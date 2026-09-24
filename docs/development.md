@@ -29,8 +29,13 @@ The managed plugin uses local BepInEx 5 and game reference DLLs. Defaults are `C
 ```powershell
 dotnet build managed/DSPAAMod.csproj -c Release
 # Example: dotnet build managed/DSPAAMod.csproj -c Release -p:DspLibsPath=C:/Local/GameReferences
-./tools/package.ps1
+# Release validation uses the original game DLLs, not publicized development references.
+$gameManaged = 'E:/SteamLibrary/steamapps/common/Dyson Sphere Program/DSPGAME_Data/Managed'
+./tools/test-game-references.ps1 -GameManagedPath $gameManaged
+./tools/package.ps1 -GameManagedPath $gameManaged
 ```
+
+Set `GameManagedPath` to your installed game's unmodified `DSPGAME_Data/Managed` directory; `DSP_GAME_MANAGED_PATH` is the environment-variable alternative. Both scripts accept `BepInExPath` for a nondefault BepInEx 5 core directory. The game-reference check rebuilds all production C# sources, including the Unity UI adapter, into an isolated `build/game-reference-check/` directory. It rejects publicized references and catches direct access to members that are private in the actual game. Access private members through Harmony/reflection instead. Packaging always runs this check and includes that exact checked DLL; the ordinary development reference directory and build outputs are unchanged. This compiler check does not execute Unity or replace in-game menu acceptance.
 
 Packaging requires Python 3 and Inkscape on the tool search path. It writes a new local `dist/` directory and a flat-root Gale/Thunderstore ZIP: package metadata, changelog, README, 256×256 icon, managed/native DLLs, verified release runtime, license/notices and `SHA256SUMS.json`. It does not deploy, launch, upload or publish anything. Default tests cover preset evidence, WARP texture lifetime/fallback/retirement, CLI errors, verified-download safety, model overrides, Apply/Cancel/Defaults, centered jitter and real managed/native ABI calls. They do not execute Unity or validate the native-menu layout.
 

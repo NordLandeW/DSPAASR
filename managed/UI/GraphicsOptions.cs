@@ -10,6 +10,10 @@ namespace DSPAAMod.UI
     // hidden and intact so native option refreshes never reinterpret our indices.
     internal sealed class GraphicsOptions : IDisposable
     {
+        // Publicized compile references do not change the game's private runtime fields.
+        private static readonly System.Reflection.FieldInfo ItemButtonsField =
+            HarmonyLib.AccessTools.Field(typeof(UIComboBox), "ItemButtons") ??
+            throw new MissingFieldException(typeof(UIComboBox).FullName, "ItemButtons");
         private readonly Plugin plugin;
         private UIOptionWindow window;
         private UIComboBox technique, resolution, configuration;
@@ -249,7 +253,7 @@ namespace DSPAAMod.UI
                 string dlss = shownAvailability.Available ? "DLSS" : shownAvailability.Pending ?
                     (Chinese ? "DLSS（检测中）" : "DLSS (checking)") : (Chinese ? "DLSS（不可用）" : "DLSS (unavailable)");
                 SetItems(technique, new[] { Chinese ? "关闭" : "Off", "MSAA", "FXAA", "TAA", dlss }, (int)draft.Choice);
-                technique.ItemButtons[(int)AaChoice.Dlss].interactable = shownAvailability.Available;
+                ((List<Button>)ItemButtonsField.GetValue(technique))[(int)AaChoice.Dlss].interactable = shownAvailability.Available;
                 availabilityLabel.text = shownAvailability.Describe(Chinese);
                 SetItems(resolution, new[] { "DLAA", Chinese ? "质量" : "Quality", Chinese ? "平衡" : "Balanced",
                     Chinese ? "性能" : "Performance", Chinese ? "超级性能" : "Ultra Performance" }, (int)draft.Settings.Resolution);

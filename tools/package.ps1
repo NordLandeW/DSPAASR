@@ -1,5 +1,9 @@
 [CmdletBinding()]
-param([string]$OutputDirectory = '')
+param(
+    [string]$OutputDirectory = '',
+    [string]$GameManagedPath = $env:DSP_GAME_MANAGED_PATH,
+    [string]$BepInExPath = 'C:/Game Modding/BepInEx/BepInEx/core'
+)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $metadata = Get-Content -LiteralPath (Join-Path $root 'pack/manifest.json') -Raw | ConvertFrom-Json
@@ -7,6 +11,8 @@ if (!$OutputDirectory) { $OutputDirectory = Join-Path $root ("dist/$($metadata.n
 $output = [IO.Path]::GetFullPath($OutputDirectory, $root)
 $zip = "$output.zip"
 if ((Test-Path -LiteralPath $output) -or (Test-Path -LiteralPath $zip)) { throw 'Refusing to overwrite an existing package.' }
+# Package the exact production DLL checked against unmodified runtime references.
+& (Join-Path $PSScriptRoot 'test-game-references.ps1') -GameManagedPath $GameManagedPath -BepInExPath $BepInExPath
 # Validate tools and built inputs before creating an output directory.
 $inkscape = (Get-Command inkscape -ErrorAction Stop).Source
 $python = (Get-Command python -ErrorAction Stop).Source
@@ -14,7 +20,7 @@ $inkscapeHelp = (& $inkscape --help | Out-String)
 $modernInkscape = $inkscapeHelp.Contains('--export-type')
 if (!$modernInkscape -and !$inkscapeHelp.Contains('--export-png')) { throw 'Unsupported Inkscape command-line interface.' }
 $files = [ordered]@{
-    'managed/bin/Release/net48/DSPAAMod.dll' = 'DSPAAMod.dll'
+    'build/game-reference-check/Release/bin/DSPAAMod.dll' = 'DSPAAMod.dll'
     'build/native/Release/DSPAANative.dll' = 'DSPAANative.dll'
     'external/ngx/runtime/rel/nvngx_dlss.dll' = 'nvngx_dlss.dll'
     'external/ngx/LICENSE.txt' = 'NVIDIA-RTX-SDK-LICENSE.txt'
@@ -28,7 +34,7 @@ $files = [ordered]@{
 foreach ($source in $files.Keys) {
     if (!(Test-Path -LiteralPath (Join-Path $root $source) -PathType Leaf)) { throw "Missing build input: $source" }
 }
-$assembly = [Reflection.AssemblyName]::GetAssemblyName((Join-Path $root 'managed/bin/Release/net48/DSPAAMod.dll'))
+$assembly = [Reflection.AssemblyName]::GetAssemblyName((Join-Path $root 'build/game-reference-check/Release/bin/DSPAAMod.dll'))
 if ($assembly.Version.ToString(3) -ne $metadata.version_number) { throw 'Assembly/package versions differ.' }
 # Revalidate the pinned release runtime and its unmodified NVIDIA signature.
 & (Join-Path $PSScriptRoot 'fetch-ngx.ps1')

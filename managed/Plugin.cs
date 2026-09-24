@@ -11,7 +11,7 @@ using UnityEngine;
 
 namespace DSPAAMod
 {
-    [BepInPlugin(Id, "DSPAASR", "1.0.0")]
+    [BepInPlugin(Id, "DSPAASR", "1.0.1")]
     [BepInProcess("DSPGAME.exe")]
     public sealed class Plugin : BaseUnityPlugin
     {
