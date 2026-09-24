@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using DSPAAMod.Core;
 using DSPAAMod.Interop;
 using HarmonyLib;
@@ -355,10 +356,21 @@ namespace DSPAAMod.Game
                 if (!component || !component.isActiveAndEnabled) continue;
                 if (component == state.Behaviour) afterStack = true;
                 if (component == state.Presenter) { afterPresenter = true; continue; }
-                if (!afterStack || AccessTools.Method(component.GetType(), "OnRenderImage", new[] { typeof(RenderTexture), typeof(RenderTexture) }) == null) continue;
+                if (!afterStack || !HasImageEffect(component.GetType())) continue;
                 if (afterPresenter || (component != state.Behaviour && !(component is TranslucentImageSource) && !(component is UnityStandardAssets.ImageEffects.SunShafts)))
                     throw new NotSupportedException("Unintegrated image effect after the DLSS stack: " + component.GetType().FullName);
             }
+        }
+        private static bool HasImageEffect(Type type)
+        {
+            // Absence is normal for camera components; Harmony's Method helper logs
+            // misses. Keep its inherited/private-method lookup without per-frame warnings.
+            var signature = new[] { typeof(RenderTexture), typeof(RenderTexture) };
+            for (; type != null; type = type.BaseType)
+                if (type.GetMethod("OnRenderImage", BindingFlags.DeclaredOnly | BindingFlags.Public |
+                    BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static, null, signature, null) != null)
+                    return true;
+            return false;
         }
         private static void RestoreTarget(CameraState state)
         {
