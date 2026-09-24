@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>DSPAAMod</AssemblyName>
+    <RootNamespace>DSPAAMod</RootNamespace>
+    <Version>1.0.0</Version>
+    <Product>DSPAASR</Product>
+    <Description>Anti-aliasing and super resolution for Dyson Sphere Program.</Description>
+    <Authors>NordLandeW</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <BepInExPath Condition="'$(BepInExPath)' == ''">C:/Game Modding/BepInEx/BepInEx/core</BepInExPath>
+    <DspLibsPath Condition="'$(DspLibsPath)' == ''">C:/Game Modding/DSPlibs</DspLibsPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="BepInEx"><HintPath>$(BepInExPath)/BepInEx.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(BepInExPath)/0Harmony.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Assembly-CSharp"><HintPath>$(DspLibsPath)/Assembly-CSharp.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine"><HintPath>$(DspLibsPath)/UnityEngine.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(DspLibsPath)/UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.IMGUIModule"><HintPath>$(DspLibsPath)/UnityEngine.IMGUIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.InputLegacyModule"><HintPath>$(DspLibsPath)/UnityEngine.InputLegacyModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.UI"><HintPath>$(DspLibsPath)/UnityEngine.UI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.UIModule"><HintPath>$(DspLibsPath)/UnityEngine.UIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(DspLibsPath)/UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+  <Target Name="ValidateLocalReferences" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(DspLibsPath)/Assembly-CSharp.dll')" Text="Set DspLibsPath to your locally extracted game reference assemblies." />
+    <Error Condition="!Exists('$(BepInExPath)/BepInEx.dll')" Text="Set BepInExPath to your BepInEx 5 core directory." />
+  </Target>
+</Project>

@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../managed/Core/*.cs" Link="Core/%(Filename)%(Extension)" />
+    <Compile Include="../../managed/Interop/NativeBridge.cs" Link="Interop/NativeBridge.cs" />
+  </ItemGroup>
+</Project>

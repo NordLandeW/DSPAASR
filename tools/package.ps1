@@ -1,0 +1,55 @@
+[CmdletBinding()]
+param([string]$OutputDirectory = '')
+$ErrorActionPreference = 'Stop'
+$root = Split-Path $PSScriptRoot -Parent
+$metadata = Get-Content -LiteralPath (Join-Path $root 'pack/manifest.json') -Raw | ConvertFrom-Json
+if (!$OutputDirectory) { $OutputDirectory = Join-Path $root ("dist/$($metadata.name)-$($metadata.version_number)-" + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
+$output = [IO.Path]::GetFullPath($OutputDirectory, $root)
+$zip = "$output.zip"
+if ((Test-Path -LiteralPath $output) -or (Test-Path -LiteralPath $zip)) { throw 'Refusing to overwrite an existing package.' }
+# Validate tools and built inputs before creating an output directory.
+$inkscape = (Get-Command inkscape -ErrorAction Stop).Source
+$python = (Get-Command python -ErrorAction Stop).Source
+$inkscapeHelp = (& $inkscape --help | Out-String)
+$modernInkscape = $inkscapeHelp.Contains('--export-type')
+if (!$modernInkscape -and !$inkscapeHelp.Contains('--export-png')) { throw 'Unsupported Inkscape command-line interface.' }
+$files = [ordered]@{
+    'managed/bin/Release/net48/DSPAAMod.dll' = 'DSPAAMod.dll'
+    'build/native/Release/DSPAANative.dll' = 'DSPAANative.dll'
+    'external/ngx/runtime/rel/nvngx_dlss.dll' = 'nvngx_dlss.dll'
+    'external/ngx/LICENSE.txt' = 'NVIDIA-RTX-SDK-LICENSE.txt'
+    'README.md' = 'README.md'
+    'LICENSE' = 'LICENSE'
+    'docs/third-party.md' = 'third-party.md'
+    'docs/nvidia-dlss-notices.txt' = 'NVIDIA-DLSS-NOTICES.txt'
+    'pack/manifest.json' = 'manifest.json'
+    'pack/CHANGELOG.md' = 'CHANGELOG.md'
+}
+foreach ($source in $files.Keys) {
+    if (!(Test-Path -LiteralPath (Join-Path $root $source) -PathType Leaf)) { throw "Missing build input: $source" }
+}
+$assembly = [Reflection.AssemblyName]::GetAssemblyName((Join-Path $root 'managed/bin/Release/net48/DSPAAMod.dll'))
+if ($assembly.Version.ToString(3) -ne $metadata.version_number) { throw 'Assembly/package versions differ.' }
+# Revalidate the pinned release runtime and its unmodified NVIDIA signature.
+& (Join-Path $PSScriptRoot 'fetch-ngx.ps1')
+$null = New-Item -ItemType Directory -Path $output
+foreach ($source in $files.Keys) { Copy-Item -LiteralPath (Join-Path $root $source) -Destination (Join-Path $output $files[$source]) }
+$icon = Join-Path $output 'icon.png'
+if ($modernInkscape) {
+    & $inkscape (Join-Path $root 'pack/icon.svg') --export-type=png --export-area-page --export-width=256 --export-height=256 "--export-filename=$icon"
+} else {
+    & $inkscape --without-gui "--file=$(Join-Path $root 'pack/icon.svg')" "--export-png=$icon" --export-area-page --export-width=256 --export-height=256
+}
+# Some older Inkscape releases return zero even for an unknown option.
+if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $icon -PathType Leaf)) { throw 'Icon rendering failed.' }
+$checksums = @(Get-ChildItem -LiteralPath $output -File | Sort-Object Name | ForEach-Object {
+    [ordered]@{ File = $_.Name; Bytes = $_.Length; SHA256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
+})
+$checksums | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.json') -Encoding utf8NoBOM
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[IO.Compression.ZipFile]::CreateFromDirectory($output, $zip, [IO.Compression.CompressionLevel]::Optimal, $false)
+& $python (Join-Path $PSScriptRoot 'validate-package.py') $zip
+if ($LASTEXITCODE -ne 0) { throw 'Package validation failed; do not install this archive.' }
+Write-Output "Gale local-import ZIP: $zip"
+Write-Output ('SHA256: ' + (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash)
+Write-Output 'No deployment, game launch or public upload was performed.'

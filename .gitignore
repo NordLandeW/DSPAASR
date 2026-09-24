@@ -1,0 +1,7 @@
+/external/
+/build/
+/artifacts/
+/dist/
+/.vs/
+**/bin/
+**/obj/

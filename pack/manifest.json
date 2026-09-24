@@ -1,0 +1,9 @@
+{
+    "name": "DSPAASR",
+    "description": "Anti-aliasing and super resolution for Dyson Sphere Program. Choose built-in TAA, NVIDIA DLAA or DLSS Super Resolution from the game's graphics settings, with independent CNN/K/L/M model selection.",
+    "version_number": "1.0.0",
+    "dependencies": [
+        "xiaoye97-BepInEx-5.4.17"
+    ],
+    "website_url": "https://github.com/NordLandeW/DSPAASR"
+}
