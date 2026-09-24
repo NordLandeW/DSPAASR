@@ -1,28 +1,30 @@
 # Developing DSPAASR
 
-DSPAASR uses a custom Direct3D 11 NGX bridge and a BepInEx 5 adapter. This guide covers building, packaging and testing the integration. For installation and graphics settings, see the [project README](../README.md) and [settings guide](usage.md).
+DSPAASR uses a custom Direct3D 11 NGX bridge, a same-adapter D3D11/D3D12 analytical FSR bridge and a BepInEx 5 adapter. This guide covers building, packaging and testing the integration. For installation and graphics settings, see the [project README](../README.md) and [settings guide](usage.md).
 
 Run the commands below from the repository root. The managed assembly name, native ABI and `dspaa.mod` configuration identity retain their original names for compatibility.
 
 ## Scope
 
 - Native-resolution DLAA and genuine lower-resolution DLSS Super Resolution, with SDK-selected input dimensions and native-resolution output/UI.
+- Analytical FSR 3.1.5 Native AA and four SR modes, with SDK-selected dimensions/jitter, automatic reactive masks and optional RCAS sharpening. Unity stays on D3D11; copies and GPU fence waits cross to a same-adapter D3D12 queue.
 - Explicit preset/model selection, independent from SR Quality/Balanced/Performance modes.
 - CNN and Transformer choices must reflect the model actually used. An accepted NGX create/evaluate call alone is not evidence that a deprecated preset was honored.
 - No frame generation, ray reconstruction, driver overrides or save conversion. The runtime does not replace game assemblies.
 
 ## Native development
 
-Requires Windows x64, Visual Studio 2022 C++ tools, a Windows SDK, PowerShell 7, CMake 3.25 or later, .NET 8+ SDK and .NET Framework 4.8 reference assemblies. The NGX import library uses the release dynamic MSVC runtime (`/MD`); use the Release preset. Runtime GPU probing additionally requires supported NVIDIA hardware and driver.
+Requires Windows x64, Visual Studio 2022 C++ tools, a Windows SDK, PowerShell 7, CMake 3.25 or later, .NET 8+ SDK and .NET Framework 4.8 reference assemblies. The NGX import library uses the release dynamic MSVC runtime (`/MD`); use the Release preset. NGX GPU probing additionally requires supported NVIDIA hardware and driver. FSR probing requires a compatible hardware D3D12/Shader Model 6.2 adapter, D3D11 shared-fence support and shared texture-format support; it is not vendor-gated.
 
 ```powershell
 pwsh -File tools/fetch-ngx.ps1 -IncludeDevelopment
+pwsh -File tools/fetch-fsr.ps1
 cmake --preset windows
 cmake --build --preset release
 ctest --preset release
 ```
 
-Dependencies download from a pinned NVIDIA commit and are checked against pinned SHA256 hashes; the runtime's NVIDIA Authenticode signature is also verified. Existing unexpected files are not overwritten. Dependencies, build outputs and diagnostic artifacts are ignored by Git. Do not copy proprietary game assemblies into this repository.
+Dependencies download from pinned NVIDIA and AMD commits and are checked against pinned SHA256 hashes; each runtime's respective NVIDIA/AMD Authenticode signature is also verified. Existing unexpected files are not overwritten. Dependencies, build outputs and diagnostic artifacts are ignored by Git. Do not copy proprietary game assemblies into this repository.
 
 The managed plugin uses local BepInEx 5 and game reference DLLs. Defaults are `C:/Game Modding/BepInEx/BepInEx/core` and `C:/Game Modding/DSPlibs`; override `BepInExPath`/`DspLibsPath` MSBuild properties on another workstation:
 
@@ -59,6 +61,14 @@ For the separate SR matrix, run `./tools/run-preset-probes.ps1 -SuperResolution`
 
 
 No NVIDIA-hardware/driver-dependent test is part of default CTest. Its resource/fallback test uses the Windows WARP software D3D11 device. Do not infer supported hardware or performance from a build/CTest pass. Development runtime output contains NVIDIA's diagnostic watermark; never distribute that DLL.
+
+### Headless FSR Native AA / SR probe
+
+```powershell
+./build/native/Release/fsr-probe.exe ./external/fsr-sdk/Kits/FidelityFX/signedbin ./artifacts/fsr-probe
+```
+
+This opt-in hardware probe opens no window and does not load NGX. It uses the exported native C ABI to query capability/provider and optimal sizes, submit valid typeless D3D11 resources, switch through Native AA/Quality/Balanced/Performance/Ultra Performance and back, then retire/shut down. It checks finite/nonblack output, selected D3D11 state preservation and D3D12 debug-layer errors when the debug layer is available. Stages alternate depth direction, reactive-mask presence and sharpening; each runs two SDK jitter cycles, with an explicit midpoint history reset. The 640×360 matrix is 358 frames with this pinned provider. PPM images/logs are diagnostic artifacts, not proof of Unity integration, transparency quality, motion-vector coverage or performance. FSR capability deliberately does not infer success from an adapter vendor/name.
 
 ### Isolated in-game validation
 
@@ -98,4 +108,4 @@ The script exports the original driver database, refuses existing application pr
 
 ## Third-party software
 
-See the [native bridge contract](native-bridge.md) for the managed/native interface and the [third-party notices](third-party.md) for dependency licenses. Project-authored source uses the [MIT License](../LICENSE); the downloaded NVIDIA runtime/SDK remain under their separate license. The build and packaging scripts do not upload or publish the resulting files.
+See the [native bridge contract](native-bridge.md) for the managed/native interface and the [third-party notices](third-party.md) for dependency licenses. Project-authored source uses the [MIT License](../LICENSE); the downloaded NVIDIA and AMD SDK/runtime components remain under their separate licenses. The build and packaging scripts do not upload or publish the resulting files.

@@ -20,6 +20,7 @@ namespace DSPAAMod.Game
             public RenderTargets Targets;
             public RenderTexture SizingAnchor, OriginalTarget, ImageResult;
             public SrPresentation Presenter;
+            public CommandBuffer OpaqueCapture;
             public readonly WorldTextOverlay WorldText = new WorldTextOverlay();
             public bool ReportedWorldText;
             public int WorldTextFrame = -1;
@@ -54,10 +55,20 @@ namespace DSPAAMod.Game
         private readonly Func<NativeBridge> acquireNative;
         private readonly Action<TaaComponent, Vector2> setJitter;
         private NativeBridge native;
-        private RenderTexture supportAnchor;
-        private IntPtr supportToken;
+        private sealed class SupportQuery
+        {
+            public UpscalerAvailability Availability;
+            public RenderTexture Anchor;
+            public IntPtr Token;
+        }
+        private readonly SupportQuery[] supportQueries = new SupportQuery[2];
         private bool supportRequested;
-        public DlssAvailability Availability { get; private set; }
+        public UpscalerAvailability Availability => supportQueries[0].Availability;
+        public UpscalerAvailability FsrAvailability => supportQueries[1].Availability;
+        public UpscalerAvailability GetAvailability(AaChoice choice) => choice == AaChoice.Fsr ? FsrAvailability : Availability;
+        private bool FsrSelected => settings.Technique == AaTechnique.Fsr;
+        private UpscalerAvailability ActiveAvailability => FsrSelected ? FsrAvailability : Availability;
+        private string BackendName => FsrSelected ? "FSR" : "DLSS";
         private ulong nextKey;
         private AaSettings settings;
         private int diagnosticThrough = -1;
@@ -140,41 +151,43 @@ namespace DSPAAMod.Game
             report = log;
             information = info;
             setJitter = AccessTools.MethodDelegate<Action<TaaComponent, Vector2>>(AccessTools.PropertySetter(typeof(TaaComponent), "jitterVector"));
-            Availability = DlssAvailability.ForPlatform(SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11,
-                SystemInfo.graphicsDeviceVendorID, SystemInfo.supportsMotionVectors, SystemInfo.supportsComputeShaders);
+            for (int i = 0; i < supportQueries.Length; ++i)
+                supportQueries[i] = new SupportQuery { Availability = UpscalerAvailability.ForPlatform(
+                    SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11, SystemInfo.graphicsDeviceVendorID,
+                    SystemInfo.supportsMotionVectors, SystemInfo.supportsComputeShaders, (UpscalerBackend)i) };
         }
-        public void RequestDlssSupport() { supportRequested = true; }
-        private void UpdateDlssSupport()
+        public void RequestUpscalerSupport() { supportRequested = true; }
+        private void UpdateSupport(SupportQuery query)
         {
-            if (!Availability.Pending) return;
+            if (!query.Availability.Pending) return;
             try
             {
-                if (supportToken == IntPtr.Zero)
+                if (query.Token == IntPtr.Zero)
                 {
                     if (native == null) native = acquireNative();
-                    supportAnchor = new RenderTexture(2, 2, 0, RenderTextureFormat.ARGB32)
+                    query.Anchor = new RenderTexture(2, 2, 0, RenderTextureFormat.ARGB32)
                     { name = "DSPAASR capability device anchor", hideFlags = HideFlags.HideAndDontSave };
-                    if (!supportAnchor.Create()) throw new InvalidOperationException("Cannot allocate a graphics-device query anchor.");
-                    IntPtr token = native.RequestSupport(supportAnchor.GetNativeTexturePtr());
-                    if (token == IntPtr.Zero) throw new InvalidOperationException("Cannot queue the DLSS capability check.");
+                    if (!query.Anchor.Create()) throw new InvalidOperationException("Cannot allocate a graphics-device query anchor.");
+                    IntPtr token = native.RequestSupport(query.Anchor.GetNativeTexturePtr(), (uint)query.Availability.Backend);
+                    if (token == IntPtr.Zero) throw new InvalidOperationException("Cannot queue the " + query.Availability.Name + " capability check.");
                     IssueControl(token);
-                    supportToken = token;
+                    query.Token = token;
                 }
-                else if (native.TryGetSupport(supportToken, out var support) && support.Result != 0)
+                else if (native.TryGetSupport(query.Token, out var support) && support.Result != 0)
                 {
-                    supportToken = IntPtr.Zero;
-                    DestroyAnchor(supportAnchor);
-                    supportAnchor = null;
-                    Availability = support.Result == 1 ? DlssAvailability.Supported : DlssAvailability.Failed(support.Message);
-                    if (!Availability.Available) report(Availability.Describe(false));
+                    query.Token = IntPtr.Zero;
+                    DestroyAnchor(query.Anchor);
+                    query.Anchor = null;
+                    query.Availability = query.Availability.Complete(support.Result == 1, support.Message);
+                    if (!query.Availability.Available) report(query.Availability.Describe(false));
                 }
             }
             catch (Exception error)
             {
                 // An issued query retains its anchor until completion or process teardown.
-                if (supportToken == IntPtr.Zero) { DestroyAnchor(supportAnchor); supportAnchor = null; }
-                Availability = DlssAvailability.Failed(error.Message);
-                report(Availability.Describe(false));
+                if (query.Token == IntPtr.Zero) { DestroyAnchor(query.Anchor); query.Anchor = null; }
+                query.Availability = query.Availability.Complete(false, error.Message);
+                report(query.Availability.Describe(false));
             }
         }
         public void Configure(AaSettings value)
@@ -188,7 +201,7 @@ namespace DSPAAMod.Game
             }
             cameras.Clear();
             settings = value;
-            Status = value.Technique == AaTechnique.Dlss ? "Waiting for a compatible camera." : "Using " + value.Technique;
+            Status = value.Temporal ? "Waiting for a compatible camera." : "Using " + value.Technique;
         }
         public void BeforeCull(PostProcessingBehaviour behaviour)
         {
@@ -213,11 +226,11 @@ namespace DSPAAMod.Game
             state.InputsCopied = false;
             state.ImageResult = null;
             if (settings.Technique == AaTechnique.Original) return;
-            if (settings.Technique == AaTechnique.Dlss)
+            if (settings.Temporal)
             {
-                if (!Availability.Available)
+                if (!ActiveAvailability.Available)
                 {
-                    Status = Availability.Describe(false);
+                    Status = ActiveAvailability.Describe(false);
                     if (state.Presenter) state.Presenter.enabled = false;
                     return;
                 }
@@ -225,8 +238,10 @@ namespace DSPAAMod.Game
                 try
                 {
                     if (SystemInfo.graphicsDeviceType != GraphicsDeviceType.Direct3D11 || !SystemInfo.supportsMotionVectors ||
-                        !SystemInfo.supportsComputeShaders || SystemInfo.graphicsDeviceVendorID != 0x10de || camera.stereoEnabled)
-                        throw new NotSupportedException("DLAA requires NVIDIA D3D11, motion vectors, compute support and a non-stereo camera.");
+                        !SystemInfo.supportsComputeShaders || (!FsrSelected && SystemInfo.graphicsDeviceVendorID != 0x10de) || camera.stereoEnabled)
+                        throw new NotSupportedException(BackendName + " requires compatible D3D11, motion vectors, compute support and a non-stereo camera.");
+                    if (FsrSelected && camera.orthographic)
+                        throw new NotSupportedException("FSR's depth reconstruction requires a perspective camera.");
                     if (behaviour.profile.debugViews.willInterrupt) return;
                     if (native == null) native = acquireNative();
                     if (native.TryGetStatus(state.Key, out var result))
@@ -234,14 +249,15 @@ namespace DSPAAMod.Game
                         if (result.Result < 0) { Fail(state, result.Message); return; }
                         if (result.Result == 1)
                         {
-                            Status = "DLSS " + settings.Resolution + " | " + state.Targets.Width + "x" + state.Targets.Height +
+                            Status = BackendName + " " + settings.Resolution + " | " + state.Targets.Width + "x" + state.Targets.Height +
                                      " -> " + state.Targets.Resolution.OutputWidth + "x" + state.Targets.Resolution.OutputHeight +
-                                     " | requested " + (char)('A' + result.RequestedPreset - 1) +
-                                     " | observed " + (char)result.ObservedPreset + " | runtime-log verified";
-                            if (state.ReportedPreset != result.ObservedPreset)
+                                     (FsrSelected ? " | " + result.Message : " | requested " + (char)('A' + result.RequestedPreset - 1) +
+                                     " | observed " + (char)result.ObservedPreset + " | runtime-log verified");
+                            uint marker = FsrSelected ? 1u : result.ObservedPreset;
+                            if (state.ReportedPreset != marker)
                             {
                                 information(Status);
-                                state.ReportedPreset = result.ObservedPreset;
+                                state.ReportedPreset = marker;
                             }
                         }
                     }
@@ -283,6 +299,12 @@ namespace DSPAAMod.Game
                     state.Scene = scene;
                     state.Profile = profile;
                     state.LastFrame = Time.frameCount;
+                    if (FsrSelected)
+                    {
+                        state.OpaqueCapture = new CommandBuffer { name = "DSPAASR FSR opaque color" };
+                        state.OpaqueCapture.Blit(BuiltinRenderTextureType.CameraTarget, state.Targets.OpaqueColor);
+                        camera.AddCommandBuffer(CameraEvent.BeforeForwardAlpha, state.OpaqueCapture);
+                    }
                     state.WorldText.Begin(camera, projection);
                     state.WorldTextFrame = Time.frameCount;
                 }
@@ -304,8 +326,8 @@ namespace DSPAAMod.Game
             aa.method = settings.Technique == AaTechnique.Fxaa ? AntialiasingModel.Method.Fxaa : AntialiasingModel.Method.Taa;
             state.Model.settings = aa;
             state.Model.enabled = true;
-            if (settings.Technique == AaTechnique.Dlss) camera.allowMSAA = false;
-            state.Prepared = settings.Technique == AaTechnique.Dlss;
+            if (settings.Temporal) camera.allowMSAA = false;
+            state.Prepared = settings.Temporal;
             TraceStage("post.preCull-prepared", camera);
         }
         private bool PrepareTargets(CameraState state, int width, int height)
@@ -320,28 +342,37 @@ namespace DSPAAMod.Game
             }
             if (state.Targets != null) return true;
             var size = new RenderResolution(width, height, width, height);
-            if (settings.Resolution != ResolutionMode.Dlaa)
+            if (settings.Resolution != ResolutionMode.Dlaa || FsrSelected)
             {
                 if (!state.QueryIssued)
                 {
                     state.SizingAnchor = new RenderTexture(2, 2, 0, RenderTextureFormat.ARGBHalf, RenderTextureReadWrite.Linear)
                     { name = "DSPAAMod sizing device anchor", hideFlags = HideFlags.HideAndDontSave };
-                    if (!state.SizingAnchor.Create()) throw new InvalidOperationException("Cannot allocate NGX sizing anchor.");
-                    IntPtr token = native.RequestOptimal(state.Key, state.SizingAnchor.GetNativeTexturePtr(), (uint)width, (uint)height, (uint)settings.Resolution);
+                    if (!state.SizingAnchor.Create()) throw new InvalidOperationException("Cannot allocate reconstruction sizing anchor.");
+                    IntPtr token = native.RequestOptimal(state.Key, state.SizingAnchor.GetNativeTexturePtr(), (uint)width, (uint)height,
+                        (uint)settings.Resolution, FsrSelected ? 1u : 0u);
                     IssueControl(token);
                     state.QueryIssued = true;
-                    Status = "Querying NGX optimal render size for " + settings.Resolution;
+                    Status = "Querying " + BackendName + " render size for " + settings.Resolution;
                     return false;
                 }
-                if (!native.TryGetOptimal(state.Key, out var result) || result.Result == 0) return false;
+                NativeOptimalSettings result;
+                uint phases = 0;
+                if (FsrSelected)
+                {
+                    if (!native.TryGetFsrOptimal(state.Key, out var fsr) || fsr.Settings.Result == 0) return false;
+                    result = fsr.Settings; phases = fsr.JitterPhases;
+                    if (result.Result == 1 && phases == 0) throw new InvalidOperationException("FSR returned no jitter sequence.");
+                }
+                else if (!native.TryGetOptimal(state.Key, out result) || result.Result == 0) return false;
                 if (result.Result < 0) throw new InvalidOperationException(result.Message);
                 if (result.OutputWidth != (uint)width || result.OutputHeight != (uint)height || result.Quality != (uint)settings.Resolution)
-                    throw new InvalidOperationException("Stale NGX resolution response.");
-                size = new RenderResolution(checked((int)result.OptimalWidth), checked((int)result.OptimalHeight), width, height);
+                    throw new InvalidOperationException("Stale reconstruction resolution response.");
+                size = new RenderResolution(checked((int)result.OptimalWidth), checked((int)result.OptimalHeight), width, height, phases);
                 DestroyAnchor(state.SizingAnchor); state.SizingAnchor = null;
             }
-            state.Targets = new RenderTargets(size);
-            information("DLSS render targets: " + size.InputWidth + "x" + size.InputHeight + " world -> " + width + "x" + height +
+            state.Targets = new RenderTargets(size, FsrSelected);
+            information(BackendName + " render targets: " + size.InputWidth + "x" + size.InputHeight + " world -> " + width + "x" + height +
                 " output/UI, mode " + settings.Resolution + ", jitter phases " + size.JitterPhases);
             return true;
         }
@@ -358,7 +389,7 @@ namespace DSPAAMod.Game
                 if (component == state.Presenter) { afterPresenter = true; continue; }
                 if (!afterStack || !HasImageEffect(component.GetType())) continue;
                 if (afterPresenter || (component != state.Behaviour && !(component is TranslucentImageSource) && !(component is UnityStandardAssets.ImageEffects.SunShafts)))
-                    throw new NotSupportedException("Unintegrated image effect after the DLSS stack: " + component.GetType().FullName);
+                    throw new NotSupportedException("Unintegrated image effect after the reconstruction stack: " + component.GetType().FullName);
             }
         }
         private static bool HasImageEffect(Type type)
@@ -423,7 +454,7 @@ namespace DSPAAMod.Game
                 if (source.width != targets.Width || source.height != targets.Height)
                     throw new InvalidOperationException("World source " + source.width + "x" + source.height + " does not match NGX input " + targets.Width + "x" + targets.Height + ".");
                 if (state.Frame == 0)
-                    information("DLSS actual world source " + source.width + "x" + source.height + "; resolve destination " + destination.width + "x" + destination.height + ".");
+                    information(BackendName + " actual world source " + source.width + "x" + source.height + "; resolve destination " + destination.width + "x" + destination.height + ".");
                 var ngxJitter = Jitter.ToNgx(state.Jitter);
                 var frame = new NativeFrame
                 {
@@ -433,16 +464,26 @@ namespace DSPAAMod.Game
                     Width = (uint)targets.Width, Height = (uint)targets.Height,
                     OutputWidth = (uint)targets.Resolution.OutputWidth, OutputHeight = (uint)targets.Resolution.OutputHeight,
                     Quality = (uint)settings.Resolution,
-                    Preset = ModelPolicy.ResolvePreset(settings.Model, settings.Resolution),
+                    Preset = FsrSelected ? 0u : ModelPolicy.ResolvePreset(settings.Model, settings.Resolution),
                     Flags = (state.Camera.allowHDR ? 1u : 0u) | (SystemInfo.usesReversedZBuffer ? 2u : 0u) | (state.Reset ? 4u : 0u),
                     JitterX = ngxJitter.X, JitterY = ngxJitter.Y,
                     // Built-in RGHalf motion is current-minus-previous in UV units.
                     MotionScaleX = -targets.Width, MotionScaleY = -targets.Height,
                     FrameTimeMilliseconds = Mathf.Max(Time.unscaledDeltaTime, 0.000001f) * 1000f
                 };
-                token = native.Submit(ref frame);
+                if (FsrSelected)
+                {
+                    var parameters = new NativeFsrParameters {
+                        CameraNear = state.Camera.nearClipPlane, CameraFar = state.Camera.farClipPlane,
+                        VerticalFov = state.Camera.fieldOfView * Mathf.Deg2Rad,
+                        PreExposure = 1f, ViewSpaceToMeters = 1f, Sharpness = settings.FsrSharpness,
+                        OpaqueColor = targets.OpaquePointer
+                    };
+                    token = native.SubmitFsr(ref frame, ref parameters);
+                }
+                else token = native.Submit(ref frame);
                 if (token == IntPtr.Zero) throw new InvalidOperationException("Native frame queue is unavailable/full.");
-                using (var commands = new CommandBuffer { name = "DSPAAMod DLAA" })
+                using (var commands = new CommandBuffer { name = "DSPAASR " + BackendName })
                 {
                     commands.Blit(source, targets.Color);
                     // String/name identifiers address CommandBuffer temporary RTs,
@@ -585,6 +626,11 @@ namespace DSPAAMod.Game
             finally
             {
                 RestoreTarget(state);
+                if (state.OpaqueCapture != null)
+                {
+                    if (state.Camera) state.Camera.RemoveCommandBuffer(CameraEvent.BeforeForwardAlpha, state.OpaqueCapture);
+                    state.OpaqueCapture.Release(); state.OpaqueCapture = null;
+                }
                 if (state.Overridden)
                 {
                     if (state.Model != null)
@@ -645,7 +691,8 @@ namespace DSPAAMod.Game
         }
         public void Update()
         {
-            if (supportRequested || settings.Technique == AaTechnique.Dlss) UpdateDlssSupport();
+            for (int i = 0; i < supportQueries.Length; ++i)
+                if (supportRequested || (settings.Temporal && i == (FsrSelected ? 1 : 0))) UpdateSupport(supportQueries[i]);
             if (diagnosticThrough >= 0 && Time.frameCount > diagnosticThrough) FinishDiagnostic();
             Camera dead = null;
             bool found = false;

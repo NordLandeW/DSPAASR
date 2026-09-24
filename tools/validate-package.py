@@ -12,6 +12,7 @@ def validate(path):
         "manifest.json", "README.md", "LICENSE", "CHANGELOG.md", "icon.png", "DSPAAMod.dll",
         "DSPAANative.dll", "nvngx_dlss.dll", "NVIDIA-RTX-SDK-LICENSE.txt", "NVIDIA-DLSS-NOTICES.txt",
         "third-party.md", "SHA256SUMS.json",
+        "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll", "AMD-FSR-SDK-LICENSE.md",
     }
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
@@ -50,7 +51,15 @@ def validate(path):
         runtime = archive.read("nvngx_dlss.dll")
         if hashlib.sha256(runtime).hexdigest().upper() != "3975567B8943C53ACCE397F2B72380092F84F162D00B0D2C7D08A1025C563983":
             raise ValueError("Package contains an unexpected or development NGX runtime")
-        for name in ("README.md", "LICENSE", "third-party.md", "NVIDIA-RTX-SDK-LICENSE.txt", "NVIDIA-DLSS-NOTICES.txt"):
+        amd_pins = {
+            "amd_fidelityfx_loader_dx12.dll": "E2D85AA05A9BD9ED8B38935FDF5199372CCA6F74C12015143BB6F945EE1608AA",
+            "amd_fidelityfx_upscaler_dx12.dll": "D0DCCCC74A43C44BA435B7A369B456E0970D8A4464E4BD683119B374F2C9FB46",
+            "AMD-FSR-SDK-LICENSE.md": "F0DA09D71AD5C82759A179E774535D4A829E5C96C49294167C1152402B2CB400",
+        }
+        for name, digest in amd_pins.items():
+            if hashlib.sha256(archive.read(name)).hexdigest().upper() != digest:
+                raise ValueError(f"Unexpected AMD runtime or incomplete license: {name}")
+        for name in ("README.md", "LICENSE", "third-party.md", "NVIDIA-RTX-SDK-LICENSE.txt", "NVIDIA-DLSS-NOTICES.txt", "AMD-FSR-SDK-LICENSE.md"):
             archive.read(name).decode("utf-8")
     print(f"Validated {manifest['name']} {version}: {len(expected)} flat-root files, metadata, icon, CRCs and payload hashes.")
 

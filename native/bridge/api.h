@@ -35,9 +35,18 @@ struct DspAaFrame {
     uint32_t reserved2;
 };
 
+// Additive FSR extension: the v2 DLSS packet remains unchanged.
+struct DspAaFsrParameters {
+    uint32_t size;
+    float cameraNear, cameraFar, verticalFov;
+    float preExposure, viewSpaceToMeters, sharpness;
+    uint32_t reserved;
+    void* opaqueColor; // optional input-sized RGBA16F before transparent draws, for the SDK reactive mask
+};
+
 struct DspAaStatus {
     uint32_t size;
-    int32_t result; // 0: no completed frame, 1: DLSS/DLAA, -1: fallback/error, 2: released
+    int32_t result; // 0: no completed frame, 1: reconstruction submitted, -1: fallback/error, 2: released
     uint64_t frame;
     uint32_t requestedPreset;
     uint32_t observedPreset; // ASCII letter, 0 when unknown
@@ -59,6 +68,11 @@ struct DspAaOptimalSettings {
     uint32_t maxWidth;
     uint32_t maxHeight;
     char message[256]; // UTF-8, NUL-terminated
+};
+
+struct DspAaFsrOptimalSettings {
+    DspAaOptimalSettings settings;
+    uint32_t jitterPhases;
 };
 
 // Additive ABI v2 query. A completed result is consumed exactly once by GetSupport.
@@ -88,3 +102,11 @@ DSPAA_API void* __cdecl DspAaQueueShutdown();
 // Cancel only when the caller did NOT submit the command to Unity.
 DSPAA_API void __cdecl DspAaCancel(void* token);
 DSPAA_API int __cdecl DspAaGetStatus(uint64_t camera, DspAaStatus* status);
+
+// backend: 0 = DLSS, 1 = analytical FSR. The legacy queries select DLSS.
+DSPAA_API void* __cdecl DspAaQueueFsrFrame(const DspAaFrame* frame, const DspAaFsrParameters* parameters);
+DSPAA_API void* __cdecl DspAaQueueSupportForBackend(void* deviceResource, uint32_t backend);
+DSPAA_API void* __cdecl DspAaQueueOptimalSettingsForBackend(uint64_t camera, void* deviceResource,
+                                                            uint32_t outputWidth, uint32_t outputHeight,
+                                                            uint32_t quality, uint32_t backend);
+DSPAA_API int __cdecl DspAaGetFsrOptimalSettings(uint64_t camera, DspAaFsrOptimalSettings* output);

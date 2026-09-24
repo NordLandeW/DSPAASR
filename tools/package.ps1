@@ -24,6 +24,9 @@ $files = [ordered]@{
     'build/native/Release/DSPAANative.dll' = 'DSPAANative.dll'
     'external/ngx/runtime/rel/nvngx_dlss.dll' = 'nvngx_dlss.dll'
     'external/ngx/LICENSE.txt' = 'NVIDIA-RTX-SDK-LICENSE.txt'
+    'external/fsr-sdk/Kits/FidelityFX/signedbin/amd_fidelityfx_loader_dx12.dll' = 'amd_fidelityfx_loader_dx12.dll'
+    'external/fsr-sdk/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll' = 'amd_fidelityfx_upscaler_dx12.dll'
+    'external/fsr-sdk/docs/license.md' = 'AMD-FSR-SDK-LICENSE.md'
     'README.md' = 'README.md'
     'LICENSE' = 'LICENSE'
     'docs/third-party.md' = 'third-party.md'
@@ -38,6 +41,7 @@ $assembly = [Reflection.AssemblyName]::GetAssemblyName((Join-Path $root 'build/g
 if ($assembly.Version.ToString(3) -ne $metadata.version_number) { throw 'Assembly/package versions differ.' }
 # Revalidate the pinned release runtime and its unmodified NVIDIA signature.
 & (Join-Path $PSScriptRoot 'fetch-ngx.ps1')
+& (Join-Path $PSScriptRoot 'fetch-fsr.ps1')
 $null = New-Item -ItemType Directory -Path $output
 foreach ($source in $files.Keys) { Copy-Item -LiteralPath (Join-Path $root $source) -Destination (Join-Path $output $files[$source]) }
 $icon = Join-Path $output 'icon.png'

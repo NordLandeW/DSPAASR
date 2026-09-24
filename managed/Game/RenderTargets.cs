@@ -17,15 +17,20 @@ namespace DSPAAMod.Game
         public RenderTexture Output { get; private set; }
         public RenderTexture Depth { get; private set; }
         public RenderTexture Motion { get; private set; }
+        public RenderTexture OpaqueColor { get; private set; }
+        public IntPtr OpaquePointer { get; private set; }
+        private readonly bool captureOpaque;
         public IntPtr ColorPointer { get; private set; }
         public IntPtr OutputPointer { get; private set; }
         public IntPtr DepthPointer { get; private set; }
         public IntPtr MotionPointer { get; private set; }
         public bool Valid => Color && Output && Depth && Motion && Color.IsCreated() && Output.IsCreated() && Depth.IsCreated() && Motion.IsCreated() &&
-            (Resolution.IsNative || (World && PostA && PostB && World.IsCreated() && PostA.IsCreated() && PostB.IsCreated()));
-        public RenderTargets(RenderResolution resolution)
+            (Resolution.IsNative || (World && PostA && PostB && World.IsCreated() && PostA.IsCreated() && PostB.IsCreated())) &&
+            (!captureOpaque || (OpaqueColor && OpaqueColor.IsCreated()));
+        public RenderTargets(RenderResolution resolution, bool captureOpaque = false)
         {
             Resolution = resolution;
+            this.captureOpaque = captureOpaque;
             try
             {
                 Color = Create("DSPAAMod Color", RenderTextureFormat.ARGBHalf, false);
@@ -38,6 +43,11 @@ namespace DSPAAMod.Game
                 }
                 Depth = Create("DSPAAMod Depth", RenderTextureFormat.RFloat, false);
                 Motion = Create("DSPAAMod Motion", RenderTextureFormat.RGHalf, false);
+                if (captureOpaque) {
+                    OpaqueColor = Create("DSPAASR opaque color", RenderTextureFormat.ARGBHalf, false);
+                    OpaquePointer = RetainPointer(OpaqueColor);
+                    if (OpaquePointer == IntPtr.Zero) throw new InvalidOperationException("Cannot retain FSR opaque color.");
+                }
                 // Native pointers are cached on creation, never fetched every frame.
                 ColorPointer = RetainPointer(Color);
                 OutputPointer = RetainPointer(Output);
@@ -80,6 +90,9 @@ namespace DSPAAMod.Game
             if (OutputPointer != IntPtr.Zero) Marshal.Release(OutputPointer);
             if (DepthPointer != IntPtr.Zero) Marshal.Release(DepthPointer);
             if (MotionPointer != IntPtr.Zero) Marshal.Release(MotionPointer);
+            if (OpaquePointer != IntPtr.Zero) Marshal.Release(OpaquePointer);
+            OpaquePointer = IntPtr.Zero;
+            Destroy(OpaqueColor); OpaqueColor = null;
             ColorPointer = OutputPointer = DepthPointer = MotionPointer = IntPtr.Zero;
             Destroy(Color); Destroy(Output); Destroy(Depth); Destroy(Motion);
             Destroy(World); Destroy(PostA); Destroy(PostB);

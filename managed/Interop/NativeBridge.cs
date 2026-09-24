@@ -19,6 +19,21 @@ namespace DSPAAMod.Interop
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    public struct NativeFsrParameters
+    {
+        public uint Size;
+        public float CameraNear, CameraFar, VerticalFov, PreExposure, ViewSpaceToMeters, Sharpness;
+        public uint Reserved;
+        public IntPtr OpaqueColor;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct NativeFsrOptimalSettings
+    {
+        public NativeOptimalSettings Settings;
+        public uint JitterPhases;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     public struct NativeStatus
     {
         public uint Size;
@@ -87,6 +102,10 @@ namespace DSPAAMod.Interop
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int ReadOptimal(ulong camera, ref NativeOptimalSettings settings);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr QueueSupport(IntPtr deviceResource);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int ReadSupport(IntPtr token, ref NativeSupport support);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr QueueFsrFrame(ref NativeFrame frame, ref NativeFsrParameters parameters);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr QueueBackendSupport(IntPtr resource, uint backend);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr QueueBackendOptimal(ulong camera, IntPtr resource, uint width, uint height, uint quality, uint backend);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int ReadFsrOptimal(ulong camera, ref NativeFsrOptimalSettings result);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr LoadLibraryEx(string name, IntPtr file, uint flags);
@@ -103,11 +122,17 @@ namespace DSPAAMod.Interop
         private readonly ReadOptimal readOptimal;
         private readonly QueueSupport queueSupport;
         private readonly ReadSupport readSupport;
+        private readonly QueueFsrFrame queueFsrFrame;
+        private readonly QueueBackendSupport queueBackendSupport;
+        private readonly QueueBackendOptimal queueBackendOptimal;
+        private readonly ReadFsrOptimal readFsrOptimal;
         public IntPtr RenderEvent { get; }
         public static uint FrameSize => (uint)Marshal.SizeOf(typeof(NativeFrame));
         public static uint StatusSize => (uint)Marshal.SizeOf(typeof(NativeStatus));
         public static uint OptimalSize => (uint)Marshal.SizeOf(typeof(NativeOptimalSettings));
         public static uint SupportSize => (uint)Marshal.SizeOf(typeof(NativeSupport));
+        public static uint FsrParametersSize => (uint)Marshal.SizeOf(typeof(NativeFsrParameters));
+        public static uint FsrOptimalSize => (uint)Marshal.SizeOf(typeof(NativeFsrOptimalSettings));
 
         public NativeBridge(string directory, string dataDirectory)
         {
@@ -115,7 +140,7 @@ namespace DSPAAMod.Interop
             module = LoadLibraryEx(Path.Combine(directory, "DSPAANative.dll"), IntPtr.Zero, 0x00000100 | 0x00001000);
             if (module == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot load DSPAANative.dll.");
             // Keep the DLL loaded for process lifetime: Unity may hold queued function pointers.
-            if (Get<Abi>("DspAaGetAbiVersion")() != 2 || FrameSize != 112 || StatusSize != 288 || OptimalSize != 300 || SupportSize != 264)
+            if (Get<Abi>("DspAaGetAbiVersion")() != 2 || FrameSize != 112 || StatusSize != 288 || OptimalSize != 300 || SupportSize != 264 || FsrParametersSize != 40 || FsrOptimalSize != 304)
                 throw new InvalidOperationException("Native/managed DSPAAMod ABI mismatch.");
             queueFrame = Get<QueueFrame>("DspAaQueueFrame");
             queueRelease = Get<QueueRelease>("DspAaQueueRelease");
@@ -126,6 +151,10 @@ namespace DSPAAMod.Interop
             readOptimal = Get<ReadOptimal>("DspAaGetOptimalSettings");
             queueSupport = Get<QueueSupport>("DspAaQueueSupport");
             readSupport = Get<ReadSupport>("DspAaGetSupport");
+            queueFsrFrame = Get<QueueFsrFrame>("DspAaQueueFsrFrame");
+            queueBackendSupport = Get<QueueBackendSupport>("DspAaQueueSupportForBackend");
+            queueBackendOptimal = Get<QueueBackendOptimal>("DspAaQueueOptimalSettingsForBackend");
+            readFsrOptimal = Get<ReadFsrOptimal>("DspAaGetFsrOptimalSettings");
             RenderEvent = Get<GetEvent>("DspAaGetRenderEvent")();
             if (RenderEvent == IntPtr.Zero || Get<Initialize>("DspAaInitialize")(directory, dataDirectory) != 1)
                 throw new InvalidOperationException("Native bridge initialization failed; check runtime path and log permissions.");
@@ -142,6 +171,19 @@ namespace DSPAAMod.Interop
             frame.Version = 2;
             return queueFrame(ref frame);
         }
+        public IntPtr SubmitFsr(ref NativeFrame frame, ref NativeFsrParameters parameters)
+        {
+            frame.Size = FrameSize; frame.Version = 2; parameters.Size = FsrParametersSize;
+            return queueFsrFrame(ref frame, ref parameters);
+        }
+        public IntPtr RequestOptimal(ulong camera, IntPtr resource, uint width, uint height, uint quality, uint backend) =>
+            queueBackendOptimal(camera, resource, width, height, quality, backend);
+        public bool TryGetFsrOptimal(ulong camera, out NativeFsrOptimalSettings result)
+        {
+            result = new NativeFsrOptimalSettings { Settings = new NativeOptimalSettings { Size = FsrOptimalSize, MessageBytes = new byte[256] } };
+            return readFsrOptimal(camera, ref result) == 1;
+        }
+        public IntPtr RequestSupport(IntPtr resource, uint backend) => queueBackendSupport(resource, backend);
         public IntPtr RequestOptimal(ulong camera, IntPtr deviceResource, uint width, uint height, uint quality) =>
             queueOptimal(camera, deviceResource, width, height, quality);
         public bool TryGetOptimal(ulong camera, out NativeOptimalSettings result)

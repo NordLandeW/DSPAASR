@@ -21,8 +21,16 @@ The repository does not include game assemblies or decompiled game code. Local B
 
 The optional driver-profile diagnostic links [NVIDIA/nvapi](https://github.com/NVIDIA/nvapi/tree/70d337db9186e968eab622f7e786de7e437faf3d), pinned to commit `70d337db9186e968eab622f7e786de7e437faf3d`. The SDK's MIT license and copyright notice are downloaded verbatim to `external/nvapi/License.txt` by `tools/fetch-nvapi.ps1`. Preserve that notice with a distribution of the optional tool. NVAPI does not change the separate proprietary terms of DLSS/NGX.
 
+## AMD FSR
+
+The official FSR SDK 2.3.0 is pinned to [GPUOpen-LibrariesAndSDKs/FidelityFX-SDK commit 60f4ea81909200d8542eca14dccb2628b763a9a3](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/60f4ea81909200d8542eca14dccb2628b763a9a3). The package includes the unmodified AMD-signed `amd_fidelityfx_loader_dx12.dll` (2.3.0.2740) and `amd_fidelityfx_upscaler_dx12.dll` (4.1.1.2740). The latter file/API version is **not** the selected reconstruction algorithm: the bridge explicitly selects and verifies the analytical **3.1.5** provider, not the hardware-specific 4.x ML provider.
+
+The complete [SDK license](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/60f4ea81909200d8542eca14dccb2628b763a9a3/docs/license.md) is downloaded to `external/fsr-sdk/docs/license.md` and included verbatim as `AMD-FSR-SDK-LICENSE.md`. Its default terms and listed per-component exceptions differ. Some analytical source components are MIT-licensed, but this does not make the entire SDK or the distributed runtime MIT. Read and preserve the complete copyright, permission and disclaimer text; binaries remain subject to their binary-redistribution terms. This package supplies the runtime as part of the integrated application plugin, not an independent replacement SDK. Do not modify the vendor binaries or their signatures.
+
+No third-party D3D11 FSR wrapper code is included. The project's same-adapter D3D11/D3D12 transport and adapter are project-authored MIT source. AMD, the AMD Arrow logo and FSR are trademarks of Advanced Micro Devices, Inc.; this community mod is not endorsed by AMD.
+
 ## Project code and game artwork
 
-DSPAASR's original source code is provided under the MIT License in the repository and package `LICENSE` file. That license does not relicense NVIDIA components, game assemblies or game artwork.
+DSPAASR's original source code is provided under the MIT License in the repository and package `LICENSE` file. That license does not relicense NVIDIA/AMD components, game assemblies or game artwork.
 
 The mod icon adapts Dyson Sphere Program's game logo by pixelating its lower-left portion; the original logo remains the property of its respective rights holders. Screenshots contain game imagery owned by its respective rights holders. Neither the icon nor the screenshots imply endorsement by the game's developers or NVIDIA.

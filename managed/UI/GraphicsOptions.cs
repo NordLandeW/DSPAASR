@@ -22,7 +22,7 @@ namespace DSPAAMod.UI
         private Vector2 configurationPosition;
         private Vector2 configurationLabelPosition, availabilityPosition;
         private Text availabilityLabel;
-        private DlssAvailability shownAvailability;
+        private UpscalerAvailability shownAvailability, shownFsrAvailability;
         private float rowStep;
         private bool originalConfigurationLabelActive;
         private readonly Dictionary<RectTransform, Vector2> movedRows = new Dictionary<RectTransform, Vector2>();
@@ -41,7 +41,7 @@ namespace DSPAAMod.UI
         public void Open(UIOptionWindow value)
         {
             plugin.Settings.Open();
-            plugin.Renderer.RequestDlssSupport();
+            plugin.Renderer.RequestUpscalerSupport();
             if (window != value)
             {
                 Dispose();
@@ -199,14 +199,14 @@ namespace DSPAAMod.UI
         }
         private void TechniqueChanged()
         {
-            if (synchronizing || draft == null || !technique || technique.itemIndex < 0 || technique.itemIndex > 4) return;
-            if (!draft.TrySelectTechnique((AaChoice)technique.itemIndex, plugin.Renderer.Availability)) { Refresh(); return; }
+            if (synchronizing || draft == null || !technique || technique.itemIndex < 0 || technique.itemIndex > (int)AaChoice.Fsr) return;
+            if (!draft.TrySelectTechnique((AaChoice)technique.itemIndex, plugin.Renderer.GetAvailability((AaChoice)technique.itemIndex))) { Refresh(); return; }
             plugin.Settings.Draft = draft.Settings;
             Refresh();
         }
         private void ResolutionChanged()
         {
-            if (synchronizing || draft == null || !resolution || !draft.ResolutionEnabled || !plugin.Renderer.Availability.Available || resolution.itemIndex < 0 || resolution.itemIndex > 4) return;
+            if (synchronizing || draft == null || !resolution || !draft.ResolutionEnabled || !plugin.Renderer.GetAvailability(draft.Choice).Available || resolution.itemIndex < 0 || resolution.itemIndex > 4) return;
             draft.SelectResolution((ResolutionMode)resolution.itemIndex);
             plugin.Settings.Draft = draft.Settings;
         }
@@ -238,7 +238,8 @@ namespace DSPAAMod.UI
         }
         public void Update()
         {
-            if (window && draft != null && !ReferenceEquals(shownAvailability, plugin.Renderer.Availability)) Refresh();
+            if (window && draft != null && (!ReferenceEquals(shownAvailability, plugin.Renderer.Availability) ||
+                !ReferenceEquals(shownFsrAvailability, plugin.Renderer.FsrAvailability))) Refresh();
         }
         public void Refresh()
         {
@@ -250,12 +251,15 @@ namespace DSPAAMod.UI
                 resolutionLabel.text = Chinese ? "超分辨率档位" : "Resolution mode";
                 configurationLabel.text = Chinese ? "配置" : "Configuration";
                 shownAvailability = plugin.Renderer.Availability;
-                string dlss = shownAvailability.Available ? "DLSS" : shownAvailability.Pending ?
-                    (Chinese ? "DLSS（检测中）" : "DLSS (checking)") : (Chinese ? "DLSS（不可用）" : "DLSS (unavailable)");
-                SetItems(technique, new[] { Chinese ? "关闭" : "Off", "MSAA", "FXAA", "TAA", dlss }, (int)draft.Choice);
-                ((List<Button>)ItemButtonsField.GetValue(technique))[(int)AaChoice.Dlss].interactable = shownAvailability.Available;
-                availabilityLabel.text = shownAvailability.Describe(Chinese);
-                SetItems(resolution, new[] { "DLAA", Chinese ? "质量" : "Quality", Chinese ? "平衡" : "Balanced",
+                shownFsrAvailability = plugin.Renderer.FsrAvailability;
+                SetItems(technique, new[] { Chinese ? "关闭" : "Off", "MSAA", "FXAA", "TAA",
+                    CapabilityLabel(shownAvailability), CapabilityLabel(shownFsrAvailability) }, (int)draft.Choice);
+                var buttons = (List<Button>)ItemButtonsField.GetValue(technique);
+                buttons[(int)AaChoice.Dlss].interactable = shownAvailability.Available;
+                buttons[(int)AaChoice.Fsr].interactable = shownFsrAvailability.Available;
+                string dlssReason = shownAvailability.Describe(Chinese), fsrReason = shownFsrAvailability.Describe(Chinese);
+                availabilityLabel.text = dlssReason + (dlssReason.Length > 0 && fsrReason.Length > 0 ? "\n" : "") + fsrReason;
+                SetItems(resolution, new[] { draft.Choice == AaChoice.Fsr ? "Native AA" : "DLAA", Chinese ? "质量" : "Quality", Chinese ? "平衡" : "Balanced",
                     Chinese ? "性能" : "Performance", Chinese ? "超级性能" : "Ultra Performance" }, (int)draft.Settings.Resolution);
                 string[] options = draft.Choice == AaChoice.Dlss ?
                     new[] { Chinese ? "推荐" : "Recommended", "CNN", "Transformer K", "Transformer L", "Transformer M" } :
@@ -266,20 +270,26 @@ namespace DSPAAMod.UI
             }
             finally { synchronizing = false; }
         }
+        private static string CapabilityLabel(UpscalerAvailability state) => state.Name + (state.Available ? "" : state.Pending ?
+            (Chinese ? "（检测中）" : " (checking)") : (Chinese ? "（不可用）" : " (unavailable)"));
         private void RefreshLayout()
         {
-            bool showAvailability = !plugin.Renderer.Availability.Available;
-            bool showResolution = draft.ResolutionEnabled && !showAvailability;
-            bool showConfiguration = draft.ConfigurationEnabled && (draft.Choice != AaChoice.Dlss || !showAvailability);
+            int availabilityRows = (plugin.Renderer.Availability.Available ? 0 : 2) + (plugin.Renderer.FsrAvailability.Available ? 0 : 2);
+            bool showAvailability = availabilityRows != 0;
+            bool selectedAvailable = plugin.Renderer.GetAvailability(draft.Choice).Available;
+            bool showResolution = draft.ResolutionEnabled && selectedAvailable;
+            bool showConfiguration = draft.ConfigurationEnabled && (draft.Choice != AaChoice.Dlss || selectedAvailable);
             resolution.gameObject.SetActive(showResolution);
             resolutionLabel.gameObject.SetActive(showResolution);
             configuration.gameObject.SetActive(showConfiguration);
             configurationLabel.gameObject.SetActive(showConfiguration);
             int optionRows = (showResolution ? 1 : 0) + (showConfiguration ? 1 : 0);
-            int secondaryRows = optionRows + (showAvailability ? 2 : 0);
+            int secondaryRows = optionRows + availabilityRows;
+            availabilityLabel.rectTransform.sizeDelta = new Vector2(availabilityLabel.rectTransform.sizeDelta.x,
+                Mathf.Max(1, availabilityRows) * rowStep - 4f);
             availabilityLabel.gameObject.SetActive(showAvailability);
             availabilityLabel.rectTransform.localPosition = new Vector3(availabilityPosition.x,
-                availabilityPosition.y - rowStep * (optionRows + 1.5f), 0f);
+                availabilityPosition.y - rowStep * (optionRows + 0.5f + availabilityRows * 0.5f), 0f);
             // Reflow from the installation snapshot, never from previously moved
             // positions: repeated mode changes must not accumulate row offsets.
             var offset = new Vector2(0f, rowStep * (1 - secondaryRows));
@@ -312,7 +322,7 @@ namespace DSPAAMod.UI
             if (resolutionLabel) { resolutionLabel.gameObject.SetActive(false); UnityEngine.Object.Destroy(resolutionLabel.gameObject); }
             if (availabilityLabel) { availabilityLabel.gameObject.SetActive(false); UnityEngine.Object.Destroy(availabilityLabel.gameObject); }
             availabilityLabel = null;
-            shownAvailability = null;
+            shownAvailability = shownFsrAvailability = null;
             foreach (var row in movedRows) if (row.Key) row.Key.anchoredPosition = row.Value;
             movedRows.Clear();
             if (layoutRoot) layoutRoot.sizeDelta = originalContentSize;

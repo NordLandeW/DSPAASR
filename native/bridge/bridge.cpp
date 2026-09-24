@@ -1,5 +1,6 @@
 #include "api.h"
 #include "core/preset-evidence.h"
+#include "fsr/session.h"
 #include "ngx/session.h"
 #include "output-backup.h"
 
@@ -26,6 +27,8 @@ static_assert(offsetof(DspAaFrame, reserved2) == 108);
 static_assert(sizeof(DspAaStatus) == 288);
 static_assert(sizeof(DspAaOptimalSettings) == 300);
 static_assert(sizeof(DspAaSupport) == 264);
+static_assert(sizeof(DspAaFsrParameters) == 40);
+static_assert(sizeof(DspAaFsrOptimalSettings) == 304);
 constexpr uint32_t abiVersion = 2;
 constexpr size_t maxPendingFrames = 16; // Shared frame/query backpressure for a stalled consumer.
 enum class Kind { Frame, OptimalSettings, Support, Release, Shutdown };
@@ -33,7 +36,9 @@ struct Command {
     Kind kind = Kind::Frame;
     uintptr_t token{};
     DspAaFrame frame{};
-    std::array<ComPtr<ID3D11Resource>, 4> resources;
+    uint32_t backend = 0;
+    DspAaFsrParameters fsr{};
+    std::array<ComPtr<ID3D11Resource>, 5> resources;
 };
 
 struct CameraFeature {
@@ -45,6 +50,7 @@ struct CameraFeature {
 struct OptimalRequest {
     uintptr_t token{};
     DspAaOptimalSettings settings{};
+    uint32_t backend = 0, jitterPhases = 0;
 };
 
 struct Service {
@@ -64,6 +70,9 @@ struct Service {
     dspaa::PresetEvidence evidence;
     std::unique_ptr<dspaa::NgxDevice> device;
     std::unordered_map<uint64_t, CameraFeature> features;
+    std::shared_ptr<dspaa::Dx11Dx12> graphicsBridge;
+    std::unique_ptr<dspaa::FsrDevice> fsrDevice;
+    std::unordered_map<uint64_t, std::unique_ptr<dspaa::FsrFeature>> fsrFeatures;
 };
 
 Service& service() {
@@ -132,7 +141,7 @@ void* enqueue(std::unique_ptr<Command> command) {
         settings.outputWidth = command->frame.outputWidth;
         settings.outputHeight = command->frame.outputHeight;
         settings.quality = command->frame.quality;
-        state.optimalRequests[command->frame.camera] = {token, settings};
+        state.optimalRequests[command->frame.camera] = {token, settings, command->backend, 0};
     }
     if (command->kind == Kind::Support) {
         DspAaSupport support{};
@@ -159,8 +168,10 @@ void logFrameTextures(const Command& command) {
     state.log << "[DSPAAMod] Rejected camera=" << command.frame.camera << " frame=" << command.frame.frame
               << " input=" << command.frame.width << 'x' << command.frame.height
               << " output=" << command.frame.outputWidth << 'x' << command.frame.outputHeight << '\n';
-    constexpr const char* names[] = {"color", "output", "depth", "motion"};
+    constexpr const char* names[] = {"color", "output", "depth", "motion", "opaque-color"};
     for (size_t i = 0; i < command.resources.size(); ++i) {
+        if (i == 4 && !command.resources[i])
+            continue;
         ComPtr<ID3D11Texture2D> texture;
         state.log << "[DSPAAMod] " << names[i] << ": ";
         if (SUCCEEDED(command.resources[i].As(&texture))) {
@@ -247,6 +258,36 @@ void ensureDevice(ID3D11Device* device) {
     }
 }
 
+void ensureFsrDevice(ID3D11Device* device) {
+    auto& state = service();
+    if (state.graphicsBridge && state.graphicsBridge->device11() != device) {
+        state.graphicsBridge->drain();
+        state.fsrFeatures.clear();
+        state.fsrDevice.reset();
+        state.graphicsBridge.reset();
+    }
+    if (!state.graphicsBridge)
+        state.graphicsBridge = std::make_shared<dspaa::Dx11Dx12>(device);
+    if (!state.fsrDevice) {
+        auto candidate = std::make_unique<dspaa::FsrDevice>(state.graphicsBridge, state.runtimeDirectory);
+        // Check actual cross-API sharing, not just vendor or feature-level claims.
+        for (auto format : {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT})
+            (void)state.graphicsBridge->texture(2, 2, format, format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+        state.fsrDevice = std::move(candidate); // Publish only after all sharing checks succeed.
+        std::lock_guard lock(state.logMutex);
+        state.log << "[DSPAASR] Analytical FSR provider " << state.fsrDevice->version()
+                  << " selected; ML excluded.\n";
+    }
+}
+void releaseFsr(uint64_t camera) {
+    auto& state = service();
+    const auto it = state.fsrFeatures.find(camera);
+    if (it == state.fsrFeatures.end())
+        return;
+    it->second->drain(); // A render-event acknowledgement alone is not GPU retirement.
+    state.fsrFeatures.erase(it);
+}
+
 void renderSupport(Command& command) {
     auto& state = service();
     DspAaSupport support{};
@@ -262,10 +303,15 @@ void renderSupport(Command& command) {
         if (FAILED(device.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(&adapter)) ||
             FAILED(adapter->GetDesc(&desc)))
             throw std::runtime_error("Cannot identify the active graphics adapter.");
-        if (desc.VendorId != 0x10de)
-            throw std::runtime_error("DLSS requires a supported NVIDIA RTX GPU.");
-        // The same NGX device/capability path is used by subsequent rendering.
-        ensureDevice(device.Get());
+        if (command.backend == 1) {
+            ensureFsrDevice(device.Get());
+            strncpy_s(support.message, state.fsrDevice->version().c_str(), _TRUNCATE);
+        } else {
+            if (desc.VendorId != 0x10de)
+                throw std::runtime_error("DLSS requires a supported NVIDIA RTX GPU.");
+            // The same NGX device/capability path is used by subsequent rendering.
+            ensureDevice(device.Get());
+        }
         support.result = 1;
     } catch (const std::exception& error) {
         support.result = -1;
@@ -285,13 +331,20 @@ void renderOptimalSettings(Command& command) {
     settings.outputWidth = frame.outputWidth;
     settings.outputHeight = frame.outputHeight;
     settings.quality = frame.quality;
+    uint32_t jitterPhases = 0;
     try {
         ComPtr<ID3D11Device> device;
         command.resources[0]->GetDevice(&device);
         if (FAILED(device->GetDeviceRemovedReason()))
             throw std::runtime_error("The D3D11 query device was removed.");
         dspaa::DlssOptimalSettings optimal;
-        if (frame.quality == 0) {
+        if (command.backend == 1) {
+            ensureFsrDevice(device.Get());
+            const auto fsr =
+                state.fsrDevice->resolution(frame.outputWidth, frame.outputHeight, frame.quality);
+            optimal = {fsr.width, fsr.height, fsr.width, fsr.height, fsr.width, fsr.height};
+            jitterPhases = fsr.phases;
+        } else if (frame.quality == 0) {
             optimal = {frame.outputWidth,  frame.outputHeight, frame.outputWidth,
                        frame.outputHeight, frame.outputWidth,  frame.outputHeight};
         } else {
@@ -313,8 +366,10 @@ void renderOptimalSettings(Command& command) {
     std::lock_guard lock(state.queueMutex);
     const auto it = state.optimalRequests.find(frame.camera);
     // An older in-flight query must not overwrite the newly accepted request.
-    if (it != state.optimalRequests.end() && it->second.token == command.token)
+    if (it != state.optimalRequests.end() && it->second.token == command.token) {
         it->second.settings = settings;
+        it->second.jitterPhases = jitterPhases;
+    }
 }
 
 void renderFrame(Command& command) {
@@ -344,6 +399,44 @@ void renderFrame(Command& command) {
             !std::isfinite(frame.motionScaleX) || !std::isfinite(frame.motionScaleY) ||
             !std::isfinite(frame.frameTimeMilliseconds) || frame.frameTimeMilliseconds < 0.0f)
             throw std::invalid_argument("Invalid temporal frame parameters.");
+        if (command.backend == 1) {
+            if (command.resources[4])
+                validateTexture("opaque-color", command.resources[4].Get(), device.Get(), frame.width,
+                                frame.height, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE);
+            ensureFsrDevice(device.Get());
+            state.features.erase(frame.camera);
+            auto& feature = state.fsrFeatures[frame.camera];
+            if (!feature)
+                feature = std::make_unique<dspaa::FsrFeature>(*state.fsrDevice);
+            feature->configure({frame.width, frame.height, frame.outputWidth, frame.outputHeight,
+                                (frame.flags & 1) != 0, (frame.flags & 2) != 0,
+                                command.resources[4] != nullptr});
+            dspaa::FsrFrame input;
+            input.color = color;
+            input.output = output;
+            input.opaqueColor = command.resources[4].Get();
+            input.depth = command.resources[2].Get();
+            input.motion = command.resources[3].Get();
+            input.jitterX = frame.jitterX;
+            input.jitterY = frame.jitterY;
+            input.motionScaleX = frame.motionScaleX;
+            input.motionScaleY = frame.motionScaleY;
+            input.milliseconds = frame.frameTimeMilliseconds;
+            input.reset = (frame.flags & 4) != 0;
+            input.cameraNear = command.fsr.cameraNear;
+            input.cameraFar = command.fsr.cameraFar;
+            input.verticalFov = command.fsr.verticalFov;
+            input.preExposure = command.fsr.preExposure;
+            input.viewSpaceToMeters = command.fsr.viewSpaceToMeters;
+            input.sharpness = command.fsr.sharpness;
+            feature->evaluate(input);
+            const dspaa::PresetEvidence noNgxPreset;
+            const auto message =
+                "Analytical FSR " + state.fsrDevice->version() + " executed through the shared D3D12 bridge.";
+            statusFor(frame.camera, frame.frame, 1, 0, message.c_str(), &noNgxPreset);
+            return;
+        }
+        releaseFsr(frame.camera);
         ensureDevice(device.Get());
         auto& cameraFeature = state.features[frame.camera];
         auto& feature = cameraFeature.feature;
@@ -403,6 +496,7 @@ void renderFrame(Command& command) {
         else if (canCopyFallback)
             context->CopyResource(output, color);
         state.features.erase(frame.camera);
+        state.fsrFeatures.erase(frame.camera); // The FSR destructor drains or quarantines its GPU resources.
         logFrameTextures(command);
         statusFor(frame.camera, frame.frame, -1, frame.preset, error.what());
     }
@@ -435,6 +529,7 @@ void __stdcall renderEvent(int eventId, void* opaque) noexcept {
         } else if (command->kind == Kind::Support) {
             renderSupport(*command);
         } else if (command->kind == Kind::Release) {
+            releaseFsr(command->frame.camera);
             state.features.erase(command->frame.camera);
             {
                 std::lock_guard lock(state.queueMutex);
@@ -442,6 +537,11 @@ void __stdcall renderEvent(int eventId, void* opaque) noexcept {
             }
             statusFor(command->frame.camera, 0, 2, 0, "Camera released; queued texture users have drained.");
         } else {
+            if (state.graphicsBridge)
+                state.graphicsBridge->drain();
+            state.fsrFeatures.clear();
+            state.fsrDevice.reset();
+            state.graphicsBridge.reset();
             state.features.clear();
             state.device.reset();
             {
@@ -480,7 +580,7 @@ int __cdecl DspAaInitialize(const wchar_t* runtimeDirectory, const wchar_t* data
             return 0;
         state.runtimeDirectory = fs::absolute(runtimeDirectory);
         state.dataDirectory = fs::absolute(dataDirectory);
-        if (!fs::is_regular_file(state.runtimeDirectory / "nvngx_dlss.dll"))
+        if (!fs::is_directory(state.runtimeDirectory))
             return 0;
         fs::create_directories(state.dataDirectory);
         std::lock_guard logLock(state.logMutex);
@@ -495,7 +595,8 @@ int __cdecl DspAaInitialize(const wchar_t* runtimeDirectory, const wchar_t* data
     }
 }
 
-void* __cdecl DspAaQueueFrame(const DspAaFrame* frame) {
+namespace {
+void* queueFrame(const DspAaFrame* frame, const DspAaFsrParameters* fsr) {
     try {
         if (!frame || frame->size != sizeof(DspAaFrame) || frame->version != abiVersion || !frame->camera ||
             !frame->color || !frame->output || !frame->depth || !frame->motion ||
@@ -509,6 +610,11 @@ void* __cdecl DspAaQueueFrame(const DspAaFrame* frame) {
             return nullptr;
         auto command = std::make_unique<Command>();
         command->frame = *frame;
+        if (fsr) {
+            command->backend = 1;
+            command->fsr = *fsr;
+            command->resources[4] = static_cast<ID3D11Resource*>(fsr->opaqueColor);
+        }
         command->resources[0] = static_cast<ID3D11Resource*>(frame->color);
         command->resources[1] = static_cast<ID3D11Resource*>(frame->output);
         command->resources[2] = static_cast<ID3D11Resource*>(frame->depth);
@@ -518,14 +624,29 @@ void* __cdecl DspAaQueueFrame(const DspAaFrame* frame) {
         return nullptr;
     }
 }
+} // namespace
+void* __cdecl DspAaQueueFrame(const DspAaFrame* frame) {
+    return queueFrame(frame, nullptr);
+}
+void* __cdecl DspAaQueueFsrFrame(const DspAaFrame* frame, const DspAaFsrParameters* parameters) {
+    if (!parameters || parameters->size != sizeof(DspAaFsrParameters) || parameters->reserved)
+        return nullptr;
+    return queueFrame(frame, parameters);
+}
 
 void* __cdecl DspAaQueueOptimalSettings(uint64_t camera, void* deviceResource, uint32_t outputWidth,
                                         uint32_t outputHeight, uint32_t quality) {
+    return DspAaQueueOptimalSettingsForBackend(camera, deviceResource, outputWidth, outputHeight, quality, 0);
+}
+void* __cdecl DspAaQueueOptimalSettingsForBackend(uint64_t camera, void* deviceResource, uint32_t outputWidth,
+                                                  uint32_t outputHeight, uint32_t quality, uint32_t backend) {
     try {
-        if (!camera || !deviceResource || !validDimensions(outputWidth, outputHeight) || quality > 4)
+        if (!camera || !deviceResource || !validDimensions(outputWidth, outputHeight) || quality > 4 ||
+            backend > 1)
             return nullptr;
         auto command = std::make_unique<Command>();
         command->kind = Kind::OptimalSettings;
+        command->backend = backend;
         command->frame.camera = camera;
         command->frame.outputWidth = outputWidth;
         command->frame.outputHeight = outputHeight;
@@ -553,12 +674,34 @@ int __cdecl DspAaGetOptimalSettings(uint64_t camera, DspAaOptimalSettings* outpu
     }
 }
 
-void* __cdecl DspAaQueueSupport(void* deviceResource) {
+int __cdecl DspAaGetFsrOptimalSettings(uint64_t camera, DspAaFsrOptimalSettings* output) {
     try {
-        if (!deviceResource)
+        if (!output || output->settings.size != sizeof(DspAaFsrOptimalSettings))
+            return 0;
+        auto& state = service();
+        std::lock_guard lock(state.queueMutex);
+        const auto it = state.optimalRequests.find(camera);
+        if (it == state.optimalRequests.end() || it->second.backend != 1)
+            return 0;
+        output->settings = it->second.settings;
+        output->settings.size = sizeof(DspAaFsrOptimalSettings);
+        output->jitterPhases = it->second.jitterPhases;
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+void* __cdecl DspAaQueueSupport(void* deviceResource) {
+    return DspAaQueueSupportForBackend(deviceResource, 0);
+}
+void* __cdecl DspAaQueueSupportForBackend(void* deviceResource, uint32_t backend) {
+    try {
+        if (!deviceResource || backend > 1)
             return nullptr;
         auto command = std::make_unique<Command>();
         command->kind = Kind::Support;
+        command->backend = backend;
         command->resources[0] = static_cast<ID3D11Resource*>(deviceResource);
         return enqueue(std::move(command));
     } catch (...) {

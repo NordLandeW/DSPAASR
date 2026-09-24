@@ -100,16 +100,16 @@ internal static class Program
     {
         // Catch vendor-only approval, unusable DLSS selection, and loss of the user's
         // AA/model/resolution choices while capabilities are pending or rejected.
-        var pending = DlssAvailability.ForPlatform(true, 0x10de, true, true);
+        var pending = UpscalerAvailability.ForPlatform(true, 0x10de, true, true);
         Require(pending.Pending && !pending.Available, "An NVIDIA vendor ID alone enabled DLSS");
         var states = new[] {
             pending,
-            DlssAvailability.ForPlatform(true, 0x1002, true, true),
-            DlssAvailability.ForPlatform(true, 0x8086, true, true),
-            DlssAvailability.ForPlatform(false, 0x10de, true, true),
-            DlssAvailability.ForPlatform(true, 0x10de, false, true),
-            DlssAvailability.ForPlatform(true, 0x10de, true, false),
-            DlssAvailability.Failed("Test driver/runtime rejection")
+            UpscalerAvailability.ForPlatform(true, 0x1002, true, true),
+            UpscalerAvailability.ForPlatform(true, 0x8086, true, true),
+            UpscalerAvailability.ForPlatform(false, 0x10de, true, true),
+            UpscalerAvailability.ForPlatform(true, 0x10de, false, true),
+            UpscalerAvailability.ForPlatform(true, 0x10de, true, false),
+            UpscalerAvailability.Failed("Test driver/runtime rejection")
         };
         foreach (var state in states)
         {
@@ -122,7 +122,7 @@ internal static class Program
                 "A blocked selection has no user-visible reason");
             foreach (var choice in new[] { AaChoice.None, AaChoice.Msaa, AaChoice.Fxaa, AaChoice.Taa })
                 Require(draft.TrySelectTechnique(choice, state) && draft.Choice == choice, "DLSS rejection disabled a native AA technique");
-            Require(draft.TrySelectTechnique(AaChoice.Dlss, DlssAvailability.Supported) &&
+            Require(draft.TrySelectTechnique(AaChoice.Dlss, UpscalerAvailability.Supported) &&
                 draft.Settings.Model == ModelSelection.TransformerL && draft.Settings.Resolution == ResolutionMode.Balanced,
                 "Capability completion failed to enable DLSS or changed the requested model/resolution");
         }
@@ -130,10 +130,49 @@ internal static class Program
         var reopened = new AaMenuDraft(saved, 0, true);
         Require(!reopened.TrySelectTechnique(AaChoice.Dlss, pending) && reopened.Settings.Equals(saved),
             "Checking support rewrote an already saved DLSS configuration");
-        Require(DlssAvailability.Failed("driver detail").Describe(true).Contains("driver detail"),
+        Require(UpscalerAvailability.Failed("driver detail").Describe(true).Contains("driver detail"),
             "The native failure reason was lost in the translated status");
     }
 
+
+    private static void FsrChecks()
+    {
+        // Detect accidental NVIDIA-only gating, wrong backend capability reuse,
+        // and loss of saved DLSS model / FSR sharpness when switching algorithms.
+        foreach (int vendor in new[] { 0x10de, 0x1002, 0x8086 })
+        {
+            var pending = UpscalerAvailability.ForPlatform(true, vendor, true, true, UpscalerBackend.Fsr);
+            Require(pending.Pending && !pending.Available, "FSR vendor gate bypassed runtime validation");
+            var saved = new AaSettings(AaTechnique.Dlss, ModelSelection.TransformerM, ResolutionMode.Balanced, 0.25f);
+            var menu = new AaMenuDraft(saved, 0, true);
+            Require(!menu.TrySelectTechnique(AaChoice.Fsr, pending) && menu.Settings.Equals(saved), "Pending FSR changed saved settings");
+            Require(!menu.TrySelectTechnique(AaChoice.Fsr, UpscalerAvailability.Supported), "DLSS support was reused to approve FSR");
+            var supported = pending.Complete(true, "3.1.5");
+            Require(menu.TrySelectTechnique(AaChoice.Fsr, supported) && menu.ResolutionEnabled && !menu.ConfigurationEnabled &&
+                menu.NativeMsaa == 0 && menu.NativeFxaa && menu.Settings.Temporal, "FSR selection lost its rendering/fallback policy");
+            menu.SelectResolution(ResolutionMode.Dlaa);
+            Require(menu.Settings.Technique == AaTechnique.Fsr && menu.Settings.Model == ModelSelection.TransformerM && menu.Settings.FsrSharpness == 0.25f,
+                "FSR Native AA migrated to DLSS or overwrote an independent setting");
+            var session = new SettingsSession(saved) { Draft = menu.Settings };
+            session.Cancel(); Require(session.Draft.Equals(saved), "Cancelling FSR leaked settings");
+            session.Draft = menu.Settings; session.Apply(); session.Open();
+            Require(new AaMenuDraft(session.Draft, 0, true).Choice == AaChoice.Fsr, "FSR did not survive apply/reopen");
+            menu.SelectTechnique(AaChoice.Dlss);
+            Require(menu.Settings.Model == ModelSelection.TransformerM && menu.Settings.FsrSharpness == 0.25f, "Backend round-trip overwrote settings");
+            var failed = pending.Complete(false, "interop unavailable");
+            Require(!failed.CanSelect(AaChoice.Fsr) && failed.Describe(false).Contains("interop unavailable"), "FSR failure was hidden or selectable");
+        }
+        Require(!UpscalerAvailability.ForPlatform(false, 0x1002, true, true, UpscalerBackend.Fsr).Pending &&
+            !UpscalerAvailability.ForPlatform(true, 0x1002, false, true, UpscalerBackend.Fsr).Pending &&
+            !UpscalerAvailability.ForPlatform(true, 0x1002, true, false, UpscalerBackend.Fsr).Pending, "FSR ignored missing platform inputs");
+        Require(new RenderResolution(640, 360, 640, 360, 8).JitterPhases == 8 &&
+            new RenderResolution(426, 240, 640, 360, 18).JitterPhases == 18, "FSR SDK jitter phases were replaced by the DLSS minimum");
+        foreach (float invalid in new[] { -0.1f, 1.1f, float.NaN, float.PositiveInfinity })
+        {
+            try { _ = new AaSettings(AaTechnique.Fsr, ModelSelection.Recommended, fsrSharpness: invalid); throw new Exception("Invalid FSR sharpening accepted"); }
+            catch (ArgumentOutOfRangeException) { }
+        }
+    }
 
     private static void ResolutionChecks()
     {
@@ -273,6 +312,11 @@ internal static class Program
             "Capability result marshaling disagrees with the native ABI");
         Require(bridge.RequestSupport(IntPtr.Zero) == IntPtr.Zero && !bridge.TryGetSupport(IntPtr.Zero, out _),
             "A null capability anchor/token was accepted");
+        Require(NativeBridge.FsrParametersSize == 40 && NativeBridge.FsrOptimalSize == 304, "FSR extension ABI is misaligned");
+        Require(bridge.RequestSupport(IntPtr.Zero, 1) == IntPtr.Zero && bridge.RequestOptimal(7, IntPtr.Zero, 640, 360, 0, 1) == IntPtr.Zero &&
+            !bridge.TryGetFsrOptimal(7, out _), "FSR accepted a null device or invented a sizing result");
+        var invalidFrame = new NativeFrame(); var fsrParameters = new NativeFsrParameters();
+        Require(bridge.SubmitFsr(ref invalidFrame, ref fsrParameters) == IntPtr.Zero, "FSR accepted an empty frame");
         const ulong camera = 0xfedcba9876543210;
         IntPtr token = bridge.Release(camera);
         Require(token != IntPtr.Zero && !bridge.TryGetStatus(camera, out _), "Release completed before its render event");
@@ -291,7 +335,7 @@ internal static class Program
         try
         {
             Require(args.Length == 1, "Pass the built native DLL path");
-            ModelPolicyChecks(); MenuChecks(); AvailabilityChecks(); ResolutionChecks(); JitterChecks(); VisibilityChecks(); InteropChecks(args[0]);
+            ModelPolicyChecks(); MenuChecks(); AvailabilityChecks(); FsrChecks(); ResolutionChecks(); JitterChecks(); VisibilityChecks(); InteropChecks(args[0]);
             Console.WriteLine("Model overrides, settings transactions, jitter coverage and real DLL interop passed.");
             return 0;
         }

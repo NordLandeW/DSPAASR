@@ -346,6 +346,59 @@ void superResolutionTests(ID3D11Device* device, ID3D11DeviceContext* context, Ds
     execute(DspAaQueueRelease(frame.camera));
 }
 
+void fsrExtensionTests(ID3D11Device* device, ID3D11DeviceContext* context, DspAaFrame frame,
+                       DXGI_FORMAT format) {
+    frame.camera = 95;
+    frame.quality = 1;
+    frame.outputWidth = 8;
+    frame.outputHeight = 6;
+    std::vector<uint16_t> pixels(8 * 6 * 4, 0x3400);
+    auto output = texture(device, format, D3D11_BIND_UNORDERED_ACCESS, pixels.data(), 8, 6);
+    frame.output = output.Get();
+    DspAaFsrParameters parameters{sizeof(DspAaFsrParameters), 0.1f, 1000.f, 1.f, 1.f, 1.f, 0.f, 0, nullptr};
+    require(!DspAaQueueFsrFrame(&frame, nullptr), "FSR accepted absent parameters");
+    --parameters.size;
+    require(!DspAaQueueFsrFrame(&frame, &parameters), "FSR accepted a wrong parameter ABI");
+    ++parameters.size;
+    parameters.reserved = 1;
+    require(!DspAaQueueFsrFrame(&frame, &parameters), "FSR accepted reserved data");
+    parameters.reserved = 0;
+    auto opaque = texture(device, format, D3D11_BIND_SHADER_RESOURCE);
+    auto destroyed = std::make_shared<std::atomic<bool>>(false);
+    constexpr GUID key{0x60427d5a, 0x8136, 0x48ea, {0x80, 0x7f, 0x12, 0x86, 0x44, 0x30, 0x51, 0x2b}};
+    auto* lifetime = new Lifetime(destroyed);
+    require(SUCCEEDED(opaque->SetPrivateDataInterface(key, lifetime)), "Attach FSR opaque lifetime sentinel");
+    lifetime->Release();
+    parameters.opaqueColor = opaque.Get();
+    auto token = DspAaQueueFsrFrame(&frame, &parameters);
+    require(token != nullptr, "FSR queue rejected a structurally valid packet");
+    opaque.Reset();
+    parameters.opaqueColor = nullptr;
+    require(!*destroyed, "FSR queue did not retain its opaque input");
+    execute(token); // Deliberately wrong depth stops before either vendor runtime initializes.
+    require(*destroyed, "FSR consumption leaked its optional input");
+    DspAaStatus status{};
+    status.size = sizeof(status);
+    require(DspAaGetStatus(95, &status) && status.result == -1 &&
+                std::string(status.message).find("depth") != std::string::npos,
+            "FSR did not report the rejected input role");
+    exactImage(device, context, output.Get(), pixels);
+    DspAaFsrOptimalSettings query{};
+    query.settings.size = sizeof(query);
+    token = DspAaQueueOptimalSettingsForBackend(95, output.Get(), 1280, 720, 1, 1);
+    require(token && DspAaGetFsrOptimalSettings(95, &query) && query.settings.result == 0 &&
+                query.jitterPhases == 0,
+            "FSR sizing did not expose a pending backend-specific result");
+    DspAaCancel(token);
+    execute(token);
+    require(!DspAaGetFsrOptimalSettings(95, &query), "FSR cancellation left a sizing result");
+    require(!DspAaQueueSupportForBackend(output.Get(), 2) &&
+                !DspAaQueueOptimalSettingsForBackend(95, output.Get(), 1280, 720, 1, 2),
+            "Unknown reconstruction backend was accepted");
+    execute(DspAaQueueRelease(95));
+    require(DspAaGetStatus(95, &status) && status.result == 2, "FSR camera retirement missing");
+}
+
 } // namespace
 int wmain(int argc, wchar_t** argv) {
     fs::path data;
@@ -410,6 +463,7 @@ int wmain(int argc, wchar_t** argv) {
         status.size = sizeof(status);
         queryTests(device.Get(), frame);
         superResolutionTests(device.Get(), context.Get(), frame, colorFormat, motionFormat, typeless);
+        fsrExtensionTests(device.Get(), context.Get(), frame, colorFormat);
         require(!DspAaGetStatus(frame.camera, &status), "Unexecuted frame has status");
         std::vector<void*> pending;
         for (int i = 0; i < 1024; ++i) {
