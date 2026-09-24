@@ -178,7 +178,7 @@ namespace DSPAAMod.UI
         private static Text FindLabel(UIOptionWindow owner, string key)
         {
             foreach (var localizer in owner.GetComponentsInChildren<Localizer>(true))
-                if (AaLabels.Matches(localizer.stringKey, key))
+                if (AaLabels.Matches(localizer.stringKey, key) || AaLabels.Matches(localizer.name, key))
                 {
                     var text = localizer.GetComponent<Text>();
                     if (text) return text;

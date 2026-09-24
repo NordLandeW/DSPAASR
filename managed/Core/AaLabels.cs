@@ -10,8 +10,8 @@ namespace DSPAAMod.Core
         {
             if (string.IsNullOrWhiteSpace(value)) return false;
             value = value.Trim();
-            return value == acronym || value.EndsWith("(" + acronym + ")", StringComparison.Ordinal) ||
-                value.EndsWith("（" + acronym + "）", StringComparison.Ordinal);
+            return value.Equals(acronym, StringComparison.OrdinalIgnoreCase) || value.EndsWith("(" + acronym + ")", StringComparison.OrdinalIgnoreCase) ||
+                value.EndsWith("（" + acronym + "）", StringComparison.OrdinalIgnoreCase);
         }
     }
 }
