@@ -77,5 +77,8 @@ if(BUILD_TESTING)
     set_tests_properties(dependency-no-clobber PROPERTIES TIMEOUT 15)
     add_test(NAME managed-policy-interop COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -NonInteractive
         -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/test-managed.ps1")
+    add_test(NAME game-sandbox-rollback COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -NonInteractive
+        -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/test-game-sandbox.ps1")
+    set_tests_properties(game-sandbox-rollback PROPERTIES TIMEOUT 15)
     set_tests_properties(managed-policy-interop PROPERTIES TIMEOUT 60)
 endif()

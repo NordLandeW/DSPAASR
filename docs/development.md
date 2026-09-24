@@ -9,7 +9,7 @@ Run the commands below from the repository root. The managed assembly name, nati
 - Native-resolution DLAA and genuine lower-resolution DLSS Super Resolution, with SDK-selected input dimensions and native-resolution output/UI.
 - Explicit preset/model selection, independent from SR Quality/Balanced/Performance modes.
 - CNN and Transformer choices must reflect the model actually used. An accepted NGX create/evaluate call alone is not evidence that a deprecated preset was honored.
-- No frame generation, ray reconstruction, driver overrides, save edits, or game-file replacement.
+- No frame generation, ray reconstruction, driver overrides or save conversion. The runtime does not replace game assemblies.
 
 ## Native development
 
@@ -59,6 +59,23 @@ For the separate SR matrix, run `./tools/run-preset-probes.ps1 -SuperResolution`
 
 
 No NVIDIA-hardware/driver-dependent test is part of default CTest. Its resource/fallback test uses the Windows WARP software D3D11 device. Do not infer supported hardware or performance from a build/CTest pass. Development runtime output contains NVIDIA's diagnostic watermark; never distribute that DLL.
+
+### Isolated in-game validation
+
+`tools/game-sandbox.ps1` is an explicit, interactive developer workflow, not part of a build, test or package command. Close DSP first and supply a new session directory, an installed BepInEx 5 core directory and an already validated, unpacked package:
+
+```powershell
+./tools/game-sandbox.ps1 -Action Prepare -SessionDirectory artifacts/game-check `
+    -CoreDirectory 'C:/Local/BepInEx/core' -PackageDirectory dist/DSPAASR-1.1.0
+# Read the emitted OverrideRoot and explicitly set the game's Configs/path.txt to it.
+./tools/game-sandbox.ps1 -Action Run -SessionDirectory artifacts/game-check -MaximumSeconds 1200
+# Only if the host was interrupted, after closing DSP:
+./tools/game-sandbox.ps1 -Action Restore -SessionDirectory artifacts/game-check
+```
+
+Use `GameDirectory` when the game is installed elsewhere. Preparation copies the core and plugin into a new private profile and backs up the existing `Configs/path.txt` without changing the game. Run refuses an unredirected data path, an existing game process or modified plugin payload; it requests windowed 1280×720 (the game's own options may override this), records its PID and bounds the session lifetime. The child receives DSP's Steam App ID (`1366540`) without altering the parent environment or Steam configuration. Steam must already be running with access to the game.
+
+The game's own path override isolates its file-based saves, blueprints, achievements and options. It does not isolate Steam account services; use a new in-game Sandbox world, not a personal save. On exit or timeout, the runner stops only its owned process and restores the original path file byte-for-byte. It refuses to overwrite a concurrent external edit. After an abrupt host termination, retain `sandbox.json` and `path.before` and use Restore rather than copying an entire installation/profile. Logs and receipts remain in the session directory. The default headless `game-sandbox-rollback` test checks this filesystem/refusal contract with disposable fixtures; it never starts the real game.
 
 ### Testing with an existing NVIDIA App override
 
