@@ -90,6 +90,46 @@ try {
     }
     Require $failed 'Early preparation did not reject an existing BOM-prefixed provider'
     Require ((Get-FileHash $boot).Hash -eq $conflictHash) 'Existing PreInit provider was modified'
+    # The offline guard is an already transformed private game assembly, not a
+    # plugin whose absence would silently allow normal Steam initialization.
+    $managed = Join-Path $game 'DSPGAME_Data/Managed'
+    $null = New-Item -ItemType Directory -Path $managed
+    $offlineAssembly = Join-Path $managed 'Assembly-CSharp.dll'
+    $offlineBytes = [byte[]](21,22,23)
+    [IO.File]::WriteAllBytes($offlineAssembly, $offlineBytes)
+    $offlineHash = (Get-FileHash $offlineAssembly).Hash
+    $runtimeReceipt = Join-Path $game 'steam-free-runtime.json'
+    @{SourceGameDirectory='different-original-game';SteamFreeAssemblySHA256=$offlineHash} | ConvertTo-Json | Set-Content $runtimeReceipt
+    $offlineSession = Join-Path $temporary 'offline-session'
+    $failed = $false
+    try { & $runner -Action Prepare -GameDirectory $game -CoreDirectory $core -PackageDirectory $package -SessionDirectory $offlineSession } catch {
+        $failed = $_.Exception.Message -like '*explicit pinned assembly*'
+    }
+    Require $failed 'An offline runtime was prepared as an ordinary Steam session'
+    & $runner -Action Prepare -GameDirectory $game -CoreDirectory $core -PackageDirectory $package -SessionDirectory $offlineSession -SteamFreeAssemblySha256 $offlineHash | Out-Null
+    $offlineManifest = Get-Content (Join-Path $offlineSession 'sandbox.json') -Raw | ConvertFrom-Json
+    Require ($offlineManifest.SteamFreeAssemblySha256 -eq $offlineHash) 'Steam-free policy was not persisted'
+    foreach ($failure in @('changed','missing','native-library','policy-missing')) {
+        [IO.File]::WriteAllBytes($offlineAssembly, $offlineBytes)
+        if ($failure -eq 'changed') { [IO.File]::WriteAllBytes($offlineAssembly, [byte[]](24,25)) }
+        if ($failure -eq 'missing') { Remove-Item $offlineAssembly }
+        $leakedLibrary = Join-Path $plugins 'steam_api64.dll'
+        if ($failure -eq 'native-library') { [IO.File]::WriteAllBytes($leakedLibrary, [byte[]](26,27)) }
+        if ($failure -eq 'policy-missing') {
+            $offlineManifest.PSObject.Properties.Remove('SteamFreeAssemblySha256')
+            $offlineManifest | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $offlineSession 'sandbox.json')
+        }
+        [IO.File]::WriteAllText($path, $offlineManifest.OverrideRoot + "`n", [Text.UTF8Encoding]::new($false))
+        $failed = $false
+        try { & $runner -Action Run -GameDirectory $game -SessionDirectory $offlineSession } catch {
+            $failed = $_.Exception.Message -like '*Steam-free*'
+        }
+        Require $failed "Offline launch did not refuse $failure without repeated command-line policy"
+        Require (!(Test-Path (Join-Path $offlineSession 'process.json'))) 'Unsafe offline run created a process receipt'
+        Require ((Get-FileHash $path).Hash -eq $offlineManifest.OriginalSHA256) 'Offline refusal failed path rollback'
+        if (Test-Path $leakedLibrary) { Remove-Item $leakedLibrary }
+    }
+    Write-Output 'Steam-free session pinning, changed/missing assemblies, native-library exclusion and absent-policy refusal passed.'
     Write-Output 'Early overlay: exact BOM/CRLF rollback, absent/existing DLL restoration, failed-run cleanup, idempotence and external/provider edit protection passed.'
     Write-Output 'Sandbox prepare/launch refusal, exact-byte rollback, idempotence and concurrent-edit protection passed; game launches=0.'
 }

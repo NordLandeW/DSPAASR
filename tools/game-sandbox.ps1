@@ -5,6 +5,7 @@ param(
     [string]$GameDirectory = 'E:/SteamLibrary/steamapps/common/Dyson Sphere Program',
     [string]$CoreDirectory = '',
     [string]$PackageDirectory = '',
+    [string]$SteamFreeAssemblySha256 = '',
     [ValidateRange(60,3600)][int]$MaximumSeconds = 1200
 )
 # Explicit developer workflow, never called by build/CTest/package. No deployment
@@ -17,6 +18,21 @@ $game = [IO.Path]::GetFullPath($GameDirectory, $root)
 $pathFile = Join-Path $game 'Configs/path.txt'
 $manifestPath = Join-Path $session 'sandbox.json'
 function Get-Hash([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
+function Assert-SteamFree([string]$ExpectedHash) {
+    $assembly = Join-Path $game 'DSPGAME_Data/Managed/Assembly-CSharp.dll'
+    $receipt = Join-Path $game 'steam-free-runtime.json'
+    if ($ExpectedHash -notmatch '^[0-9a-fA-F]{64}$' -or
+        !(Test-Path -LiteralPath $assembly -PathType Leaf) -or
+        !(Test-Path -LiteralPath $receipt -PathType Leaf) -or
+        (Get-Hash $assembly) -ne $ExpectedHash) {
+        throw 'Steam-free diagnostics require the exact validated private game assembly.'
+    }
+    $runtime = Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json
+    if ($runtime.SteamFreeAssemblySHA256 -ne $ExpectedHash -or $runtime.SourceGameDirectory -eq $game -or
+        @(Get-ChildItem -LiteralPath $game -Filter 'steam_api*.dll' -File -Recurse).Count) {
+        throw 'Steam-free runtime identity changed or a native Steam API library is present.'
+    }
+}
 function Restore-SandboxPath($Manifest) {
     if (!(Test-Path -LiteralPath $pathFile -PathType Leaf)) { throw 'Owned path override disappeared; do not overwrite another edit.' }
     $current = [IO.File]::ReadAllText($pathFile).Trim().Replace('\','/')
@@ -41,6 +57,10 @@ if ($Action -eq 'Prepare') {
     if (!(Test-Path -LiteralPath (Join-Path $core 'BepInEx.Preloader.dll')) -or
         !(Test-Path -LiteralPath (Join-Path $package 'DSPAAMod.dll')) -or
         !(Test-Path -LiteralPath $pathFile -PathType Leaf)) { throw 'Required core/package/original path config is missing.' }
+    if ($SteamFreeAssemblySha256) { Assert-SteamFree $SteamFreeAssemblySha256 }
+    elseif (Test-Path -LiteralPath (Join-Path $game 'steam-free-runtime.json')) {
+        throw 'A Steam-free runtime requires an explicit pinned assembly during Prepare.'
+    }
     $null = New-Item -ItemType Directory -Path $session
     Copy-Item -LiteralPath $pathFile -Destination (Join-Path $session 'path.before')
     $coreTarget = Join-Path $session 'BepInEx/core'
@@ -56,7 +76,8 @@ if ($Action -eq 'Prepare') {
         $copied += [ordered]@{Name=$_.Name; SHA256=$hash}
     }
     $manifest = [ordered]@{GameDirectory=$game; SessionDirectory=$session; OverrideRoot=((Join-Path $session 'game-data').Replace('\','/') + '/');
-        OriginalSHA256=(Get-Hash (Join-Path $session 'path.before')); Payload=$copied; UTC=[DateTime]::UtcNow.ToString('o')}
+        OriginalSHA256=(Get-Hash (Join-Path $session 'path.before')); Payload=$copied;
+        SteamFreeAssemblySha256=$SteamFreeAssemblySha256; UTC=[DateTime]::UtcNow.ToString('o')}
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
     $manifest | ConvertTo-Json -Depth 5
     Write-Output 'Prepared only. Explicitly set Configs/path.txt to OverrideRoot, then Run. No game launched.'
@@ -81,20 +102,36 @@ try {
     foreach ($file in $manifest.Payload) {
         if ((Get-Hash (Join-Path $session ('BepInEx/plugins/DSPAASR/' + $file.Name))) -ne $file.SHA256) { throw 'Sandbox payload changed since preparation.' }
     }
+    $expectedSteamFree = if ($manifest.PSObject.Properties['SteamFreeAssemblySha256']) { [string]$manifest.SteamFreeAssemblySha256 } else { '' }
+    if ($SteamFreeAssemblySha256 -and $SteamFreeAssemblySha256 -ne $expectedSteamFree) {
+        throw 'Steam-free launch policy cannot be changed after Prepare.'
+    }
+    if ($expectedSteamFree) { Assert-SteamFree $expectedSteamFree }
+    elseif (Test-Path -LiteralPath (Join-Path $game 'steam-free-runtime.json')) {
+        throw 'Steam-free runtime has no pinned session policy; refusing ordinary launch.'
+    }
     $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $game 'DSPGAME.exe'))
     $start.WorkingDirectory = $game
     $start.UseShellExecute = $false
-    # Direct launch must supply the real game's App ID, as Steam normally does.
-    # Child-only environment: no Steam/account configuration or steam_appid.txt edits.
-    $start.Environment['SteamAppId'] = '1366540'
-    $start.Environment['SteamGameId'] = '1366540'
+    # The pinned private assembly disables native Steam entry points even if
+    # Doorstop/BepInEx fails. Removing App IDs alone is not isolation. The session
+    # policy is persistent: a subsequent Run cannot silently revert to Steam.
+    # Child-only environment: no client/account or steam_appid.txt changes.
+    if ($expectedSteamFree) {
+        $null = $start.Environment.Remove('SteamAppId')
+        $null = $start.Environment.Remove('SteamGameId')
+        $start.Environment['DSPAASR_FG_VALIDATION_ROOT'] = $session
+    } else {
+        $start.Environment['SteamAppId'] = '1366540'
+        $start.Environment['SteamGameId'] = '1366540'
+    }
     foreach ($arg in @('--doorstop-enable','true','--doorstop-target',(Join-Path $session 'BepInEx/core/BepInEx.Preloader.dll'),
         '-screen-fullscreen','0','-screen-width','1280','-screen-height','720','-logFile',(Join-Path $session 'Player.log'))) {
         $start.ArgumentList.Add($arg)
     }
     $process = [Diagnostics.Process]::Start($start)
     [ordered]@{PID=$process.Id; Executable=$start.FileName; SessionDirectory=$session; MaximumSeconds=$MaximumSeconds;
-        StartedUTC=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json |
+        StartedUTC=[DateTime]::UtcNow.ToString('o'); SteamFreeAssemblySha256=$expectedSteamFree} | ConvertTo-Json |
         Set-Content -LiteralPath (Join-Path $session 'process.json') -Encoding utf8NoBOM
     Write-Output "Game sandbox PID=$($process.Id); only the temporary data root is active."
     if (!$process.WaitForExit($MaximumSeconds * 1000)) {
