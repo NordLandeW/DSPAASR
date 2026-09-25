@@ -1,5 +1,6 @@
 #include "shadow.h"
 #include "constants.h"
+#include "upload.h"
 #include <algorithm>
 #include <atomic>
 #include <bitset>
@@ -234,7 +235,8 @@ struct __declspec(uuid("FB267A8C-C3C1-4822-ACBD-F47FA124219A")) Facts final : IU
         }
         return true;
     }
-    uint64_t updatePages(unsigned first, unsigned last, const void* source, uint64_t epoch) {
+    uint64_t updatePages(unsigned first, unsigned last, const void* source, uint64_t epoch,
+                         bool uploadMemory) {
         uint64_t copied = 0;
         // Never create pages here, especially from a completed cold ticket:
         // a retired request cannot resurrect demand that was already evicted.
@@ -251,8 +253,9 @@ struct __declspec(uuid("FB267A8C-C3C1-4822-ACBD-F47FA124219A")) Facts final : IU
                 page.valid.reset();
             const auto local = static_cast<unsigned>(begin - offset);
             const auto bytes = static_cast<unsigned>(end - begin);
-            std::memcpy(page.data.get() + local, static_cast<const unsigned char*>(source) + (begin - first),
-                        bytes);
+            copyObservedBytes(page.data.get() + local,
+                              static_cast<const unsigned char*>(source) + (begin - first), bytes,
+                              uploadMemory);
             if (local == 0 && bytes == ConstantShadow::iaPageBytes)
                 page.valid.set();
             else
@@ -297,22 +300,23 @@ struct __declspec(uuid("FB267A8C-C3C1-4822-ACBD-F47FA124219A")) Facts final : IU
     // snapshots are bounded; large CBs copy sparse cells, large IA copies only
     // resident demand/lookahead pages. Neither path scans a whole large pool.
     // Return bytes actually read from source, not subsequent cached-cell copies.
-    uint64_t update(unsigned first, unsigned last, const void* source, bool rememberSmall, uint64_t epoch) {
+    uint64_t update(unsigned first, unsigned last, const void* source, bool rememberSmall, uint64_t epoch,
+                    bool uploadMemory = false) {
         if (!source || first > last || last > description.ByteWidth) {
             invalidate();
             return 0;
         }
         if (pagedInput())
-            return updatePages(first, last, source, epoch);
+            return updatePages(first, last, source, epoch, uploadMemory);
         uint64_t sourceBytes = 0;
         if (rememberSmall && first == 0 && last == description.ByteWidth && ensureSnapshot()) {
-            std::memcpy(snapshot.get(), source, last);
+            copyObservedBytes(snapshot.get(), source, last, uploadMemory);
             sourceBytes += last;
             budget->copied += last;
             snapshotEpoch = epoch;
             snapshotValid = true;
         } else if (rememberSmall && snapshotValid && snapshotEpoch == epoch) {
-            std::memcpy(snapshot.get() + first, source, last - first);
+            copyObservedBytes(snapshot.get() + first, source, last - first, uploadMemory);
             sourceBytes += last - first;
             budget->copied += last - first;
         } else
@@ -326,8 +330,9 @@ struct __declspec(uuid("FB267A8C-C3C1-4822-ACBD-F47FA124219A")) Facts final : IU
                 cell.epoch = epoch;
                 budget->copied += bytes;
             } else if (offset >= first && end <= last) {
-                std::memcpy(cell.value.data(), static_cast<const unsigned char*>(source) + offset - first,
-                            bytes);
+                copyObservedBytes(cell.value.data(),
+                                  static_cast<const unsigned char*>(source) + offset - first, bytes,
+                                  uploadMemory);
                 sourceBytes += bytes;
                 cell.valid = true;
                 cell.epoch = epoch;
@@ -866,7 +871,7 @@ void ConstantShadow::beforeUnmap(ID3D11DeviceContext* context, ID3D11Resource* r
         }
         const auto start = std::chrono::steady_clock::now();
         const auto copied = value->update(0, value->description.ByteWidth, source,
-                                          value->description.ByteWidth <= smallBytes, epoch);
+                                          value->description.ByteWidth <= smallBytes, epoch, true);
         const auto elapsed =
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
                 .count();
