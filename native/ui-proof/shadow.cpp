@@ -1,17 +1,17 @@
 #include "shadow.h"
 #include "constants.h"
-#include <wrl/client.h>
 #include <atomic>
 #include <chrono>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <wrl/client.h>
 
 namespace dspaa::proof {
 namespace {
 using Microsoft::WRL::ComPtr;
-constexpr GUID bufferKey{0xa41ac69b,0xc695,0x498b,{0x92,0x4f,0x39,0x04,0x8c,0x0c,0x11,0x23}};
+constexpr GUID bufferKey{0xa41ac69b, 0xc695, 0x498b, {0x92, 0x4f, 0x39, 0x04, 0x8c, 0x0c, 0x11, 0x23}};
 struct Budget {
     const uint64_t limit;
     std::atomic<uint64_t> bytes{0}, peak{0}, epoch{1}, copied{0}, invalidations{0};
@@ -19,17 +19,25 @@ struct Budget {
     std::atomic<uint64_t> queued{0}, published{0}, stale{0}, failed{0}, pending{0};
     std::atomic<uint64_t> adopted{0}, attachmentFailures{0}, liveBuffers{0};
     std::atomic<bool> active{true}, quarantined{false};
-    explicit Budget(uint64_t maximum):limit(maximum){}
+    explicit Budget(uint64_t maximum) : limit(maximum) {}
     bool reserve(uint64_t count) {
-        auto used=bytes.load();
-        do { if(used>limit || count>limit-used)return false; }
-        while(!bytes.compare_exchange_weak(used,used+count));
-        const auto next=used+count;auto previous=peak.load();
-        while(previous<next && !peak.compare_exchange_weak(previous,next)){}
+        auto used = bytes.load();
+        do {
+            if (used > limit || count > limit - used)
+                return false;
+        } while (!bytes.compare_exchange_weak(used, used + count));
+        const auto next = used + count;
+        auto previous = peak.load();
+        while (previous < next && !peak.compare_exchange_weak(previous, next)) {
+        }
         return true;
     }
 };
-struct Cell {std::array<float,4> value{};uint64_t epoch=0;bool valid=false;};
+struct Cell {
+    std::array<float, 4> value{};
+    uint64_t epoch = 0;
+    bool valid = false;
+};
 // No reference back to the resource or manager: attaching this object cannot
 // create a COM cycle. Pending tickets live separately in the bounded manager.
 struct __declspec(uuid("FB267A8C-C3C1-4822-ACBD-F47FA124219A")) Facts final : IUnknown {
@@ -38,98 +46,181 @@ struct __declspec(uuid("FB267A8C-C3C1-4822-ACBD-F47FA124219A")) Facts final : IU
     const D3D11_BUFFER_DESC description;
     std::mutex mutex;
     std::unique_ptr<unsigned char[]> snapshot;
-    std::map<unsigned,Cell> cells;
-    const unsigned char* mapping=nullptr;
-    uint64_t charged=sizeof(Facts), revision=1, snapshotEpoch=0, mappingEpoch=0;
-    bool snapshotValid=false;
-    Facts(std::shared_ptr<Budget> owner,const D3D11_BUFFER_DESC& desc):budget(std::move(owner)),description(desc){++budget->liveBuffers;}
-    ~Facts(){budget->bytes.fetch_sub(charged);--budget->liveBuffers;}
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** output) override {
-        if(!output)return E_POINTER;*output=nullptr;
-        if(iid!=IID_IUnknown && iid!=__uuidof(Facts))return E_NOINTERFACE;
-        *output=static_cast<IUnknown*>(this);AddRef();return S_OK;
+    std::map<unsigned, Cell> cells;
+    const unsigned char* mapping = nullptr;
+    uint64_t charged = sizeof(Facts), revision = 1, snapshotEpoch = 0, mappingEpoch = 0;
+    bool snapshotValid = false;
+    Facts(std::shared_ptr<Budget> owner, const D3D11_BUFFER_DESC& desc)
+        : budget(std::move(owner)), description(desc) {
+        ++budget->liveBuffers;
     }
-    ULONG STDMETHODCALLTYPE AddRef() override{return ++references;}
-    ULONG STDMETHODCALLTYPE Release() override {const auto left=--references;if(!left)delete this;return left;}
+    ~Facts() {
+        budget->bytes.fetch_sub(charged);
+        --budget->liveBuffers;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
+        if (!output)
+            return E_POINTER;
+        *output = nullptr;
+        if (iid != IID_IUnknown && iid != __uuidof(Facts))
+            return E_NOINTERFACE;
+        *output = static_cast<IUnknown*>(this);
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return ++references;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const auto left = --references;
+        if (!left)
+            delete this;
+        return left;
+    }
     void invalidate() {
-        ++revision;snapshotValid=false;
-        for(auto& entry:cells)entry.second.valid=false;
+        ++revision;
+        snapshotValid = false;
+        for (auto& entry : cells)
+            entry.second.valid = false;
         ++budget->invalidations;
     }
     bool ensureSnapshot() {
-        if(snapshot)return true;
-        const auto size=description.ByteWidth;
-        if(size>ConstantShadow::smallBytes || !budget->reserve(size))return false;
-        try {snapshot=std::make_unique<unsigned char[]>(size);charged+=size;}
-        catch(...) {budget->bytes.fetch_sub(size);return false;}
+        if (snapshot)
+            return true;
+        const auto size = description.ByteWidth;
+        if (size > ConstantShadow::smallBytes || !budget->reserve(size))
+            return false;
+        try {
+            snapshot = std::make_unique<unsigned char[]>(size);
+            charged += size;
+        } catch (...) {
+            budget->bytes.fetch_sub(size);
+            return false;
+        }
         return true;
     }
     // The caller owns mutex and validates the source lifetime. Complete small
     // snapshots are bounded; large WC pools copy ONLY previously requested cells.
     // Return bytes actually read from source, not subsequent cached-cell copies.
-    uint64_t update(unsigned first,unsigned last,const void* source,bool rememberSmall,uint64_t epoch) {
-        if(!source || first>last || last>description.ByteWidth){invalidate();return 0;}
-        uint64_t sourceBytes=0;
-        if(rememberSmall && first==0 && last==description.ByteWidth && ensureSnapshot()) {
-            std::memcpy(snapshot.get(),source,last);sourceBytes+=last;budget->copied+=last;
-            snapshotEpoch=epoch;snapshotValid=true;
-        } else if(rememberSmall && snapshotValid && snapshotEpoch==epoch) {
-            std::memcpy(snapshot.get()+first,source,last-first);sourceBytes+=last-first;budget->copied+=last-first;
-        } else snapshotValid=false;
-        for(auto& [offset,cell]:cells) {
-            if(snapshotValid && snapshotEpoch==epoch) {
-                std::memcpy(cell.value.data(),snapshot.get()+offset,16);
-                cell.valid=true;cell.epoch=epoch;budget->copied+=16;
-            } else if(offset>=first && offset+16<=last) {
-                std::memcpy(cell.value.data(),static_cast<const unsigned char*>(source)+offset-first,16);
-                sourceBytes+=16;cell.valid=true;cell.epoch=epoch;budget->copied+=16;
-            } else if(offset<last && offset+16>first)cell.valid=false;
+    uint64_t update(unsigned first, unsigned last, const void* source, bool rememberSmall, uint64_t epoch) {
+        if (!source || first > last || last > description.ByteWidth) {
+            invalidate();
+            return 0;
+        }
+        uint64_t sourceBytes = 0;
+        if (rememberSmall && first == 0 && last == description.ByteWidth && ensureSnapshot()) {
+            std::memcpy(snapshot.get(), source, last);
+            sourceBytes += last;
+            budget->copied += last;
+            snapshotEpoch = epoch;
+            snapshotValid = true;
+        } else if (rememberSmall && snapshotValid && snapshotEpoch == epoch) {
+            std::memcpy(snapshot.get() + first, source, last - first);
+            sourceBytes += last - first;
+            budget->copied += last - first;
+        } else
+            snapshotValid = false;
+        for (auto& [offset, cell] : cells) {
+            if (snapshotValid && snapshotEpoch == epoch) {
+                std::memcpy(cell.value.data(), snapshot.get() + offset, 16);
+                cell.valid = true;
+                cell.epoch = epoch;
+                budget->copied += 16;
+            } else if (offset >= first && offset + 16 <= last) {
+                std::memcpy(cell.value.data(), static_cast<const unsigned char*>(source) + offset - first,
+                            16);
+                sourceBytes += 16;
+                cell.valid = true;
+                cell.epoch = epoch;
+                budget->copied += 16;
+            } else if (offset < last && offset + 16 > first)
+                cell.valid = false;
         }
         return sourceBytes;
     }
-    bool readCell(unsigned offset,std::array<float,4>& output,const char*& failure) {
-        if(mapping){failure="buffer-mapped";return false;}
-        if(offset>description.ByteWidth || description.ByteWidth-offset<16 || offset%16){failure="cell-physical-range";return false;}
-        auto found=cells.find(offset);
-        if(found==cells.end()) {
-            if(cells.size()>=ConstantShadow::maximumCells){failure="cell-limit";return false;}
-            constexpr auto cost=sizeof(Cell)+64;
-            if(!budget->reserve(cost)){failure="byte-budget";return false;}
-            try {found=cells.emplace(offset,Cell{}).first;charged+=cost;}
-            catch(...) {budget->bytes.fetch_sub(cost);throw;}
+    bool readCell(unsigned offset, std::array<float, 4>& output, const char*& failure) {
+        if (mapping) {
+            failure = "buffer-mapped";
+            return false;
         }
-        auto& cell=found->second;
-        const auto epoch=budget->epoch.load();
+        if (offset > description.ByteWidth || description.ByteWidth - offset < 16 || offset % 16) {
+            failure = "cell-physical-range";
+            return false;
+        }
+        auto found = cells.find(offset);
+        if (found == cells.end()) {
+            if (cells.size() >= ConstantShadow::maximumCells) {
+                failure = "cell-limit";
+                return false;
+            }
+            constexpr auto cost = sizeof(Cell) + 64;
+            if (!budget->reserve(cost)) {
+                failure = "byte-budget";
+                return false;
+            }
+            try {
+                found = cells.emplace(offset, Cell{}).first;
+                charged += cost;
+            } catch (...) {
+                budget->bytes.fetch_sub(cost);
+                throw;
+            }
+        }
+        auto& cell = found->second;
+        const auto epoch = budget->epoch.load();
         // A newly received full snapshot also heals cells registered by the
         // earlier failed read; it is not restricted to newly inserted entries.
-        if(snapshotValid && (description.Usage==D3D11_USAGE_IMMUTABLE || snapshotEpoch==epoch)) {
-            std::memcpy(cell.value.data(),snapshot.get()+offset,16);
-            cell.valid=true;cell.epoch=epoch;
+        if (snapshotValid && (description.Usage == D3D11_USAGE_IMMUTABLE || snapshotEpoch == epoch)) {
+            std::memcpy(cell.value.data(), snapshot.get() + offset, 16);
+            cell.valid = true;
+            cell.epoch = epoch;
         }
-        if(!cell.valid){failure="cell-unobserved";return false;}
-        if(description.Usage!=D3D11_USAGE_IMMUTABLE && cell.epoch!=epoch){failure="cell-epoch";return false;}
-        output=cell.value;return true;
+        if (!cell.valid) {
+            failure = "cell-unobserved";
+            return false;
+        }
+        if (description.Usage != D3D11_USAGE_IMMUTABLE && cell.epoch != epoch) {
+            failure = "cell-epoch";
+            return false;
+        }
+        output = cell.value;
+        return true;
     }
 };
 ComPtr<Facts> facts(ID3D11Resource* resource) {
-    ComPtr<IUnknown> stored;UINT size=sizeof(IUnknown*);
-    if(!resource || FAILED(resource->GetPrivateData(bufferKey,&size,stored.GetAddressOf())) || size!=sizeof(IUnknown*))return {};
-    ComPtr<Facts> result;if(stored)stored.As(&result);return result;
+    ComPtr<IUnknown> stored;
+    UINT size = sizeof(IUnknown*);
+    if (!resource || FAILED(resource->GetPrivateData(bufferKey, &size, stored.GetAddressOf())) ||
+        size != sizeof(IUnknown*))
+        return {};
+    ComPtr<Facts> result;
+    if (stored)
+        stored.As(&result);
+    return result;
 }
 ComPtr<IUnknown> identity(IUnknown* object) {
-    ComPtr<IUnknown> result;if(object)object->QueryInterface(IID_PPV_ARGS(&result));return result;
+    ComPtr<IUnknown> result;
+    if (object)
+        object->QueryInterface(IID_PPV_ARGS(&result));
+    return result;
 }
 const char* rangeFailure(BoundReadFailure failure) {
-    switch(failure) {
-    case BoundReadFailure::Components:return "pin-components";
-    case BoundReadFailure::Alignment:return "pin-alignment";
-    case BoundReadFailure::Window:return "window-count";
-    case BoundReadFailure::WindowRange:return "shader-window-range";
-    case BoundReadFailure::AllocationRange:return "physical-allocation-range";
-    default:return "bound-read-failure";
+    switch (failure) {
+    case BoundReadFailure::Components:
+        return "pin-components";
+    case BoundReadFailure::Alignment:
+        return "pin-alignment";
+    case BoundReadFailure::Window:
+        return "window-count";
+    case BoundReadFailure::WindowRange:
+        return "shader-window-range";
+    case BoundReadFailure::AllocationRange:
+        return "physical-allocation-range";
+    default:
+        return "bound-read-failure";
     }
 }
-}
+} // namespace
 struct ConstantShadow::Impl {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -137,192 +228,400 @@ struct ConstantShadow::Impl {
     const std::shared_ptr<Budget> budget;
     std::mutex adoptionMutex;
     struct Ticket {
-        ComPtr<ID3D11Buffer> source,staging;
+        ComPtr<ID3D11Buffer> source, staging;
         ComPtr<IUnknown> sourceIdentity;
         ComPtr<Facts> value;
-        uint64_t revision=0,epoch=0,charged=0;
-        bool failed=false;
+        uint64_t revision = 0, epoch = 0, charged = 0;
+        bool failed = false;
     };
-    std::array<Ticket,maximumPending> tickets;
+    std::array<Ticket, maximumPending> tickets;
     std::shared_ptr<Impl> quarantine;
-    Impl(ID3D11Device* d,ID3D11DeviceContext* c,uint64_t limit):device(d),context(c),deviceIdentity(identity(d)),budget(std::make_shared<Budget>(limit)) {
-        if(!d || !c || !limit || limit>maximumBytes || c->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)
+    Impl(ID3D11Device* d, ID3D11DeviceContext* c, uint64_t limit)
+        : device(d), context(c), deviceIdentity(identity(d)), budget(std::make_shared<Budget>(limit)) {
+        if (!d || !c || !limit || limit > maximumBytes || c->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
             throw std::invalid_argument("Constant shadow requires a bounded immediate-context owner");
-        ComPtr<ID3D11Device> actual;c->GetDevice(&actual);
-        if(identity(actual.Get()).Get()!=deviceIdentity.Get())throw std::invalid_argument("Constant shadow context belongs to another device");
+        ComPtr<ID3D11Device> actual;
+        c->GetDevice(&actual);
+        if (identity(actual.Get()).Get() != deviceIdentity.Get())
+            throw std::invalid_argument("Constant shadow context belongs to another device");
     }
-    ComPtr<Facts> adopt(ID3D11Resource* resource,const void* initial,const char*& failure) {
-        failure=nullptr;
-        if(!budget->active){failure="shadow-stopped";return {};}
-        if(!resource){failure="no-buffer";return {};}
+    ComPtr<Facts> adopt(ID3D11Resource* resource, const void* initial, const char*& failure) {
+        failure = nullptr;
+        if (!budget->active) {
+            failure = "shadow-stopped";
+            return {};
+        }
+        if (!resource) {
+            failure = "no-buffer";
+            return {};
+        }
         std::lock_guard lock(adoptionMutex);
-        auto value=facts(resource);
-        if(value && value->budget==budget)return value;
-        if(value && value->budget->active){failure="foreign-active-owner";return {};}
+        // stop() closes this same gate before another owner may replace facts.
+        // A callback that entered before shutdown must not attach afterwards.
+        if (!budget->active) {
+            failure = "shadow-stopped";
+            return {};
+        }
+        auto value = facts(resource);
+        if (value && value->budget == budget)
+            return value;
+        if (value && value->budget->active) {
+            failure = "foreign-active-owner";
+            return {};
+        }
         ComPtr<ID3D11Buffer> buffer;
-        if(FAILED(resource->QueryInterface(IID_PPV_ARGS(&buffer)))){failure="not-constant-buffer";return {};}
-        ComPtr<ID3D11Device> sourceDevice;buffer->GetDevice(&sourceDevice);
-        if(identity(sourceDevice.Get()).Get()!=deviceIdentity.Get()){failure="foreign-device";return {};}
-        D3D11_BUFFER_DESC desc{};buffer->GetDesc(&desc);
-        if(desc.BindFlags!=D3D11_BIND_CONSTANT_BUFFER || !desc.ByteWidth || desc.ByteWidth%16){failure="invalid-constant-buffer";return {};}
-        if(!budget->reserve(sizeof(Facts))){failure="byte-budget";return {};}
+        if (FAILED(resource->QueryInterface(IID_PPV_ARGS(&buffer)))) {
+            failure = "not-constant-buffer";
+            return {};
+        }
+        ComPtr<ID3D11Device> sourceDevice;
+        buffer->GetDevice(&sourceDevice);
+        if (identity(sourceDevice.Get()).Get() != deviceIdentity.Get()) {
+            failure = "foreign-device";
+            return {};
+        }
+        D3D11_BUFFER_DESC desc{};
+        buffer->GetDesc(&desc);
+        if (desc.BindFlags != D3D11_BIND_CONSTANT_BUFFER || !desc.ByteWidth || desc.ByteWidth % 16) {
+            failure = "invalid-constant-buffer";
+            return {};
+        }
+        if (!budget->reserve(sizeof(Facts))) {
+            failure = "byte-budget";
+            return {};
+        }
         ComPtr<Facts> next;
-        try {next.Attach(new Facts(budget,desc));}catch(...){budget->bytes.fetch_sub(sizeof(Facts));throw;}
-        if(initial)next->update(0,desc.ByteWidth,initial,desc.ByteWidth<=smallBytes,budget->epoch.load());
-        const auto attached=buffer->SetPrivateDataInterface(bufferKey,next.Get());
-        if(FAILED(attached)){++budget->attachmentFailures;failure="attach-facts-failed";return {};}
-        ++budget->adopted;return next;
+        try {
+            next.Attach(new Facts(budget, desc));
+        } catch (...) {
+            budget->bytes.fetch_sub(sizeof(Facts));
+            throw;
+        }
+        if (initial)
+            next->update(0, desc.ByteWidth, initial, desc.ByteWidth <= smallBytes, budget->epoch.load());
+        const auto attached = buffer->SetPrivateDataInterface(bufferKey, next.Get());
+        if (FAILED(attached)) {
+            ++budget->attachmentFailures;
+            failure = "attach-facts-failed";
+            return {};
+        }
+        ++budget->adopted;
+        return next;
     }
     ComPtr<Facts> owned(ID3D11Resource* resource) {
-        auto value=facts(resource);return value && value->budget==budget?value:ComPtr<Facts>{};
+        auto value = facts(resource);
+        return value && value->budget == budget ? value : ComPtr<Facts>{};
     }
     // Called with Facts::mutex held, on the serialized render thread only.
-    const char* request(ID3D11Buffer* source,const ComPtr<Facts>& value) {
-        if(value->mapping)return "buffer-mapped";
-        if(value->description.ByteWidth>smallBytes)return "cold-large-buffer";
-        auto sourceIdentity=identity(source);
-        if(!sourceIdentity)return "resource-identity-unavailable";
-        Ticket* empty=nullptr;
-        for(auto& ticket:tickets) {
-            if(ticket.sourceIdentity.Get()==sourceIdentity.Get())return ticket.failed?"cold-readback-failed":"cold-readback-pending";
-            if(!ticket.staging && !empty)empty=&ticket;
+    const char* request(ID3D11Buffer* source, const ComPtr<Facts>& value) {
+        if (value->mapping)
+            return "buffer-mapped";
+        if (value->description.ByteWidth > smallBytes)
+            return "cold-large-buffer";
+        auto sourceIdentity = identity(source);
+        if (!sourceIdentity)
+            return "resource-identity-unavailable";
+        Ticket* empty = nullptr;
+        for (auto& ticket : tickets) {
+            if (ticket.sourceIdentity.Get() == sourceIdentity.Get())
+                return ticket.failed ? "cold-readback-failed" : "cold-readback-pending";
+            if (!ticket.staging && !empty)
+                empty = &ticket;
         }
-        if(!empty)return "cold-readback-slots-full";
-        ComPtr<ID3D11Predicate> predicate;BOOL enabled=FALSE;context->GetPredication(&predicate,&enabled);
-        if(predicate)return "cold-readback-predicated";
-        const auto bytes=value->description.ByteWidth;
-        if(!budget->reserve(bytes))return "byte-budget";
-        D3D11_BUFFER_DESC desc{};desc.ByteWidth=bytes;desc.Usage=D3D11_USAGE_STAGING;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+        if (!empty)
+            return "cold-readback-slots-full";
+        ComPtr<ID3D11Predicate> predicate;
+        BOOL enabled = FALSE;
+        context->GetPredication(&predicate, &enabled);
+        if (predicate)
+            return "cold-readback-predicated";
+        const auto bytes = value->description.ByteWidth;
+        if (!budget->reserve(bytes))
+            return "byte-budget";
+        D3D11_BUFFER_DESC desc{};
+        desc.ByteWidth = bytes;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         ComPtr<ID3D11Buffer> staging;
-        if(FAILED(device->CreateBuffer(&desc,nullptr,&staging))){budget->bytes.fetch_sub(bytes);++budget->failed;return "cold-staging-create-failed";}
+        if (FAILED(device->CreateBuffer(&desc, nullptr, &staging))) {
+            budget->bytes.fetch_sub(bytes);
+            ++budget->failed;
+            return "cold-staging-create-failed";
+        }
         // Publish ticket ownership before issuing the asynchronous copy. A
         // source mutation only changes its revision; it NEVER frees this slot.
-        empty->source=source;empty->sourceIdentity=std::move(sourceIdentity);empty->staging=std::move(staging);empty->value=value;
-        empty->revision=value->revision;empty->epoch=budget->epoch.load();empty->charged=bytes;
-        ++budget->pending;++budget->queued;
-        capture::Bypass bypass;context->CopyResource(empty->staging.Get(),source);
+        empty->source = source;
+        empty->sourceIdentity = std::move(sourceIdentity);
+        empty->staging = std::move(staging);
+        empty->value = value;
+        empty->revision = value->revision;
+        empty->epoch = budget->epoch.load();
+        empty->charged = bytes;
+        ++budget->pending;
+        ++budget->queued;
+        capture::Bypass bypass;
+        context->CopyResource(empty->staging.Get(), source);
         return "cold-readback-queued";
     }
     void collect() noexcept {
         capture::Bypass bypass;
-        for(auto& ticket:tickets) {
-            if(!ticket.staging || ticket.failed)continue;
+        for (auto& ticket : tickets) {
+            if (!ticket.staging || ticket.failed)
+                continue;
             D3D11_MAPPED_SUBRESOURCE mapped{};
-            const auto result=context->Map(ticket.staging.Get(),0,D3D11_MAP_READ,D3D11_MAP_FLAG_DO_NOT_WAIT,&mapped);
-            if(result==DXGI_ERROR_WAS_STILL_DRAWING)continue;
-            if(FAILED(result)){ticket.failed=true;++budget->failed;continue;}
+            const auto result =
+                context->Map(ticket.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+            if (result == DXGI_ERROR_WAS_STILL_DRAWING)
+                continue;
+            if (FAILED(result)) {
+                ticket.failed = true;
+                ++budget->failed;
+                continue;
+            }
             // A successful nonblocking map is the retirement witness, including
             // for stale revisions. There is no age-based recycling or busy loop.
             try {
-                auto current=facts(ticket.source.Get());
-                auto& value=*ticket.value.Get();std::lock_guard lock(value.mutex);
-                if(mapped.pData && budget->active && current.Get()==ticket.value.Get() && value.budget==budget &&
-                    ticket.revision==value.revision && ticket.epoch==budget->epoch.load() && !value.mapping) {
-                    const auto epoch=ticket.epoch;
-                    if(value.ensureSnapshot()) {
-                        value.update(0,value.description.ByteWidth,mapped.pData,true,epoch);
-                        if(epoch==budget->epoch.load() && budget->active)++budget->published;
-                        else {value.invalidate();++budget->stale;}
+                auto current = facts(ticket.source.Get());
+                auto& value = *ticket.value.Get();
+                std::lock_guard lock(value.mutex);
+                if (mapped.pData && budget->active && current.Get() == ticket.value.Get() &&
+                    value.budget == budget && ticket.revision == value.revision &&
+                    ticket.epoch == budget->epoch.load() && !value.mapping) {
+                    const auto epoch = ticket.epoch;
+                    if (value.ensureSnapshot()) {
+                        value.update(0, value.description.ByteWidth, mapped.pData, true, epoch);
+                        if (epoch == budget->epoch.load() && budget->active)
+                            ++budget->published;
+                        else {
+                            value.invalidate();
+                            ++budget->stale;
+                        }
                     }
-                } else ++budget->stale;
-            }catch(...) {++budget->failed;}
-            context->Unmap(ticket.staging.Get(),0);
-            const auto charge=ticket.charged;
-            ticket={};budget->bytes.fetch_sub(charge);--budget->pending;
+                } else
+                    ++budget->stale;
+            } catch (...) {
+                ++budget->failed;
+            }
+            context->Unmap(ticket.staging.Get(), 0);
+            const auto charge = ticket.charged;
+            ticket = {};
+            budget->bytes.fetch_sub(charge);
+            --budget->pending;
         }
     }
 };
-ConstantShadow::ConstantShadow(ID3D11Device* device,ID3D11DeviceContext* context,uint64_t byteLimit):impl_(std::make_shared<Impl>(device,context,byteLimit)){}
+ConstantShadow::ConstantShadow(ID3D11Device* device, ID3D11DeviceContext* context, uint64_t byteLimit)
+    : impl_(std::make_shared<Impl>(device, context, byteLimit)) {}
 ConstantShadow::~ConstantShadow() {
-    if(!stop()){impl_->budget->quarantined=true;impl_->quarantine=impl_;}
+    // The last callback lease can die on an application worker, without the
+    // render-thread graphics lock. Destruction must never call Map/Unmap.
+    // Explicit stop()/collect() is the only retirement path; unknown GPU work
+    // keeps its bounded lease and charge rather than being released speculatively.
+    auto& s = *impl_;
+    if (s.budget->active.exchange(false))
+        ++s.budget->epoch;
+    if (s.budget->pending) {
+        s.budget->quarantined = true;
+        s.quarantine = impl_;
+    }
 }
-bool ConstantShadow::created(ID3D11Buffer* buffer,const void* initial) noexcept {
-    try {const char* failure=nullptr;return impl_->adopt(buffer,initial,failure).Get()!=nullptr;}catch(...){return false;}
-}
-bool ConstantShadow::read(ID3D11Buffer* buffer,unsigned first,unsigned count,unsigned offset,unsigned components,
-                          std::array<float,4>& output,ShadowReadInfo& info) noexcept {
-    output={};info={};
+bool ConstantShadow::created(ID3D11Buffer* buffer, const void* initial) noexcept {
     try {
-        auto& s=*impl_;
-        if(buffer)buffer->GetDesc(&info.description);
-        auto value=s.adopt(buffer,nullptr,info.failure);if(!value)return false;
-        info.owned=true;
+        const char* failure = nullptr;
+        return impl_->adopt(buffer, initial, failure).Get() != nullptr;
+    } catch (...) {
+        return false;
+    }
+}
+bool ConstantShadow::read(ID3D11Buffer* buffer, unsigned first, unsigned count, unsigned offset,
+                          unsigned components, std::array<float, 4>& output, ShadowReadInfo& info) noexcept {
+    output = {};
+    info = {};
+    try {
+        auto& s = *impl_;
+        if (buffer)
+            buffer->GetDesc(&info.description);
+        auto value = s.adopt(buffer, nullptr, info.failure);
+        if (!value)
+            return false;
+        info.owned = true;
         std::lock_guard lock(value->mutex);
-        const auto epoch=s.budget->epoch.load();
-        BoundReadFailure failure=BoundReadFailure::None;
-        if(!readBoundFloats(info.description.ByteWidth,first,count,offset,components,
-            [&](unsigned position,std::array<float,4>& cell){return value->readCell(position,cell,info.failure);},output,&failure)) {
-            if(failure!=BoundReadFailure::Cell)info.failure=rangeFailure(failure);
-            else if(info.failure && (std::strcmp(info.failure,"cell-unobserved")==0 || std::strcmp(info.failure,"cell-epoch")==0))
-                info.failure=s.request(buffer,value);
+        const auto epoch = s.budget->epoch.load();
+        BoundReadFailure failure = BoundReadFailure::None;
+        if (!readBoundFloats(
+                info.description.ByteWidth, first, count, offset, components,
+                [&](unsigned position, std::array<float, 4>& cell) {
+                    return value->readCell(position, cell, info.failure);
+                },
+                output, &failure)) {
+            if (failure != BoundReadFailure::Cell)
+                info.failure = rangeFailure(failure);
+            else if (info.failure && (std::strcmp(info.failure, "cell-unobserved") == 0 ||
+                                      std::strcmp(info.failure, "cell-epoch") == 0))
+                info.failure = s.request(buffer, value);
             return false;
         }
-        if(!s.budget->active || (value->description.Usage!=D3D11_USAGE_IMMUTABLE && epoch!=s.budget->epoch.load())) {
-            output={};info.failure="read-epoch-changed";return false;
+        if (!s.budget->active ||
+            (value->description.Usage != D3D11_USAGE_IMMUTABLE && epoch != s.budget->epoch.load())) {
+            output = {};
+            info.failure = "read-epoch-changed";
+            return false;
         }
-        info.failure=nullptr;return true;
-    }catch(...){output={};info.failure="shadow-read-exception";return false;}
+        info.failure = nullptr;
+        return true;
+    } catch (...) {
+        output = {};
+        info.failure = "shadow-read-exception";
+        return false;
+    }
 }
-void ConstantShadow::collect() noexcept {impl_->collect();}
+void ConstantShadow::collect() noexcept {
+    impl_->collect();
+}
 bool ConstantShadow::stop() noexcept {
-    auto& s=*impl_;if(s.budget->active.exchange(false))++s.budget->epoch;
-    s.collect();return s.budget->pending==0;
+    auto& s = *impl_;
+    {
+        std::lock_guard lock(s.adoptionMutex);
+        if (s.budget->active.exchange(false))
+            ++s.budget->epoch;
+    }
+    // Do not hold adoptionMutex across driver calls: device hooks may reenter
+    // created(), and Facts locks are acquired by both collection and callbacks.
+    s.collect();
+    return s.budget->pending == 0;
 }
-void ConstantShadow::mapped(ID3D11DeviceContext* context,ID3D11Resource* resource,unsigned sub,D3D11_MAP type,const D3D11_MAPPED_SUBRESOURCE& mapping) noexcept {
-    if(sub || type==D3D11_MAP_READ)return;
+void ConstantShadow::mapped(ID3D11DeviceContext* context, ID3D11Resource* resource, unsigned sub,
+                            D3D11_MAP type, const D3D11_MAPPED_SUBRESOURCE& mapping) noexcept {
+    if (sub || type == D3D11_MAP_READ)
+        return;
     try {
-        auto& s=*impl_;const char* failure=nullptr;auto value=s.adopt(resource,nullptr,failure);if(!value)return;
-        std::lock_guard lock(value->mutex);value->invalidate();value->mapping=nullptr;
-        if(context==s.context.Get() && mapping.pData){value->mapping=static_cast<const unsigned char*>(mapping.pData);value->mappingEpoch=s.budget->epoch.load();}
-    }catch(...){}
+        auto& s = *impl_;
+        const char* failure = nullptr;
+        auto value = s.adopt(resource, nullptr, failure);
+        if (!value)
+            return;
+        std::lock_guard lock(value->mutex);
+        value->invalidate();
+        value->mapping = nullptr;
+        if (context == s.context.Get() && mapping.pData) {
+            value->mapping = static_cast<const unsigned char*>(mapping.pData);
+            value->mappingEpoch = s.budget->epoch.load();
+        }
+    } catch (...) {
+    }
 }
-void ConstantShadow::beforeUnmap(ID3D11DeviceContext* context,ID3D11Resource* resource,unsigned sub) noexcept {
-    if(sub)return;
+void ConstantShadow::beforeUnmap(ID3D11DeviceContext* context, ID3D11Resource* resource,
+                                 unsigned sub) noexcept {
+    if (sub)
+        return;
     try {
-        auto& s=*impl_;auto value=s.owned(resource);if(!value)return;
+        auto& s = *impl_;
+        auto value = s.owned(resource);
+        if (!value)
+            return;
         std::lock_guard lock(value->mutex);
         // Clear the retained pointer even when allocation/copy bookkeeping fails.
-        const auto* source=value->mapping;value->mapping=nullptr;
-        if(!s.budget->active || !source || context!=s.context.Get())return;
-        const auto epoch=s.budget->epoch.load();
-        if(value->mappingEpoch!=epoch){value->invalidate();return;}
-        const auto start=std::chrono::steady_clock::now();
-        const auto copied=value->update(0,value->description.ByteWidth,source,value->description.ByteWidth<=smallBytes,epoch);
-        const auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
-        if(copied){s.budget->wcBytes+=copied;++s.budget->wcCopies;s.budget->wcNanoseconds+=static_cast<uint64_t>(elapsed);}
-        if(epoch!=s.budget->epoch.load())value->invalidate();
-    }catch(...) {invalidated(resource);}
+        const auto* source = value->mapping;
+        value->mapping = nullptr;
+        if (!s.budget->active || !source || context != s.context.Get())
+            return;
+        const auto epoch = s.budget->epoch.load();
+        if (value->mappingEpoch != epoch) {
+            value->invalidate();
+            return;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const auto copied = value->update(0, value->description.ByteWidth, source,
+                                          value->description.ByteWidth <= smallBytes, epoch);
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+                .count();
+        if (copied) {
+            s.budget->wcBytes += copied;
+            ++s.budget->wcCopies;
+            s.budget->wcNanoseconds += static_cast<uint64_t>(elapsed);
+        }
+        if (epoch != s.budget->epoch.load())
+            value->invalidate();
+    } catch (...) {
+        invalidated(resource);
+    }
 }
-void ConstantShadow::beforeUpdate(ID3D11DeviceContext* context,ID3D11Resource* resource,unsigned sub,const D3D11_BOX* box,const void* source,unsigned,unsigned,unsigned flags) noexcept {
-    if(sub)return;
+void ConstantShadow::beforeUpdate(ID3D11DeviceContext* context, ID3D11Resource* resource, unsigned sub,
+                                  const D3D11_BOX* box, const void* source, unsigned, unsigned,
+                                  unsigned flags) noexcept {
+    if (sub)
+        return;
     try {
-        auto& s=*impl_;const char* failure=nullptr;auto value=s.adopt(resource,nullptr,failure);if(!value)return;
-        std::lock_guard lock(value->mutex);++value->revision;
-        if(context!=s.context.Get() || (flags & ~(D3D11_COPY_DISCARD|D3D11_COPY_NO_OVERWRITE)) ||
-            (box&&(box->top||box->front||box->bottom!=1||box->back!=1))){value->invalidate();return;}
+        auto& s = *impl_;
+        const char* failure = nullptr;
+        auto value = s.adopt(resource, nullptr, failure);
+        if (!value)
+            return;
+        std::lock_guard lock(value->mutex);
+        ++value->revision;
+        if (context != s.context.Get() || (flags & ~(D3D11_COPY_DISCARD | D3D11_COPY_NO_OVERWRITE)) ||
+            (box && (box->top || box->front || box->bottom != 1 || box->back != 1))) {
+            value->invalidate();
+            return;
+        }
         // UpdateSubresource is predicated. Observing its CPU argument is not
         // proof the GPU accepted it when a predicate can skip the real update.
-        ComPtr<ID3D11Predicate> predicate;BOOL enabled=FALSE;context->GetPredication(&predicate,&enabled);
-        if(predicate){value->invalidate();return;}
-        if(flags&D3D11_COPY_DISCARD)value->invalidate();
-        const auto epoch=s.budget->epoch.load();
-        value->update(box?box->left:0,box?box->right:value->description.ByteWidth,source,true,epoch);
-        if(epoch!=s.budget->epoch.load())value->invalidate();
-    }catch(...) {invalidated(resource);}
+        ComPtr<ID3D11Predicate> predicate;
+        BOOL enabled = FALSE;
+        context->GetPredication(&predicate, &enabled);
+        if (predicate) {
+            value->invalidate();
+            return;
+        }
+        if (flags & D3D11_COPY_DISCARD)
+            value->invalidate();
+        const auto epoch = s.budget->epoch.load();
+        value->update(box ? box->left : 0, box ? box->right : value->description.ByteWidth, source, true,
+                      epoch);
+        if (epoch != s.budget->epoch.load())
+            value->invalidate();
+    } catch (...) {
+        invalidated(resource);
+    }
 }
 void ConstantShadow::invalidated(ID3D11Resource* resource) noexcept {
     try {
-        auto& s=*impl_;if(!s.budget->active)return;
-        if(!resource){++s.budget->epoch;++s.budget->invalidations;return;}
-        if(auto value=s.owned(resource)){std::lock_guard lock(value->mutex);value->invalidate();}
-    }catch(...){}
+        auto& s = *impl_;
+        if (!s.budget->active)
+            return;
+        if (!resource) {
+            ++s.budget->epoch;
+            ++s.budget->invalidations;
+            return;
+        }
+        if (auto value = s.owned(resource)) {
+            std::lock_guard lock(value->mutex);
+            value->invalidate();
+        }
+    } catch (...) {
+    }
 }
 ShadowStats ConstantShadow::stats() const noexcept {
-    const auto& b=*impl_->budget;ShadowStats result;
-    result.bytes=b.bytes;result.peakBytes=b.peak;result.copiedBytes=b.copied;result.invalidations=b.invalidations;
-    result.wcBytes=b.wcBytes;result.wcCopies=b.wcCopies;result.wcNanoseconds=b.wcNanoseconds;
-    result.queued=b.queued;result.published=b.published;result.stale=b.stale;result.failed=b.failed;result.pending=b.pending;
-    result.adopted=b.adopted;result.attachmentFailures=b.attachmentFailures;result.liveBuffers=b.liveBuffers;
-    result.stopped=!b.active;result.quarantined=b.quarantined;return result;
+    const auto& b = *impl_->budget;
+    ShadowStats result;
+    result.bytes = b.bytes;
+    result.peakBytes = b.peak;
+    result.copiedBytes = b.copied;
+    result.invalidations = b.invalidations;
+    result.wcBytes = b.wcBytes;
+    result.wcCopies = b.wcCopies;
+    result.wcNanoseconds = b.wcNanoseconds;
+    result.queued = b.queued;
+    result.published = b.published;
+    result.stale = b.stale;
+    result.failed = b.failed;
+    result.pending = b.pending;
+    result.adopted = b.adopted;
+    result.attachmentFailures = b.attachmentFailures;
+    result.liveBuffers = b.liveBuffers;
+    result.stopped = !b.active;
+    result.quarantined = b.quarantined;
+    return result;
 }
 } // namespace dspaa::proof

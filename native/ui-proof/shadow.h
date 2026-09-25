@@ -33,17 +33,21 @@ class ConstantShadow final : public capture::WriteObserver {
     ConstantShadow& operator=(const ConstantShadow&) = delete;
     bool created(ID3D11Buffer* buffer, const void* initial = nullptr) noexcept;
     bool read(ID3D11Buffer* buffer, unsigned first, unsigned count, unsigned offset, unsigned components,
-              std::array<float,4>& output, ShadowReadInfo& info) noexcept;
+              std::array<float, 4>& output, ShadowReadInfo& info) noexcept;
     void collect() noexcept;
     // Nonblocking. An unretired/failed ticket is not recycled. Destruction with
     // unknown retirement quarantines its bounded owner, rather than uncharging
-    // live GPU work or retaining a mapped pointer. Normal shutdown drains first.
+    // live GPU work. Destruction never submits context commands; normal shutdown
+    // calls stop/collect under the graphics lock until tickets have retired.
     bool stop() noexcept;
     ShadowStats stats() const noexcept;
-    void mapped(ID3D11DeviceContext*, ID3D11Resource*, unsigned, D3D11_MAP, const D3D11_MAPPED_SUBRESOURCE&) noexcept override;
+    void mapped(ID3D11DeviceContext*, ID3D11Resource*, unsigned, D3D11_MAP,
+                const D3D11_MAPPED_SUBRESOURCE&) noexcept override;
     void beforeUnmap(ID3D11DeviceContext*, ID3D11Resource*, unsigned) noexcept override;
-    void beforeUpdate(ID3D11DeviceContext*, ID3D11Resource*, unsigned, const D3D11_BOX*, const void*, unsigned, unsigned, unsigned) noexcept override;
+    void beforeUpdate(ID3D11DeviceContext*, ID3D11Resource*, unsigned, const D3D11_BOX*, const void*,
+                      unsigned, unsigned, unsigned) noexcept override;
     void invalidated(ID3D11Resource*) noexcept override;
+
   private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
