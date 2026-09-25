@@ -112,7 +112,7 @@ namespace DSPAAMod.UI
             }
             if (!value.Equals(plugin.FrameGeneration.Applied)) {
                 if (value.Backend == FrameGenerationBackend.Dlss && value.Reflex == ReflexMode.Off)
-                    return Chinese ? "应用后将暂停 DLSS 帧生成。" : "Applying these settings will pause DLSS frame generation.";
+                    return Chinese ? "DLSS 帧生成需要开启 NVIDIA Reflex。" : "DLSS frame generation requires NVIDIA Reflex.";
                 return Chinese ? "应用设置后生效。" : "Apply settings to use these changes.";
             }
             if (value.Backend == FrameGenerationBackend.Dlss && value.Reflex == ReflexMode.Off)
