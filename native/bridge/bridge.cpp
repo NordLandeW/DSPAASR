@@ -267,7 +267,7 @@ void ensureFsrDevice(ID3D11Device* device) {
         state.graphicsBridge.reset();
     }
     if (!state.graphicsBridge)
-        state.graphicsBridge = std::make_shared<dspaa::Dx11Dx12>(device);
+        state.graphicsBridge = dspaa::acquireDx11Dx12(device);
     if (!state.fsrDevice) {
         auto candidate = std::make_unique<dspaa::FsrDevice>(state.graphicsBridge, state.runtimeDirectory);
         // Check actual cross-API sharing, not just vendor or feature-level claims.

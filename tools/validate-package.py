@@ -5,6 +5,7 @@ import re
 import struct
 import sys
 import zipfile
+from pathlib import Path
 
 
 def validate(path):
@@ -13,6 +14,10 @@ def validate(path):
         "DSPAANative.dll", "nvngx_dlss.dll", "NVIDIA-RTX-SDK-LICENSE.txt", "NVIDIA-DLSS-NOTICES.txt",
         "third-party.md", "SHA256SUMS.json",
         "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll", "AMD-FSR-SDK-LICENSE.md",
+        "MINHOOK-LICENSE.txt",
+        "amd_fidelityfx_framegeneration_dx12.dll", "STREAMLINE-LICENSE.txt",
+        "sl.interposer.dll", "sl.common.dll", "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll", "nvngx_dlssg.dll",
+        "nvngx_dlss.license.txt", "reflex.license.txt",
     }
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
@@ -55,10 +60,18 @@ def validate(path):
             "amd_fidelityfx_loader_dx12.dll": "E2D85AA05A9BD9ED8B38935FDF5199372CCA6F74C12015143BB6F945EE1608AA",
             "amd_fidelityfx_upscaler_dx12.dll": "D0DCCCC74A43C44BA435B7A369B456E0970D8A4464E4BD683119B374F2C9FB46",
             "AMD-FSR-SDK-LICENSE.md": "F0DA09D71AD5C82759A179E774535D4A829E5C96C49294167C1152402B2CB400",
+            "amd_fidelityfx_framegeneration_dx12.dll": "02297BEEDD285E822D3A64F314CF00FAF378DCEC0EDC47FF0C4DD71B3A8C2F18",
         }
         for name, digest in amd_pins.items():
             if hashlib.sha256(archive.read(name)).hexdigest().upper() != digest:
                 raise ValueError(f"Unexpected AMD runtime or incomplete license: {name}")
+        if hashlib.sha256(archive.read("MINHOOK-LICENSE.txt")).hexdigest().upper() != "4F21F857550D7BE854DA6EA5F2DA4E6775CA4E3FBB535E4F3D961C47D0BF3335":
+            raise ValueError("Incomplete MinHook / HDE license")
+        streamline = json.loads(Path(__file__).with_name("streamline-pins.json").read_text(encoding="utf-8"))
+        sl_pins = dict(streamline["runtime"], **{"STREAMLINE-LICENSE.txt": streamline["licenseSHA256"]})
+        for name, digest in sl_pins.items():
+            if hashlib.sha256(archive.read(name)).hexdigest().upper() != digest:
+                raise ValueError(f"Unexpected Streamline production runtime or incomplete license: {name}")
         for name in ("README.md", "LICENSE", "third-party.md", "NVIDIA-RTX-SDK-LICENSE.txt", "NVIDIA-DLSS-NOTICES.txt", "AMD-FSR-SDK-LICENSE.md"):
             archive.read(name).decode("utf-8")
     print(f"Validated {manifest['name']} {version}: {len(expected)} flat-root files, metadata, icon, CRCs and payload hashes.")

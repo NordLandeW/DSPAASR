@@ -27,6 +27,17 @@ $files = [ordered]@{
     'external/fsr-sdk/Kits/FidelityFX/signedbin/amd_fidelityfx_loader_dx12.dll' = 'amd_fidelityfx_loader_dx12.dll'
     'external/fsr-sdk/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll' = 'amd_fidelityfx_upscaler_dx12.dll'
     'external/fsr-sdk/docs/license.md' = 'AMD-FSR-SDK-LICENSE.md'
+    'external/minhook/LICENSE.txt' = 'MINHOOK-LICENSE.txt'
+    'external/fsr-sdk/Kits/FidelityFX/signedbin/amd_fidelityfx_framegeneration_dx12.dll' = 'amd_fidelityfx_framegeneration_dx12.dll'
+    'external/streamline/LICENSE.txt' = 'STREAMLINE-LICENSE.txt'
+    'external/streamline-runtime/rel/sl.interposer.dll' = 'sl.interposer.dll'
+    'external/streamline-runtime/rel/sl.common.dll' = 'sl.common.dll'
+    'external/streamline-runtime/rel/sl.dlss_g.dll' = 'sl.dlss_g.dll'
+    'external/streamline-runtime/rel/sl.reflex.dll' = 'sl.reflex.dll'
+    'external/streamline-runtime/rel/sl.pcl.dll' = 'sl.pcl.dll'
+    'external/streamline-runtime/rel/nvngx_dlssg.dll' = 'nvngx_dlssg.dll'
+    'external/streamline-runtime/rel/nvngx_dlss.license.txt' = 'nvngx_dlss.license.txt'
+    'external/streamline-runtime/rel/reflex.license.txt' = 'reflex.license.txt'
     'README.md' = 'README.md'
     'LICENSE' = 'LICENSE'
     'docs/third-party.md' = 'third-party.md'
@@ -42,6 +53,8 @@ if ($assembly.Version.ToString(3) -ne $metadata.version_number) { throw 'Assembl
 # Revalidate the pinned release runtime and its unmodified NVIDIA signature.
 & (Join-Path $PSScriptRoot 'fetch-ngx.ps1')
 & (Join-Path $PSScriptRoot 'fetch-fsr.ps1')
+& (Join-Path $PSScriptRoot 'fetch-minhook.ps1')
+& (Join-Path $PSScriptRoot 'fetch-streamline.ps1')
 $null = New-Item -ItemType Directory -Path $output
 foreach ($source in $files.Keys) { Copy-Item -LiteralPath (Join-Path $root $source) -Destination (Join-Path $output $files[$source]) }
 $icon = Join-Path $output 'icon.png'

@@ -291,6 +291,21 @@ internal static class Program
         Require(destroyed.Writes == 1, "Restoration wrote to a destroyed renderer");
     }
 
+    private static void FrameGenerationChecks()
+    {
+        var settings = new FrameGenerationSettingsSession(FrameGenerationSettings.Default);
+        settings.Draft = new FrameGenerationSettings(FrameGenerationBackend.Dlss, FrameGenerationMode.Dynamic, 5, ReflexMode.OnWithBoost, 165, 10000);
+        Require(settings.Applied.Backend == FrameGenerationBackend.Off, "FG draft activated without Apply");
+        settings.Cancel(); Require(settings.Draft.Backend == FrameGenerationBackend.Off, "FG cancel leaked an uncommitted mode");
+        settings.Draft = new FrameGenerationSettings(FrameGenerationBackend.Dlss, FrameGenerationMode.Fixed, 5);
+        settings.Apply(); settings.Open(); Require(settings.Draft.GeneratedFrames == 5, "MFG choice was hard-coded to 40-series limits");
+        settings.Defaults(); Require(settings.Applied.GeneratedFrames == 5, "FG defaults rewrote applied settings before Apply");
+        try { _ = new FrameGenerationSettings(FrameGenerationBackend.Fsr, FrameGenerationMode.Dynamic); throw new Exception("FSR accepted DLSS Dynamic"); }
+        catch (ArgumentException) { }
+        try { _ = new FrameGenerationSettings(FrameGenerationBackend.Dlss, generatedFrames: 0); throw new Exception("Zero additional frames accepted"); }
+        catch (ArgumentOutOfRangeException) { }
+    }
+
     private static void InteropChecks(string dll)
     {
         string root = Path.Combine(Path.GetTempPath(), "DSPAAMod-managed-" + Guid.NewGuid().ToString("N"));
@@ -302,6 +317,30 @@ internal static class Program
         File.WriteAllBytes(Path.Combine(root, "nvngx_dlss.dll"), new byte[] { 0 });
         var bridge = new NativeBridge(root, Path.Combine(root, "data"));
         var callback = Marshal.GetDelegateForFunctionPointer<RenderEvent>(bridge.RenderEvent);
+        var presentation = new PresentationBridge(bridge);
+        Require(presentation.TryGetStatus(out var presentationStatus) && !presentationStatus.Available && presentationStatus.Message.Length > 0,
+            "No-bootstrap state invented presentation support or lost its reason");
+        Require(!presentation.Begin(out _) && !presentation.Configure(new NativePresentationConfiguration { GeneratedFrames = 1, Reflex = 1 }),
+            "A late SR-only DLL created presentation ownership");
+        var noFrame = NativePresentationInputs.Create();
+        Require(presentation.Queue(ref noFrame) == IntPtr.Zero, "Presentation accepted an unallocated application frame");
+        var capture = new CaptureBridge(bridge, presentation.RenderEvent);
+        Require(capture.TryGetStatus(out var captureStatus) && !captureStatus.Ready && captureStatus.Reason.Length > 0,
+            "Capture ABI invented an early graphics owner in an SR-only process");
+        Require(capture.TryGetDepthCopyResult(out var depthCopyResult) && depthCopyResult.Flags == 0 &&
+            !depthCopyResult.Submitted(1,1,1), "An SR-only process invented a submitted depth-copy receipt");
+        var receipt = new NativeDepthCopyResult { Version = 1, Flags = 3, ApplicationFrameId = 7, Generation = 9, RequestId = 11 };
+        Require(receipt.Submitted(7,9,11) && !receipt.Submitted(8,9,11) && !receipt.Submitted(7,10,11) &&
+            !receipt.Submitted(7,9,12) && !receipt.Submitted(7,9,0), "Depth-copy success escaped its frame/generation/request identity");
+        receipt.Flags = 1;
+        Require(!receipt.Submitted(7,9,11), "An executed but failed depth copy was treated as usable");
+        Require(capture.Queue(new NativeCaptureCommand { ApplicationFrameId = 1, Generation = 1, OcclusionSlot = -1,
+            OcclusionDomain = NativeCaptureDomain.Identity }) == IntPtr.Zero,
+            "Capture queued graphics work without an early facade");
+        capture.Cancel(new IntPtr(123456)); // Opaque late/unknown handles are harmless, not native pointers.
+        Require((int)Marshal.OffsetOf<NativeCaptureCommand>(nameof(NativeCaptureCommand.Source)) == 56 &&
+            (int)Marshal.OffsetOf<NativeCaptureStatus>(nameof(NativeCaptureStatus.ReasonBytes)) == 104,
+            "Capture metadata no longer matches the native command/status layout");
         Require((int)Marshal.OffsetOf<NativeFrame>(nameof(NativeFrame.JitterX)) == 72, "Frame temporal payload has the wrong ABI offset");
         Require(Marshal.SizeOf<NativeFrame>() == 112 && (int)Marshal.OffsetOf<NativeFrame>(nameof(NativeFrame.OutputWidth)) == 96,
             "SR frame extension broke the ABI v2 prefix/size");
@@ -335,7 +374,7 @@ internal static class Program
         try
         {
             Require(args.Length == 1, "Pass the built native DLL path");
-            ModelPolicyChecks(); MenuChecks(); AvailabilityChecks(); FsrChecks(); ResolutionChecks(); JitterChecks(); VisibilityChecks(); InteropChecks(args[0]);
+            ModelPolicyChecks(); MenuChecks(); AvailabilityChecks(); FsrChecks(); ResolutionChecks(); JitterChecks(); VisibilityChecks(); FrameGenerationChecks(); InteropChecks(args[0]);
             Console.WriteLine("Model overrides, settings transactions, jitter coverage and real DLL interop passed.");
             return 0;
         }

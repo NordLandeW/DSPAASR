@@ -7,6 +7,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../managed/Core/*.cs" Link="Core/%(Filename)%(Extension)" />
-    <Compile Include="../../managed/Interop/NativeBridge.cs" Link="Interop/NativeBridge.cs" />
+    <Compile Include="../../managed/Interop/*.cs" Link="Interop/%(Filename)%(Extension)" />
   </ItemGroup>
 </Project>

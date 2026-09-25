@@ -4,6 +4,8 @@
 #include <d3d11_4.h>
 #include <d3d12.h>
 #include <string>
+#include <memory>
+#include <mutex>
 #include <wrl/client.h>
 
 namespace dspaa {
@@ -35,6 +37,10 @@ class Dx11Dx12 {
     ID3D12CommandQueue* queue12() const {
         return queue12_.Get();
     }
+    // SR and the presentation adapter share the device and this queue timeline.
+    // Hold a batch lock while submitting immediate-context copies and handoffs.
+    std::unique_lock<std::recursive_mutex> lock() { return std::unique_lock(access_); }
+    ID3D12Fence* completionFence12() const { return completed12_.Get(); }
     SharedTexture texture(unsigned width, unsigned height, DXGI_FORMAT format, bool unorderedAccess);
     // Publish preceding 11 work and enqueue a GPU-side wait on 12; no CPU readback.
     void handoffTo12();
@@ -47,6 +53,7 @@ class Dx11Dx12 {
                            D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after);
 
   private:
+    std::recursive_mutex access_;
     Microsoft::WRL::ComPtr<ID3D11Device5> device11_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext4> context11_;
     Microsoft::WRL::ComPtr<ID3D12Device> device12_;
@@ -56,4 +63,5 @@ class Dx11Dx12 {
     uint64_t next11_ = 0, next12_ = 0;
     HANDLE event_ = nullptr;
 };
+std::shared_ptr<Dx11Dx12> acquireDx11Dx12(ID3D11Device* device);
 } // namespace dspaa

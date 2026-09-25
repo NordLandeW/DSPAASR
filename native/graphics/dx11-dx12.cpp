@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 using Microsoft::WRL::ComPtr;
 namespace dspaa {
@@ -22,6 +23,21 @@ struct Handle {
     }
 };
 } // namespace
+std::shared_ptr<Dx11Dx12> acquireDx11Dx12(ID3D11Device* device) {
+    struct Registry {
+        std::mutex mutex;
+        std::unordered_map<ID3D11Device*, std::weak_ptr<Dx11Dx12>> devices;
+    };
+    static auto* registry = new Registry;
+    std::lock_guard guard(registry->mutex);
+    auto& weak = registry->devices[device];
+    auto result = weak.lock();
+    if (!result) {
+        result = std::make_shared<Dx11Dx12>(device);
+        weak = result;
+    }
+    return result;
+}
 Dx11Dx12::Dx11Dx12(ID3D11Device* device) {
     if (!device)
         throw std::invalid_argument("Missing D3D11 device");
@@ -63,6 +79,7 @@ Dx11Dx12::~Dx11Dx12() {
         CloseHandle(event_);
 }
 SharedTexture Dx11Dx12::texture(unsigned width, unsigned height, DXGI_FORMAT format, bool unorderedAccess) {
+    auto access = lock();
     SharedTexture result;
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -93,18 +110,21 @@ SharedTexture Dx11Dx12::texture(unsigned width, unsigned height, DXGI_FORMAT for
     return result;
 }
 void Dx11Dx12::handoffTo12() {
+    auto access = lock();
     const auto value = ++next11_;
     graphicsCheck(context11_->Signal(produced11_.Get(), value), "Signal D3D11 producer");
     context11_->Flush(); // Submit the signal before the other API waits for it.
     graphicsCheck(queue12_->Wait(produced12_.Get(), value), "D3D12 waits for D3D11 producer");
 }
 uint64_t Dx11Dx12::handoffTo11() {
+    auto access = lock();
     const auto value = ++next12_;
     graphicsCheck(queue12_->Signal(completed12_.Get(), value), "Signal D3D12 completion");
     graphicsCheck(context11_->Wait(completed11_.Get(), value), "D3D11 waits for D3D12 completion");
     return value;
 }
 void Dx11Dx12::wait12(uint64_t completion) {
+    auto access = lock();
     if (!completion)
         return;
     graphicsCheck(device12_->GetDeviceRemovedReason(), "D3D12 device health");
@@ -126,6 +146,7 @@ void Dx11Dx12::wait12(uint64_t completion) {
             "GPU fence notification did not prove requested retirement; resources remain retained");
 }
 void Dx11Dx12::drain() {
+    auto access = lock();
     handoffTo12();
     const auto value = ++next12_;
     graphicsCheck(queue12_->Signal(completed12_.Get(), value), "Signal bridge retirement");

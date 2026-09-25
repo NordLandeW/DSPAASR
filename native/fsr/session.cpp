@@ -167,6 +167,7 @@ void FsrFeature::drain() {
 }
 bool FsrFeature::configure(const FsrConfiguration& config) {
     auto& s = *impl_;
+    auto access = s.device->bridge->lock();
     if (s.context && s.configuration == config)
         return false;
     if (!config.inputWidth || !config.inputHeight || !config.outputWidth || !config.outputHeight ||
@@ -190,7 +191,8 @@ bool FsrFeature::configure(const FsrConfiguration& config) {
         mask.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         mask.Width = config.inputWidth;
         mask.Height = config.inputHeight;
-        mask.DepthOrArraySize = mask.MipLevels = mask.SampleDesc.Count = 1;
+        mask.DepthOrArraySize = mask.MipLevels = 1;
+        mask.SampleDesc.Count = 1;
         mask.Format = DXGI_FORMAT_R8_UNORM;
         mask.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         graphicsCheck(bridge.device12()->CreateCommittedResource(
@@ -236,6 +238,7 @@ bool FsrFeature::configure(const FsrConfiguration& config) {
 }
 void FsrFeature::evaluate(const FsrFrame& frame) {
     auto& s = *impl_;
+    auto access = s.device->bridge->lock();
     if (!s.context)
         throw std::runtime_error("FSR context is not configured");
     if (!frame.color || !frame.depth || !frame.motion || !frame.output ||

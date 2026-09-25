@@ -39,6 +39,58 @@ try {
     }
     Require $failed 'Rollback accepted an external edit'
     Require ((Get-FileHash -LiteralPath $path).Hash -eq $externalHash) 'Rollback overwrote an external edit'
+    $early = Join-Path $PSScriptRoot 'game-early.ps1'
+    $plugins = Join-Path $game 'DSPGAME_Data/Plugins/x86_64'
+    $null = New-Item -ItemType Directory -Path $plugins
+    $boot = Join-Path $game 'DSPGAME_Data/boot.config'
+    $library = Join-Path $temporary 'bootstrap-source.dll'
+    $installed = Join-Path $plugins 'DSPAAPresentBootstrap.dll'
+    [IO.File]::WriteAllBytes($library, [byte[]](7,8,9))
+    $bootBytes = [byte[]](0xEF,0xBB,0xBF) + [Text.Encoding]::UTF8.GetBytes("test=1`r`n")
+    foreach ($hadLibrary in @($false,$true)) {
+        $earlySession = Join-Path $temporary "early-$hadLibrary"
+        & $runner -Action Prepare -GameDirectory $game -CoreDirectory $core -PackageDirectory $package -SessionDirectory $earlySession | Out-Null
+        [IO.File]::WriteAllBytes($boot, $bootBytes)
+        if ($hadLibrary) { [IO.File]::WriteAllBytes($installed, [byte[]](10,11,12)) }
+        elseif (Test-Path $installed) { Remove-Item -LiteralPath $installed }
+        $bootHash = (Get-FileHash $boot).Hash
+        $libraryHash = if ($hadLibrary) { (Get-FileHash $installed).Hash } else { '' }
+        & $early -Action Prepare -SessionDirectory $earlySession -GameDirectory $game -BootstrapLibrary $library | Out-Null
+        $e = Get-Content (Join-Path $earlySession 'early.json') -Raw | ConvertFrom-Json
+        Require ((Get-FileHash $boot).Hash -eq $bootHash) 'Early Prepare edited boot.config'
+        Require ((Get-FileHash $installed).Hash -eq (Get-FileHash $library).Hash) 'Early binary staging failed'
+        [IO.File]::WriteAllBytes($boot, [byte[]]($bootBytes + [Text.Encoding]::UTF8.GetBytes($e.BootSetting + "`r`n")))
+        Require ((Get-FileHash $boot).Hash -eq $e.BootActiveSHA256) 'Early active hash lost BOM/CRLF bytes'
+        $failed = $false
+        try { & $early -Action Run -SessionDirectory $earlySession -GameDirectory $game } catch {
+            $failed = $_.Exception.Message -like '*not redirected*'
+        }
+        Require $failed 'Early Run reached a launch without the isolated game data path'
+        Require (!(Test-Path (Join-Path $earlySession 'process.json'))) 'Early refusal wrote a game process receipt'
+        Require ((Get-FileHash $boot).Hash -eq $bootHash) 'Early failed-run rollback did not restore exact boot bytes'
+        if ($hadLibrary) { Require ((Get-FileHash $installed).Hash -eq $libraryHash) 'Early original DLL was not restored' }
+        else { Require (!(Test-Path $installed)) 'Early temporary DLL was not removed' }
+        & $early -Action Restore -SessionDirectory $earlySession -GameDirectory $game | Out-Null
+        [IO.File]::WriteAllText($boot, 'External boot owner')
+        $changedHash = (Get-FileHash $boot).Hash
+        $failed = $false
+        try { & $early -Action Restore -SessionDirectory $earlySession -GameDirectory $game } catch {
+            $failed = $_.Exception.Message -like '*changed externally*'
+        }
+        Require $failed 'Early rollback did not refuse external boot edits'
+        Require ((Get-FileHash $boot).Hash -eq $changedHash) 'Early rollback replaced an external boot edit'
+    }
+    $conflictSession = Join-Path $temporary 'early-conflict'
+    & $runner -Action Prepare -GameDirectory $game -CoreDirectory $core -PackageDirectory $package -SessionDirectory $conflictSession | Out-Null
+    [IO.File]::WriteAllBytes($boot, [byte[]]([byte[]](0xEF,0xBB,0xBF) + [Text.Encoding]::UTF8.GetBytes('xrsdk-pre-init-library=OtherProvider')))
+    $conflictHash = (Get-FileHash $boot).Hash
+    $failed = $false
+    try { & $early -Action Prepare -SessionDirectory $conflictSession -GameDirectory $game -BootstrapLibrary $library } catch {
+        $failed = $_.Exception.Message -like '*existing PreInit provider*'
+    }
+    Require $failed 'Early preparation did not reject an existing BOM-prefixed provider'
+    Require ((Get-FileHash $boot).Hash -eq $conflictHash) 'Existing PreInit provider was modified'
+    Write-Output 'Early overlay: exact BOM/CRLF rollback, absent/existing DLL restoration, failed-run cleanup, idempotence and external/provider edit protection passed.'
     Write-Output 'Sandbox prepare/launch refusal, exact-byte rollback, idempotence and concurrent-edit protection passed; game launches=0.'
 }
 finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force } }

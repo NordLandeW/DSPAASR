@@ -12,7 +12,14 @@ namespace DSPAAMod.Game
     internal static class BeforeCullPatch
     {
         private static void Prefix(PostProcessingBehaviour __instance)
-        { Plugin.Instance?.Guard(() => Plugin.Instance.Renderer.BeforeCull(__instance)); }
+        {
+            // Snapshot the real display camera before SR temporarily assigns its
+            // private low-resolution target, regardless of global callback order.
+            Plugin.Instance?.Guard(() => Plugin.Instance.Presentation?.World?.BeforeCull(__instance.GetComponent<Camera>()));
+            Plugin.Instance?.Guard(() => Plugin.Instance.Renderer.BeforeCull(__instance));
+        }
+        private static void Postfix(PostProcessingBehaviour __instance)
+        { Plugin.Instance?.Guard(() => Plugin.Instance.Presentation?.World?.AfterProjection(__instance)); }
     }
     [HarmonyPatch(typeof(PostProcessingBehaviour), "OnRenderImage")]
     internal static class AfterImagePatch

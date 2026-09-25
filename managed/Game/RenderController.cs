@@ -587,17 +587,17 @@ namespace DSPAAMod.Game
             scope.State.ImageResult = scope.Target;
             // Honor Unity's original image-effect chain destinations while retaining
             // a separate native-size chain; later registered effects consume the latter.
-            if (scope.Target != scope.OriginalDestination) Graphics.Blit(scope.Target, scope.OriginalDestination);
+            if (scope.Target != scope.OriginalDestination) FrameGenerationEffects.Copy(scope.Target, scope.OriginalDestination, false);
         }
         public bool Present(Camera camera, RenderTexture source, RenderTexture destination)
         {
             if (!camera || !cameras.TryGetValue(camera, out var state) || !state.SrThisRender) return false;
             RestoreTarget(state);
             RenderTexture final = state.ImageResult ? state.ImageResult : source;
-            if (final != destination) Graphics.Blit(final, destination);
+            if (final != destination) FrameGenerationEffects.Copy(final, destination, true);
             // Graphics.Blit(null) uses Camera.main.targetTexture. That target has
             // already been restored; the world RT must never absorb the screen blit.
-            if (final != state.OriginalTarget && destination != state.OriginalTarget) Graphics.Blit(final, state.OriginalTarget);
+            if (final != state.OriginalTarget && destination != state.OriginalTarget) FrameGenerationEffects.Copy(final, state.OriginalTarget, true);
             state.SrThisRender = false;
             state.ImageResult = null;
             return true;

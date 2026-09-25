@@ -17,6 +17,7 @@ namespace DSPAAMod.UI
         private readonly Plugin plugin;
         private UIOptionWindow window;
         private UIComboBox technique, resolution, configuration;
+        private FrameGenerationOptions frameGeneration;
         private RectTransform layoutRoot;
         private Vector2 originalContentSize;
         private Vector2 configurationPosition;
@@ -41,6 +42,7 @@ namespace DSPAAMod.UI
         public void Open(UIOptionWindow value)
         {
             plugin.Settings.Open();
+            plugin.FrameGeneration.Open();
             plugin.Renderer.RequestUpscalerSupport();
             if (window != value)
             {
@@ -133,6 +135,7 @@ namespace DSPAAMod.UI
             technique.onItemIndexChange.AddListener(TechniqueChanged);
             resolution.onItemIndexChange.AddListener(ResolutionChanged);
             configuration.onItemIndexChange.AddListener(ConfigurationChanged);
+            frameGeneration = new FrameGenerationOptions(plugin, original, aaLabel, availabilityLabel, layoutRoot, rowStep);
         }
         private void ShiftRows(Transform column, float fromCenter, float distance)
         {
@@ -145,7 +148,7 @@ namespace DSPAAMod.UI
                 rect.anchoredPosition += new Vector2(0f, -distance);
             }
         }
-        private static UIComboBox Clone(UIComboBox source, string name)
+        internal static UIComboBox Clone(UIComboBox source, string name)
         {
             var copy = UnityEngine.Object.Instantiate(source, source.transform.parent);
             try
@@ -188,7 +191,7 @@ namespace DSPAAMod.UI
                 if (text.text.Trim() == translated || AaLabels.Matches(text.text, key)) return text;
             return null;
         }
-        private static void SetItems(UIComboBox control, string[] items, int index)
+        internal static void SetItems(UIComboBox control, string[] items, int index)
         {
             control.isDroppedDown = false;
             control.Items = new List<string>(items);
@@ -197,6 +200,8 @@ namespace DSPAAMod.UI
             control.UpdateItems();
             control.itemIndex = index;
         }
+        internal static void SetItemEnabled(UIComboBox control, int index, bool enabled) =>
+            ((List<Button>)ItemButtonsField.GetValue(control))[index].interactable = enabled;
         private void TechniqueChanged()
         {
             if (synchronizing || draft == null || !technique || technique.itemIndex < 0 || technique.itemIndex > (int)AaChoice.Fsr) return;
@@ -239,7 +244,7 @@ namespace DSPAAMod.UI
         public void Update()
         {
             if (window && draft != null && (!ReferenceEquals(shownAvailability, plugin.Renderer.Availability) ||
-                !ReferenceEquals(shownFsrAvailability, plugin.Renderer.FsrAvailability))) Refresh();
+                !ReferenceEquals(shownFsrAvailability, plugin.Renderer.FsrAvailability) || (frameGeneration?.Changed ?? false))) Refresh();
         }
         public void Refresh()
         {
@@ -266,6 +271,7 @@ namespace DSPAAMod.UI
                     draft.Choice == AaChoice.Msaa ? new[] { "2×", "4×", "8×" } :
                     new[] { Chinese ? "无" : "None" };
                 SetItems(configuration, options, draft.ConfigurationIndex);
+                frameGeneration?.Refresh();
                 RefreshLayout();
             }
             finally { synchronizing = false; }
@@ -284,7 +290,8 @@ namespace DSPAAMod.UI
             configuration.gameObject.SetActive(showConfiguration);
             configurationLabel.gameObject.SetActive(showConfiguration);
             int optionRows = (showResolution ? 1 : 0) + (showConfiguration ? 1 : 0);
-            int secondaryRows = optionRows + availabilityRows;
+            int secondaryRows = optionRows + availabilityRows + (frameGeneration?.Rows ?? 0);
+            frameGeneration?.Layout(availabilityPosition.y - rowStep * (optionRows + availabilityRows + 1));
             availabilityLabel.rectTransform.sizeDelta = new Vector2(availabilityLabel.rectTransform.sizeDelta.x,
                 Mathf.Max(1, availabilityRows) * rowStep - 4f);
             availabilityLabel.gameObject.SetActive(showAvailability);
@@ -307,16 +314,18 @@ namespace DSPAAMod.UI
             option.fxaa = draft.NativeFxaa;
             plugin.Settings.Draft = draft.Settings;
         }
-        public void Close() { plugin.Settings.Cancel(); draft = null; }
+        public void Close() { plugin.Settings.Cancel(); plugin.FrameGeneration.Cancel(); draft = null; }
         public void Defaults(int tab)
         {
             if (tab != 0) return;
             plugin.Settings.Defaults();
+            plugin.FrameGeneration.Defaults();
             draft = new AaMenuDraft(plugin.Settings.Draft, nativeRefreshMsaa, nativeRefreshFxaa);
             Refresh();
         }
         public void Dispose()
         {
+            frameGeneration?.Dispose(); frameGeneration = null;
             if (technique) { technique.gameObject.SetActive(false); UnityEngine.Object.Destroy(technique.gameObject); }
             if (resolution) { resolution.gameObject.SetActive(false); UnityEngine.Object.Destroy(resolution.gameObject); }
             if (resolutionLabel) { resolutionLabel.gameObject.SetActive(false); UnityEngine.Object.Destroy(resolutionLabel.gameObject); }

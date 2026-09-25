@@ -40,7 +40,11 @@ namespace DSPAAMod.UI
             Plugin.Instance?.Guard(() => Plugin.Instance.Options.Read(ref value));
             ___tempOption = value;
         }
-        private static void Postfix() { Plugin.Instance?.Guard(() => Plugin.Instance.ApplySettings()); }
+        private static void Postfix()
+        {
+            Plugin.Instance?.Guard(() => Plugin.Instance.ApplySettings());
+            Plugin.Instance?.Guard(() => Plugin.Instance.ApplyFrameGeneration());
+        }
     }
     [HarmonyPatch(typeof(UIOptionWindow), nameof(UIOptionWindow.OnLanguageChange))]
     internal static class OptionsLanguagePatch

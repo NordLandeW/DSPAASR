@@ -159,7 +159,7 @@ namespace DSPAAMod.Interop
             if (RenderEvent == IntPtr.Zero || Get<Initialize>("DspAaInitialize")(directory, dataDirectory) != 1)
                 throw new InvalidOperationException("Native bridge initialization failed; check runtime path and log permissions.");
         }
-        private T Get<T>(string name) where T : Delegate
+        internal T Get<T>(string name) where T : Delegate
         {
             IntPtr address = GetProcAddress(module, name);
             if (address == IntPtr.Zero) throw new EntryPointNotFoundException(name);
