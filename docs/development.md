@@ -47,6 +47,26 @@ Set `GameManagedPath` to your installed game's unmodified `DSPGAME_Data/Managed`
 
 Packaging requires Python 3 and Inkscape on the tool search path. It writes a new local `dist/` directory and a Gale/Thunderstore ZIP with root package metadata, changelog, README, 256×256 icon, managed/native DLLs, verified release runtimes and license/notices, plus `patchers/DSPAASR.Preloader.dll`. `SHA256SUMS.json` covers every payload file recursively with archive-relative slash-separated paths. The manager routes the patcher separately from ordinary root/plugin files; do not flatten that entry. It does not deploy, launch, upload or publish anything. Default tests cover preset evidence, WARP texture lifetime/fallback/retirement, CLI errors, verified-download safety, model overrides, Apply/Cancel/Defaults, centered jitter and real managed/native ABI calls. They do not execute Unity or validate the native-menu layout.
 
+### Local development paths
+
+Public sources do not assume an installation directory. For repeated local use, create an untracked `Directory.Build.props` at the repository root and replace the placeholders with absolute paths. This file is ignored by Git:
+
+```xml
+<Project>
+  <PropertyGroup>
+    <BepInExPath Condition="'$(BepInExPath)' == ''">&lt;absolute-BepInEx-core-directory&gt;</BepInExPath>
+    <DspLibsPath Condition="'$(DspLibsPath)' == ''">&lt;absolute-development-reference-directory&gt;</DspLibsPath>
+    <GameDirectory Condition="'$(GameDirectory)' == ''">&lt;absolute-game-directory&gt;</GameDirectory>
+  </PropertyGroup>
+</Project>
+```
+
+For these defaults, priority is an explicit MSBuild `-p:Name=value` or script `-Name value`, then the same-named process environment variable, then the local file. The empty-value conditions above keep MSBuild's environment values intact. Ordinary `dotnet build` imports the file automatically; `package.ps1` and `test-game-references.ps1` use its BepInEx path, while `game-sandbox.ps1` and `game-early.ps1` use its game directory. Scripts only read literal values: they do not evaluate MSBuild expressions, imports or custom conditions. Use absolute literals without MSBuild percent escapes, one value per property and an unconditional PropertyGroup. Missing values fail with setup guidance rather than selecting a guessed installation.
+
+`GameManagedPath` remains an explicit script argument or `DSP_GAME_MANAGED_PATH` environment value. It is deliberately not inferred from `DspLibsPath`, which may contain development-only publicized references. `test-preloader.ps1` keeps its repository-relative minimum-BepInEx default; pass a BepInEx path explicitly to use another core. Run `pwsh -NoProfile -File tools/test-local-paths.ps1` to check the resolver in disposable fixtures without building or launching the game.
+
+Production managed Release builds map this repository's physical path to `/_/` in compiler outputs, including PDB source records and the PE's PDB reference. Portable symbols remain generated; a debugger inspecting a Release build needs a source-path mapping back to the checkout. Debug builds retain ordinary local source paths and breakpoint behavior. See Microsoft's [PathMap and PdbFile documentation](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/compiler-options/advanced#pathmap).
+
 ### Preloader helper checks
 
 After the game-reference build, run the configuration and payload-discovery checks in a fresh PowerShell process:

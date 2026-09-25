@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory)][ValidateSet('Prepare','Run','Restore')][string]$Action,
     [Parameter(Mandatory)][string]$SessionDirectory,
-    [string]$GameDirectory = 'E:/SteamLibrary/steamapps/common/Dyson Sphere Program',
+    [string]$GameDirectory = '',
     [string]$CoreDirectory = '',
     [string]$PackageDirectory = '',
     [string]$SteamFreeAssemblySha256 = '',
@@ -13,6 +13,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
+. (Join-Path $PSScriptRoot 'local-paths.ps1')
+$GameDirectory = Resolve-DspLocalPath -Name GameDirectory -Value $GameDirectory -RepositoryRoot $root
 $session = [IO.Path]::GetFullPath($SessionDirectory, $root)
 $game = [IO.Path]::GetFullPath($GameDirectory, $root)
 $pathFile = Join-Path $game 'Configs/path.txt'

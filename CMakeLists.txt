@@ -161,6 +161,9 @@ if(BUILD_TESTING)
     add_test(NAME dependency-no-clobber COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -NonInteractive
         -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/test-download.ps1")
     set_tests_properties(dependency-no-clobber PROPERTIES TIMEOUT 15)
+    add_test(NAME local-path-defaults COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -NonInteractive
+        -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/test-local-paths.ps1")
+    set_tests_properties(local-path-defaults PROPERTIES TIMEOUT 15)
     add_test(NAME managed-policy-interop COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -NonInteractive
         -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/test-managed.ps1")
     add_test(NAME game-sandbox-rollback COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -NonInteractive

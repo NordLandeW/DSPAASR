@@ -12,8 +12,9 @@
     <Authors>NordLandeW</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
-    <BepInExPath Condition="'$(BepInExPath)' == ''">C:/Game Modding/BepInEx/BepInEx/core</BepInExPath>
-    <DspLibsPath Condition="'$(DspLibsPath)' == ''">C:/Game Modding/DSPlibs</DspLibsPath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <PathMap>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/..'))=/_/</PathMap>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="BepInEx"><HintPath>$(BepInExPath)/BepInEx.dll</HintPath><Private>false</Private></Reference>

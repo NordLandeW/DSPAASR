@@ -2,10 +2,12 @@
 param(
     [string]$OutputDirectory = '',
     [string]$GameManagedPath = $env:DSP_GAME_MANAGED_PATH,
-    [string]$BepInExPath = 'C:/Game Modding/BepInEx/BepInEx/core'
+    [string]$BepInExPath = ''
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
+. (Join-Path $PSScriptRoot 'local-paths.ps1')
+$BepInExPath = Resolve-DspLocalPath -Name BepInExPath -Value $BepInExPath -RepositoryRoot $root
 $metadata = Get-Content -LiteralPath (Join-Path $root 'pack/manifest.json') -Raw | ConvertFrom-Json
 if (!$OutputDirectory) { $OutputDirectory = Join-Path $root ("dist/$($metadata.name)-$($metadata.version_number)-" + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
 $output = [IO.Path]::GetFullPath($OutputDirectory, $root)

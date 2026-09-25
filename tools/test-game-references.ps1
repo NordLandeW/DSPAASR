@@ -1,12 +1,14 @@
 [CmdletBinding()]
 param(
     [string]$GameManagedPath = $env:DSP_GAME_MANAGED_PATH,
-    [string]$BepInExPath = 'C:/Game Modding/BepInEx/BepInEx/core',
+    [string]$BepInExPath = '',
     [string]$Configuration = 'Release'
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 if (!$GameManagedPath) { throw 'Specify -GameManagedPath (or DSP_GAME_MANAGED_PATH) pointing to the unmodified DSPGAME_Data/Managed directory.' }
+. (Join-Path $PSScriptRoot 'local-paths.ps1')
+$BepInExPath = Resolve-DspLocalPath -Name BepInExPath -Value $BepInExPath -RepositoryRoot $root
 $game = (Resolve-Path -LiteralPath $GameManagedPath).Path
 $bepInEx = (Resolve-Path -LiteralPath $BepInExPath).Path
 # Reject the publicized development references that concealed the 1.0.0 regression.
