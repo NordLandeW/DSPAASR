@@ -1,4 +1,5 @@
 #include "guard.h"
+#include "blit.h"
 #include "capture/hooks.h"
 #include "constants.h"
 #include "effect-pins.h"
@@ -147,6 +148,7 @@ HRESULT STDMETHODCALLTYPE createLayout(ID3D11Device* self, const D3D11_INPUT_ELE
                 }
             proof.color32 = proof.color32 && colors == 1;
             (*output)->SetPrivateData(layoutKey, sizeof(proof), &proof);
+            dspaa::proof::observeBlitLayout(*output, elements, count);
         }
     } catch (...) {
     }
@@ -286,7 +288,7 @@ struct UiShaderProof::Impl final : DeviceObserver {
     std::vector<ConstantFailureKey> constantFailures;
     std::vector<std::tuple<uint64_t, std::string, std::string, std::string, unsigned>> effectFailures;
     void effectFailure(ID3D11PixelShader* pixel, const CaptureScope& scope,
-                       const std::string& reason) noexcept {
+                       const capture::DrawArguments& arguments, const std::string& reason) noexcept {
         constexpr size_t maximumDiagnostics = 16;
         if (!log || effectFailures.size() >= maximumDiagnostics)
             return;
@@ -318,12 +320,16 @@ struct UiShaderProof::Impl final : DeviceObserver {
                 depthDescription.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
                 depthDescription.DepthFunc = D3D11_COMPARISON_LESS;
             }
-            char message[768];
+            D3D11_PRIMITIVE_TOPOLOGY topology{};
+            context->IAGetPrimitiveTopology(&topology);
+            char message[1024];
             std::snprintf(message, sizeof(message),
-                          "capture.effect-unverified pass=0x%llX colorWrite=0x%X depthEnabled=%u "
+                          "capture.effect-unverified pass=0x%llX indexed=%u count=%u start=%u base=%d "
+                          "instances=%u topology=%u colorWrite=0x%X depthEnabled=%u "
                           "depthWrite=%u depthFunc=%u stencilEnabled=%u stencilRef=%u PS=%s VS=%s reason=%s",
-                          static_cast<unsigned long long>(scope.passId), colorWrite,
-                          depthDescription.DepthEnable ? 1u : 0u,
+                          static_cast<unsigned long long>(scope.passId), arguments.indexed ? 1u : 0u,
+                          arguments.count, arguments.start, arguments.baseVertex, arguments.instances,
+                          static_cast<unsigned>(topology), colorWrite, depthDescription.DepthEnable ? 1u : 0u,
                           static_cast<unsigned>(depthDescription.DepthWriteMask),
                           static_cast<unsigned>(depthDescription.DepthFunc),
                           depthDescription.StencilEnable ? 1u : 0u, stencilReference, ps.c_str(), vs.c_str(),
@@ -487,8 +493,9 @@ struct UiShaderProof::Impl final : DeviceObserver {
         height = allocation.Height;
         return true;
     }
-    bool inspectEffect(ID3D11PixelShader* pixel, const CaptureScope& scope, CaptureSupport& support,
-                       std::string& reason, std::array<char, 65>& shaderHash) {
+    bool inspectEffect(ID3D11PixelShader* pixel, const CaptureScope& scope,
+                       const capture::DrawArguments& arguments, CaptureSupport& support, std::string& reason,
+                       std::array<char, 65>& shaderHash) {
         support = {};
         auto reject = [&](const char* text) {
             reason = text;
@@ -516,6 +523,20 @@ struct UiShaderProof::Impl final : DeviceObserver {
         if (!data(pixel, shaderKey, ps) || !data(vertex.Get(), shaderKey, vs))
             return reject("Effect shader predates DXBC observation");
         std::copy(std::begin(ps.hash), std::end(ps.hash), shaderHash.begin());
+        // This engine-internal pair takes clip-space positions and raw UVs from
+        // IA, not _MainTex_ST. Verify the real geometry instead of inventing CBs
+        // or assuming that a matching Copy PS implies a fullscreen identity map.
+        if (scope.passId == 0x1000 &&
+            std::string_view(vs.hash) == "6B3ED052E7846FC4BA2BB450C0FA6466EA69567965217ED8C9BB3505CA151CE6" &&
+            std::string_view(ps.hash) == "BC4AEE2598ED82ED1D584DC8B5B26AACC9628827F25FE707893BB2978AF09E23") {
+            if (scope.kind != CaptureScopeKind::DualColor || !scope.fullOverwrite)
+                return reject("Native clip blit requires a full-output color contract");
+            unsigned width = 0, height = 0;
+            const EffectTexturePin source{EffectTextureRole::Main, 0, 0};
+            if (!effectTexture(source, width, height))
+                return reject("Native clip blit source/SRV/sampler is unverified");
+            return proof::inspectClipBlit(context, *shadow, arguments, width, height, support, reason);
+        }
         const auto* vertexLayout = effectLayout(scope.passId, false, vs);
         const auto* pixelLayout = effectLayout(scope.passId, true, ps);
         if (!vertexLayout || !pixelLayout)
@@ -732,7 +753,7 @@ CaptureUiShaderPolicy UiShaderProof::inspect(ID3D11PixelShader* shader) noexcept
     return {};
 }
 bool UiShaderProof::inspectEffect(ID3D11PixelShader* shader, const CaptureScope& scope,
-                                  CaptureSupport& support) noexcept {
+                                  const capture::DrawArguments& arguments, CaptureSupport& support) noexcept {
     support = {};
     try {
         if (impl_->stopped)
@@ -740,9 +761,9 @@ bool UiShaderProof::inspectEffect(ID3D11PixelShader* shader, const CaptureScope&
         impl_->shadow->collect();
         std::string reason;
         std::array<char, 65> shaderHash{};
-        const bool accepted = impl_->inspectEffect(shader, scope, support, reason, shaderHash);
+        const bool accepted = impl_->inspectEffect(shader, scope, arguments, support, reason, shaderHash);
         if (!accepted)
-            impl_->effectFailure(shader, scope, reason);
+            impl_->effectFailure(shader, scope, arguments, reason);
         std::lock_guard lock(impl_->statusMutex);
         ++impl_->observation.inspected;
         if (accepted)

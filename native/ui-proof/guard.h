@@ -26,7 +26,7 @@ class UiShaderProof {
     // The capture owner holds the graphics lock while invoking either policy.
     CaptureUiShaderPolicy inspect(ID3D11PixelShader* shader) noexcept;
     bool inspectEffect(ID3D11PixelShader* shader, const CaptureScope& scope,
-                       CaptureSupport& support) noexcept;
+                       const capture::DrawArguments& arguments, CaptureSupport& support) noexcept;
     UiProofStatus status() const;
     // Diagnostic identity only; a fingerprint does not authorize any replay.
     static std::string shaderFingerprint(ID3D11DeviceChild* shader);

@@ -78,7 +78,7 @@ target_link_libraries(dspaa-capture PUBLIC dspaa-graphics minhook d3dcompiler)
 target_compile_options(dspaa-capture PRIVATE /W4 /permissive- /utf-8)
 set_property(TARGET dspaa-capture PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 
-add_library(dspaa-ui-proof STATIC native/ui-proof/guard.cpp native/ui-proof/effects.cpp native/ui-proof/shadow.cpp)
+add_library(dspaa-ui-proof STATIC native/ui-proof/guard.cpp native/ui-proof/effects.cpp native/ui-proof/blit.cpp native/ui-proof/shadow.cpp)
 target_link_libraries(dspaa-ui-proof PUBLIC dspaa-capture bcrypt)
 target_compile_options(dspaa-ui-proof PRIVATE /W4 /permissive- /utf-8)
 set_property(TARGET dspaa-ui-proof PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
@@ -126,7 +126,7 @@ set_property(TARGET present-probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDL
 
 # Opt-in, real-adapter behavioral capture proof; never opens a window.
 add_executable(ui-capture-probe native/probe/ui-capture.cpp)
-target_link_libraries(ui-capture-probe PRIVATE dspaa-capture)
+target_link_libraries(ui-capture-probe PRIVATE dspaa-ui-proof)
 target_compile_options(ui-capture-probe PRIVATE /W4 /permissive- /utf-8)
 set_property(TARGET ui-capture-probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 

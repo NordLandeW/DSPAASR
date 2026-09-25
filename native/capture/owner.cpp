@@ -397,9 +397,10 @@ struct CaptureOwner::Impl final : capture::Observer, std::enable_shared_from_thi
             flushUi(output); output.resetRgb = true; ++state.signedContributionDraws;
         }
     }
-    void dualDraw(Record& output, StateGuard& saved, NativeCall& original) {
+    void dualDraw(Record& output, StateGuard& saved, const DrawArguments& arguments, NativeCall& original) {
         CaptureSupport verifiedSupport;
-        if (!info.effectShaderPolicy || !info.effectShaderPolicy(saved.pixelShader.Get(), *scope, verifiedSupport) ||
+        if (!info.effectShaderPolicy ||
+            !info.effectShaderPolicy(saved.pixelShader.Get(), *scope, arguments, verifiedSupport) ||
             verifiedSupport.basis.empty())
             throw std::runtime_error("Effect shader or actual sampling bindings are unverified");
         const bool partial = scope->kind == CaptureScopeKind::PartialWrite || !scope->fullOverwrite;
@@ -467,7 +468,7 @@ struct CaptureOwner::Impl final : capture::Observer, std::enable_shared_from_thi
             output.transmittance = plane(*output.clean, 1, DXGI_FORMAT_R32_FLOAT); output.constantT = true;
         } else if (!output.constantT) failure("Partial color-only write cannot silently erase existing geometric opacity", false, true, false);
     }
-    void draw(NativeCall& original) {
+    void draw(const DrawArguments& arguments, NativeCall& original) {
         ++state.observedDraws;
         if (!scope || scope->kind == CaptureScopeKind::SharedPreparation || scope->kind == CaptureScopeKind::ExternalBlurPublication) {
             // Ordinary world/preparation draws do not need a replay snapshot.
@@ -528,7 +529,7 @@ struct CaptureOwner::Impl final : capture::Observer, std::enable_shared_from_thi
         if (!output) throw std::runtime_error("Capture output was not declared with an allocation epoch");
         if (scope->kind == CaptureScopeKind::FullOnlyUiCoverage) uiDraw(*output, saved, original);
         else {
-            dualDraw(*output, saved, original);
+            dualDraw(*output, saved, arguments, original);
             scopeOutput = {output->original,output->epoch};
         }
     }
@@ -633,7 +634,9 @@ struct CaptureOwner::Impl final : capture::Observer, std::enable_shared_from_thi
             if (operation.kind == OperationKind::QueryBegin || operation.kind == OperationKind::QueryEnd) { query(operation); original.run(); return; }
             if (!state.active || !arena || stopped) { original.run(); return; }
             switch (operation.kind) {
-            case OperationKind::Draw: draw(original); return;
+            case OperationKind::Draw:
+                draw(operation.draw, original);
+                return;
             case OperationKind::Copy: case OperationKind::CopyRegion: case OperationKind::Resolve: transfer(operation, original); return;
             case OperationKind::ClearColor: case OperationKind::ClearDepth: case OperationKind::ClearView: clear(operation, original); return;
             case OperationKind::ExecuteList:

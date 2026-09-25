@@ -9,6 +9,13 @@ enum class OperationKind {
     ClearView, Discard, Update, GenerateMips, Dispatch, ExecuteList,
     QueryBegin, QueryEnd, CpuWrite, UavWrite, ResourceLod
 };
+// Exact direct draw arguments, observed before the application's call. These
+// describe IA consumption; they never authorize geometry or a replay themselves.
+struct DrawArguments {
+    bool indexed = false;
+    unsigned count = 0, start = 0, instances = 1, firstInstance = 0;
+    int baseVertex = 0;
+};
 struct Operation {
     OperationKind kind = OperationKind::Draw;
     ID3D11Resource* destination = nullptr;
@@ -24,6 +31,7 @@ struct Operation {
     unsigned char stencil = 0;
     const D3D11_RECT* rectangles = nullptr;
     unsigned rectangleCount = 0;
+    DrawArguments draw;
 };
 // Stack-only synchronous call. run() suppresses nested driver entry-point
 // aliases, and guarantees the application's original operation runs once.

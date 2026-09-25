@@ -71,19 +71,27 @@ template<class Function> void invoke(ID3D11DeviceContext* context, const Operati
 }
 void STDMETHODCALLTYPE drawIndexed(ID3D11DeviceContext* self, UINT count, UINT start, INT base) {
     using F = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
-    invoke(self, {}, [&] { original<12, F>()(self, count, start, base); });
+    Operation op;
+    op.draw = {true, count, start, 1, 0, base};
+    invoke(self, op, [&] { original<12, F>()(self, count, start, base); });
 }
 void STDMETHODCALLTYPE draw(ID3D11DeviceContext* self, UINT count, UINT start) {
     using F = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
-    invoke(self, {}, [&] { original<13, F>()(self, count, start); });
+    Operation op;
+    op.draw = {false, count, start};
+    invoke(self, op, [&] { original<13, F>()(self, count, start); });
 }
 void STDMETHODCALLTYPE drawIndexedInstanced(ID3D11DeviceContext* self, UINT count, UINT instances, UINT start, INT base, UINT firstInstance) {
     using F = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
-    invoke(self, {}, [&] { original<20, F>()(self, count, instances, start, base, firstInstance); });
+    Operation op;
+    op.draw = {true, count, start, instances, firstInstance, base};
+    invoke(self, op, [&] { original<20, F>()(self, count, instances, start, base, firstInstance); });
 }
 void STDMETHODCALLTYPE drawInstanced(ID3D11DeviceContext* self, UINT count, UINT instances, UINT start, UINT firstInstance) {
     using F = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
-    invoke(self, {}, [&] { original<21, F>()(self, count, instances, start, firstInstance); });
+    Operation op;
+    op.draw = {false, count, start, instances, firstInstance};
+    invoke(self, op, [&] { original<21, F>()(self, count, instances, start, firstInstance); });
 }
 void STDMETHODCALLTYPE drawAuto(ID3D11DeviceContext* self) {
     using F = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*);

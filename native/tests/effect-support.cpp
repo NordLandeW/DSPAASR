@@ -1,5 +1,6 @@
-#include "ui-proof/effects.h"
+#include "ui-proof/blit.h"
 #include "ui-proof/effect-pins.h"
+#include "ui-proof/effects.h"
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -205,11 +206,79 @@ void shaftsAndFailClosed() {
     require(f.output.inputs.empty() && f.output.occlusionResourceSlot == -1, "auxiliary border fabricated inputs or geometric opacity");
     require(!f.resolve(0x1700, empty, empty, CaptureScopeKind::PartialWrite, true), "border declared an unsafe whole-subresource overwrite");
 }
+void nativeBlitGeometry() {
+    using Vertex = proof::ClipBlitVertex;
+    const std::array<Vertex, 4> quad{
+        {{{-1, 1, 0}, {0, 0}}, {{1, 1, 0}, {1, 0}}, {{-1, -1, 0}, {0, 1}}, {{1, -1, 0}, {1, 1}}}};
+    CaptureSampleDomain domain;
+    std::string reason;
+    auto ok = [&](std::span<const Vertex> vertices, D3D11_PRIMITIVE_TOPOLOGY topology) {
+        if (!proof::clipBlitDomain(vertices, topology, domain, reason))
+            throw std::runtime_error(reason);
+        require(reason.empty(), "Geometry success retained a previous rejection");
+    };
+    auto no = [&](std::span<const Vertex> vertices, D3D11_PRIMITIVE_TOPOLOGY topology) {
+        require(!proof::clipBlitDomain(vertices, topology, domain, reason) && !reason.empty(),
+                "Incomplete or non-affine geometry was accepted as a full blit");
+    };
+    ok(quad, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    auto uv = center(domain, 0.25, 0.75, 64, 32);
+    requireNear(uv[0], 0.25, "Native copy lost its actual horizontal coordinate");
+    requireNear(uv[1], 0.75, "Native copy introduced an unrequested Y flip");
+    auto transformed = quad;
+    for (auto& vertex : transformed)
+        vertex.uv = {0.125f + 0.5f * vertex.uv[0], 0.75f - 0.5f * vertex.uv[1]};
+    ok(transformed, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    uv = center(domain, 0.25, 0.75, 64, 32);
+    requireNear(uv[0], 0.25, "Native copy ignored the actual source crop");
+    requireNear(uv[1], 0.375, "Native copy guessed an identity map instead of the observed flip");
+    // Rotation is affine too; it cannot be reduced to independent scale/bias.
+    for (size_t i = 0; i < quad.size(); ++i)
+        transformed[i].uv = {quad[i].uv[1], 1 - quad[i].uv[0]};
+    ok(transformed, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    uv = center(domain, 0.25, 0.75, 64, 32);
+    requireNear(uv[0], 0.75, "Native copy lost cross-axis UV transport");
+    requireNear(uv[1], 0.75, "Native copy lost its rotated source coordinate");
+    const std::array<Vertex, 3> triangle{{{{-1, 1, 0}, {0, 0}}, {{3, 1, 0}, {2, 0}}, {{-1, -3, 0}, {0, 2}}}};
+    ok(triangle, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    uv = center(domain, 0.25, 0.75, 64, 32);
+    requireNear(uv[0], 0.25, "Clipped fullscreen triangle lost its UV origin");
+    requireNear(uv[1], 0.75, "Clipped fullscreen triangle used unclipped output dimensions");
+    const std::array<Vertex, 6> list{quad[0], quad[1], quad[2], quad[2], quad[1], quad[3]};
+    ok(list, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    auto missing = list;
+    missing[5] = quad[0];
+    no(missing, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    auto gap = quad;
+    gap[1].position[0] = gap[3].position[0] = 0.5f;
+    no(gap, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    gap = quad;
+    gap[3].uv[0] = 0.5f;
+    no(gap, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    gap = quad;
+    gap[0].position[2] = -1;
+    no(gap, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    gap = quad;
+    gap[0].uv[0] = std::numeric_limits<float>::quiet_NaN();
+    no(gap, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    gap = quad;
+    for (auto& vertex : gap) {
+        vertex.position[0] *= 3;
+        vertex.position[1] *= 3;
+    }
+    // Full coverage alone cannot authorize rounding an exact 1/3 UV slope.
+    no(gap, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    no(quad, D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+    no(std::span(quad.data(), 3), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ok(quad, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP); // A rejected frame cannot poison the next proof.
+}
 } // namespace
 int main() {
     try {
         copyAndPrefilterOrder(); bloomBaseFlipsAndTinySource(); dofAndFxaaSourceTexels();
-        uberStageSeparationAndGeometricA(); shaftsAndFailClosed();
+        uberStageSeparationAndGeometricA();
+        shaftsAndFailClosed();
+        nativeBlitGeometry();
         std::puts("effect support: actual stage/CB/SRV inputs, ST/flip order, source-texel kernels, geometric A and fail-closed behavior passed");
         return 0;
     } catch (const std::exception& error) { std::fprintf(stderr, "%s\n", error.what()); return 1; }

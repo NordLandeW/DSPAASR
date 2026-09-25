@@ -1,15 +1,17 @@
-#include "capture/owner.h"
 #include "capture/gpu.h"
+#include "capture/owner.h"
+#include "ui-proof/blit.h"
+#include "ui-proof/shadow.h"
 #include <MinHook.h>
-#include <d3d11sdklayers.h>
-#include <d3dcompiler.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <d3d11sdklayers.h>
+#include <d3dcompiler.h>
 #include <iostream>
-#include <stdexcept>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -33,6 +35,12 @@ Texture2D<float4> image : register(t0);
 RWTexture2D<float4> writtenImage : register(u1);
 SamplerState nearestSampler : register(s0);
 float4 vertex(uint id : SV_VertexID) : SV_Position { return float4(id == 2 ? 3 : -1, id == 1 ? 3 : -1, 0, 1); }
+struct ClipInput { float3 position : POSITION; float2 uv : TEXCOORD; };
+struct ClipOutput { float4 position : SV_Position; float2 uv : TEXCOORD; };
+ClipOutput clipVertex(ClipInput value) {
+    ClipOutput result; result.position=float4(value.position,1); result.uv=value.uv; return result;
+}
+float4 clipPixel(ClipOutput value) : SV_Target { return image.Sample(nearestSampler,value.uv); }
 float4 solid(float4 p : SV_Position) : SV_Target {
     if (any(p.xy < bounds.xy) || any(p.xy >= bounds.zw)) discard;
     return color;
@@ -103,6 +111,7 @@ class Fixture {
     uint64_t nextFrame = 0;
     unsigned checkedFrames = 0;
     unsigned diagnosticCalls = 0;
+    decltype(dspaa::CaptureOwnerCreateInfo::effectShaderPolicy) specialEffect;
 
     Fixture() {
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
@@ -160,12 +169,18 @@ class Fixture {
             return dspaa::CaptureUiShaderPolicy{verified && (actualShader == solid.Get() || actualShader == overlapSolid.Get() || actualShader == earlyOverlapSolid.Get()),
                                                 nonnegative, signedWithoutOverlap && actualShader == solid.Get(), finiteRgb, conservativeFragments};
         };
-        info.effectShaderPolicy = [this](ID3D11PixelShader* actual, const dspaa::CaptureScope& declared, dspaa::CaptureSupport& support) {
+        info.effectShaderPolicy = [this](ID3D11PixelShader* actual, const dspaa::CaptureScope& declared,
+                                         const dspaa::capture::DrawArguments& arguments,
+                                         dspaa::CaptureSupport& support) {
+            if (specialEffect)
+                return specialEffect(actual, declared, arguments, support);
             // This fixture owns the exact three-tap/constant PS programs.
             // A different actual PS must not inherit the declared pass's proof.
             if (!((declared.passId == 2 && actual == filter.Get()) ||
-                  (declared.passId == 3 && actual == solid.Get()))) return false;
-            support = declared.support; return true;
+                  (declared.passId == 3 && actual == solid.Get())))
+                return false;
+            support = declared.support;
+            return true;
         };
         info.unannotatedDraw = [this](ID3D11RenderTargetView*) {
             ++diagnosticCalls;
@@ -713,6 +728,188 @@ void unscopedUavInvalidation(Fixture& f) {
     close(f.read(f.full.texture.Get()).at(1, 1, 2), 0.75f + 0.25f * world[2],
           "UAV invalidation suppressed or duplicated the original color draw");
 }
+void nativeClipTransfer(Fixture& f) {
+    using Vertex = dspaa::proof::ClipBlitVertex;
+    const std::array<Vertex, 4> quad{
+        {{{-1, 1, 0}, {1, 0}}, {{1, 1, 0}, {0, 0}}, {{-1, -1, 0}, {1, 1}}, {{1, -1, 0}, {0, 1}}}};
+    // Binding offset, draw start and negative base vertex are deliberately
+    // independent. None of the three may be silently treated as zero.
+    const std::array<Vertex, 8> vertices{Vertex{}, Vertex{}, quad[0], quad[1],
+                                         quad[2],  quad[2],  quad[1], quad[3]};
+    auto shadow = std::make_shared<dspaa::proof::ConstantShadow>(f.device.Get(), f.context.Get());
+    dspaa::capture::attachWrites(shadow);
+    struct Cleanup {
+        Fixture& f;
+        std::shared_ptr<dspaa::proof::ConstantShadow> shadow;
+        ~Cleanup() {
+            f.specialEffect = {};
+            dspaa::capture::detachWrites(shadow.get());
+            shadow->stop();
+        }
+    } cleanup{f, shadow};
+    auto makeBuffer = [&](const void* data, UINT bytes, UINT bindings) {
+        D3D11_BUFFER_DESC description{};
+        description.ByteWidth = bytes;
+        description.Usage = D3D11_USAGE_DEFAULT;
+        description.BindFlags = bindings;
+        D3D11_SUBRESOURCE_DATA initial{};
+        initial.pSysMem = data;
+        ComPtr<ID3D11Buffer> buffer;
+        dspaa::graphicsCheck(f.device->CreateBuffer(&description, &initial, &buffer),
+                             "Create native blit IA fixture");
+        require(shadow->created(buffer.Get(), data), "Observe native blit IA fixture bytes");
+        return buffer;
+    };
+    auto vertexBuffer = makeBuffer(vertices.data(), sizeof(vertices), D3D11_BIND_VERTEX_BUFFER);
+    // Large indices with a negative base must still address the actual vertices.
+    constexpr uint16_t lastIndex = std::numeric_limits<uint16_t>::max() - 1;
+    const std::array<uint16_t, 8> indices16{
+        0, 0, lastIndex - 5, lastIndex - 4, lastIndex - 3, lastIndex - 2, lastIndex - 1, lastIndex};
+    const std::array<uint32_t, 8> indices32{0, 0, 2, 3, 4, 5, 6, 7};
+    auto index16 = makeBuffer(indices16.data(), sizeof(indices16), D3D11_BIND_INDEX_BUFFER);
+    auto index32 = makeBuffer(indices32.data(), sizeof(indices32), D3D11_BIND_INDEX_BUFFER);
+    const auto vertexCode = compile("clipVertex", "vs_5_0"), pixelCode = compile("clipPixel", "ps_5_0");
+    ComPtr<ID3D11VertexShader> vertex;
+    ComPtr<ID3D11PixelShader> pixel;
+    dspaa::graphicsCheck(f.device->CreateVertexShader(vertexCode->GetBufferPointer(),
+                                                      vertexCode->GetBufferSize(), nullptr, &vertex),
+                         "Create native blit fixture VS");
+    dspaa::graphicsCheck(f.device->CreatePixelShader(pixelCode->GetBufferPointer(),
+                                                     pixelCode->GetBufferSize(), nullptr, &pixel),
+                         "Create native blit fixture PS");
+    const D3D11_INPUT_ELEMENT_DESC elements[]{
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT,
+         D3D11_INPUT_PER_VERTEX_DATA, 0}};
+    ComPtr<ID3D11InputLayout> layout;
+    dspaa::graphicsCheck(f.device->CreateInputLayout(elements, static_cast<UINT>(std::size(elements)),
+                                                     vertexCode->GetBufferPointer(),
+                                                     vertexCode->GetBufferSize(), &layout),
+                         "Create native blit fixture layout");
+    dspaa::proof::observeBlitLayout(layout.Get(), elements, static_cast<unsigned>(std::size(elements)));
+    const D3D11_INPUT_ELEMENT_DESC splitElements[]{
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT,
+         D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 1, D3D11_APPEND_ALIGNED_ELEMENT,
+         D3D11_INPUT_PER_VERTEX_DATA, 0}};
+    ComPtr<ID3D11InputLayout> splitLayout;
+    dspaa::graphicsCheck(f.device->CreateInputLayout(
+                             splitElements, static_cast<UINT>(std::size(splitElements)),
+                             vertexCode->GetBufferPointer(), vertexCode->GetBufferSize(), &splitLayout),
+                         "Create per-slot APPEND blit layout");
+    dspaa::proof::observeBlitLayout(splitLayout.Get(), splitElements,
+                                    static_cast<unsigned>(std::size(splitElements)));
+    for (unsigned kind = 0; kind < 4; ++kind) {
+        const bool indexed = (kind & 1u) != 0, instanced = (kind & 2u) != 0;
+        const int base = indexed ? (kind == 1 ? 1 - static_cast<int>(indices16[2]) : -1) : 0;
+        unsigned observations = 0;
+        std::string rejection;
+        f.specialEffect = [&](ID3D11PixelShader* actual, const dspaa::CaptureScope& scope,
+                              const dspaa::capture::DrawArguments& args, dspaa::CaptureSupport& support) {
+            ++observations;
+            require(actual == pixel.Get() && scope.passId == 0x1000,
+                    "Blit fixture mixed its actual shader contract");
+            ComPtr<ID3D11VertexShader> actualVertex;
+            f.context->VSGetShader(&actualVertex, nullptr, nullptr);
+            require(actualVertex.Get() == vertex.Get(), "Blit fixture mixed its actual VS contract");
+            require(args.indexed == indexed && args.count == 6 && args.start == 1 && args.instances == 1 &&
+                        args.firstInstance == (instanced ? 9u : 0u) && args.baseVertex == base,
+                    "Draw hook changed actual IA arguments");
+            return dspaa::proof::inspectClipBlit(f.context.Get(), *shadow, args, width, height, support,
+                                                 rejection);
+        };
+        const float untouched[]{0.9f, 0.8f, 0.7f, 0.6f};
+        f.context->ClearRenderTargetView(f.post.rtv.Get(), untouched);
+        f.begin();
+        f.uiScope();
+        f.blend(D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_INV_SRC_ALPHA);
+        f.draw({1, 0, 0, 0.5f}, {4, 4, 20, 12});
+        f.end();
+        require(f.capture->declareTexture(f.post.captured()), "Declare native blit output");
+        f.bind(f.post);
+        f.blend(D3D11_BLEND_ONE, D3D11_BLEND_ZERO, D3D11_COLOR_WRITE_ENABLE_ALL, false);
+        auto* input = f.full.srv.Get();
+        f.context->PSSetShaderResources(0, 1, &input);
+        ID3D11Buffer* buffers[]{vertexBuffer.Get(), vertexBuffer.Get()};
+        const UINT strides[]{sizeof(Vertex), sizeof(Vertex)},
+            offsets[]{sizeof(Vertex), sizeof(Vertex) + offsetof(Vertex, uv)};
+        f.context->IASetVertexBuffers(0, static_cast<UINT>(std::size(buffers)), buffers, strides, offsets);
+        f.context->IASetInputLayout(kind == 3 ? splitLayout.Get() : layout.Get());
+        f.context->VSSetShader(vertex.Get(), nullptr, 0);
+        f.context->PSSetShader(pixel.Get(), nullptr, 0);
+        f.context->IASetIndexBuffer(kind == 3 ? index32.Get() : index16.Get(),
+                                    kind == 3 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT,
+                                    kind == 3 ? sizeof(uint32_t) : sizeof(uint16_t));
+        dspaa::CaptureScope scope;
+        scope.kind = dspaa::CaptureScopeKind::DualColor;
+        scope.passId = 0x1000;
+        scope.fullOverwrite = true;
+        require(f.capture->beginScope(scope), "Begin native blit fixture scope");
+        if (kind == 0)
+            f.context->Draw(6, 1);
+        else if (kind == 1)
+            f.context->DrawIndexed(6, 1, base);
+        else if (kind == 2)
+            f.context->DrawInstanced(6, 1, 1, 9);
+        else
+            f.context->DrawIndexedInstanced(6, 1, 1, base, 9);
+        require(rejection.empty(), rejection.c_str());
+        require(observations == 1, "Native blit draw was missed or its private replay re-entered proof");
+        f.end();
+        f.bindings(f.post, pixel.Get());
+        ComPtr<ID3D11InputLayout> actualLayout;
+        f.context->IAGetInputLayout(&actualLayout);
+        require(actualLayout.Get() == (kind == 3 ? splitLayout.Get() : layout.Get()),
+                "Capture changed the application IA layout");
+        for (UINT slot = 0; slot < std::size(buffers); ++slot) {
+            ComPtr<ID3D11Buffer> actualBuffer;
+            UINT actualStride = 0, actualOffset = 0;
+            f.context->IAGetVertexBuffers(slot, 1, &actualBuffer, &actualStride, &actualOffset);
+            require(actualBuffer.Get() == buffers[slot] && actualStride == strides[slot] &&
+                        actualOffset == offsets[slot],
+                    "Capture changed an application IA binding");
+        }
+        auto lease = f.seal(f.post);
+        f.complete(lease);
+        const auto clean = f.read(lease->clean.Get());
+        const auto opacity = f.read(lease->occlusion.Get()), influence = f.read(lease->influence.Get()),
+                   actual = f.read(f.post.texture.Get());
+        std::cout << "native_clip kind=" << kind << " clean00=" << clean.at(0, 0)
+                  << " final00=" << actual.at(0, 0) << " cleanLast=" << clean.at(width - 1, height - 1)
+                  << " finalLast=" << actual.at(width - 1, height - 1) << " errors=" << f.errors() << '\n';
+        f.worldPlane(clean);
+        for (unsigned y = 0; y < height; ++y)
+            for (unsigned x = 0; x < width; ++x) {
+                const bool covered = x >= width - 20 && x < width - 4 && y >= 4 && y < 12;
+                close(opacity.at(x, y), covered ? 0.5f : 0.f, "Observed mirrored UV lost geometric opacity");
+                close(influence.at(x, y), covered ? 1.f : 0.f, "Observed mirrored UV lost UI influence");
+                close(actual.at(x, y, 0), covered ? 0.6f : world[0],
+                      "Native blit hook changed the original color copy");
+            }
+        // The same valid shaders/bytes cannot authorize a later clipped draw.
+        const D3D11_RECT clipped{0, 0, width / 2, height};
+        f.context->RSSetScissorRects(1, &clipped);
+        dspaa::CaptureSupport denied;
+        std::string why;
+        const dspaa::capture::DrawArguments args{indexed, 6, 1, 1, instanced ? 9u : 0u, base};
+        require(!dspaa::proof::inspectClipBlit(f.context.Get(), *shadow, args, width, height, denied, why) &&
+                    denied.basis.empty(),
+                "Native copy accepted a partial scissor as full-output geometry");
+        f.specialEffect = {};
+    }
+    const D3D11_RECT fullScissor{0, 0, width, height};
+    f.context->RSSetScissorRects(1, &fullScissor);
+    auto cutIndices = indices16;
+    cutIndices.back() = std::numeric_limits<uint16_t>::max();
+    f.context->UpdateSubresource(index16.Get(), 0, nullptr, cutIndices.data(), 0, 0);
+    f.context->IASetIndexBuffer(index16.Get(), DXGI_FORMAT_R16_UINT, sizeof(uint16_t));
+    dspaa::CaptureSupport denied;
+    std::string why;
+    const dspaa::capture::DrawArguments cut{true, 6, 1, 1, 0, 1 - static_cast<int>(indices16[2])};
+    require(!dspaa::proof::inspectClipBlit(f.context.Get(), *shadow, cut, width, height, denied, why) &&
+                denied.basis.empty(),
+            "Maximum IA index falsely proved a complete rectangle after a negative base");
+}
 void missingSignedProof(Fixture& f) {
     f.nonnegative=false; f.signedWithoutOverlap=false;
     f.begin(); f.uiScope(); f.blend(D3D11_BLEND_ONE,D3D11_BLEND_ONE); f.draw({-0.5f,0,0,0}); f.end();
@@ -824,6 +1021,7 @@ int main() {
         unscopedConsumedValue(fixture);
         unscopedMissingInput(fixture);
         unscopedUavInvalidation(fixture);
+        nativeClipTransfer(fixture);
         fragmentNonfiniteRgb(fixture); fragmentMixedScopes(fixture); fragmentStencilClip(fixture);
         fragmentSampleMask(fixture); fragmentWritableOverlap(fixture); fragmentOptInGates(fixture);
         sourceOver(fixture); // Recovery after an invalidated frame, and safe arena reuse.

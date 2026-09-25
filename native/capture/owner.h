@@ -8,6 +8,9 @@
 #include <vector>
 
 namespace dspaa {
+namespace capture {
+struct DrawArguments;
+}
 // All calls below execute in the ORIGINAL Unity immediate-context command order
 // (normally ordered render events), never by setting a main-thread global flag.
 // The caller owns camera/pass identification and the validity of its shader
@@ -88,7 +91,9 @@ struct CaptureOwnerCreateInfo {
     std::function<CaptureUiShaderPolicy(ID3D11PixelShader*)> uiShaderPolicy;
     // Resolve the complete effect dependency/UV contract from the ACTUAL draw,
     // before any private raster work. A declaration/basis alone is not a proof.
-    std::function<bool(ID3D11PixelShader*, const CaptureScope&, CaptureSupport&)> effectShaderPolicy;
+    std::function<bool(ID3D11PixelShader*, const CaptureScope&, const capture::DrawArguments&,
+                       CaptureSupport&)>
+        effectShaderPolicy;
     // Optional read-only diagnostic before the first unexplained color write.
     // Failures in this callback never suppress or replay the original draw.
     std::function<void(ID3D11RenderTargetView*)> unannotatedDraw;

@@ -94,8 +94,8 @@ struct FrameCapture::Impl {
         info.graphics = graphics;
         info.uiShaderPolicy = [this](ID3D11PixelShader* shader) { return proof->inspect(shader); };
         info.effectShaderPolicy = [this](ID3D11PixelShader* shader, const CaptureScope& scope,
-                                         CaptureSupport& support) {
-            return proof->inspectEffect(shader, scope, support);
+                                         const capture::DrawArguments& arguments, CaptureSupport& support) {
+            return proof->inspectEffect(shader, scope, arguments, support);
         };
         char diagnostic[2]{};
         if (GetEnvironmentVariableA("DSPAASR_CAPTURE_TRACE_WRITES", diagnostic, sizeof(diagnostic)) == 1 &&
