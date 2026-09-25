@@ -6,6 +6,7 @@
 #include <cstring>
 #include <d3d11sdklayers.h>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 #include <wrl/client.h>
@@ -132,6 +133,32 @@ ComPtr<ID3D11Buffer> buffer(ID3D11Device* device, unsigned bytes, D3D11_USAGE us
     ComPtr<ID3D11Buffer> result;
     check(device->CreateBuffer(&desc, initial ? &data : nullptr, &result), "Create probe constant buffer");
     return result;
+}
+ComPtr<ID3D11Buffer> byteBuffer(ID3D11Device* device, unsigned bytes, unsigned bindings, D3D11_USAGE usage,
+                                const void* initial = nullptr) {
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = bytes;
+    desc.BindFlags = bindings;
+    desc.Usage = usage;
+    if (usage == D3D11_USAGE_DYNAMIC)
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    D3D11_SUBRESOURCE_DATA data{};
+    data.pSysMem = initial;
+    ComPtr<ID3D11Buffer> result;
+    check(device->CreateBuffer(&desc, initial ? &data : nullptr, &result), "Create probe byte buffer");
+    return result;
+}
+std::vector<unsigned char> byteValues(unsigned count, unsigned char salt) {
+    std::vector<unsigned char> result(count);
+    for (unsigned i = 0; i < count; ++i)
+        result[i] = static_cast<unsigned char>(i ^ salt);
+    return result;
+}
+void writeBytes(Gpu& gpu, ID3D11Buffer* target, const std::vector<unsigned char>& data) {
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    check(gpu.context->Map(target, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped), "Map probe IA bytes for writing");
+    std::memcpy(mapped.pData, data.data(), data.size());
+    gpu.context->Unmap(target, 0);
 }
 void write(Gpu& gpu, ID3D11Buffer* target, const std::vector<float>& data) {
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -528,6 +555,243 @@ int main() {
                     "Foreign-device constants were adopted");
             require(s.shadow->stats().bytes == 0 && s.shadow->stats().queued == 0,
                     "Foreign resource consumed this owner's shadow budget");
+            s.close();
+            ++scenarios;
+            std::cout << "scenario " << scenarios << " passed\n";
+        }
+        // A real six-index ushort buffer has only 12 bytes: cold readback and
+        // its final cell must not assume a physically present fourth uint32.
+        {
+            const std::array<uint16_t, 6> initial{0, 1, 2, 0x7FC1, 0xFFFF, 0x8000};
+            auto target = byteBuffer(gpu.device.Get(), sizeof(initial), D3D11_BIND_INDEX_BUFFER,
+                                     D3D11_USAGE_IMMUTABLE, initial.data());
+            Session s(gpu);
+            ShadowReadInfo info;
+            std::array<uint16_t, 6> output;
+            output.fill(9);
+            require(!s.shadow->readBytes(target.Get(), 0, sizeof(output), output.data(), info) &&
+                        info.owned && output == std::array<uint16_t, 6>{},
+                    "Short IB was trusted before its real cold copy completed");
+            require(s.shadow->stats().queued == 1 && s.shadow->stats().pending == 1,
+                    "Short IB did not reuse the common readback ticket owner");
+            s.collect();
+            require(s.shadow->readBytes(target.Get(), 0, sizeof(output), output.data(), info) &&
+                        output == initial,
+                    "12-byte IB tail lost exact ushort index bits");
+            uint16_t last = 0;
+            require(s.shadow->readBytes(target.Get(), sizeof(initial) - sizeof(last), sizeof(last), &last,
+                                        info) &&
+                        last == initial.back(),
+                    "Short IB's last index was inaccessible");
+            std::array<unsigned char, 4> invalid{9, 9, 9, 9};
+            require(!s.shadow->readBytes(target.Get(), sizeof(initial) - 1, sizeof(invalid), invalid.data(),
+                                         info) &&
+                        invalid == std::array<unsigned char, 4>{},
+                    "IA physical overrun exposed partial bytes");
+            invalid.fill(9);
+            require(!s.shadow->readBytes(target.Get(), std::numeric_limits<unsigned>::max() - 1,
+                                         sizeof(invalid), invalid.data(), info) &&
+                        invalid == std::array<unsigned char, 4>{},
+                    "IA byte range wrapped at UINT_MAX");
+            require(s.shadow->stats().queued == 1, "Invalid IA range scheduled another GPU copy");
+            target.Reset();
+            released(s);
+            s.close();
+            ++scenarios;
+            std::cout << "scenario " << scenarios << " passed\n";
+        }
+        // Integer payloads cross cells and end at an odd physical tail. Some
+        // words encode NaNs/infinities as floats; no float arithmetic is valid.
+        {
+            std::array<unsigned char, 31> initial{};
+            const std::array<uint32_t, 5> bits{0x7FC00001u, 0x7FA12345u, 0xFF800000u, 0xFFFFFFFFu,
+                                               0x80000000u};
+            std::memcpy(initial.data() + 11, bits.data(), sizeof(bits));
+            Session s(gpu);
+            auto target = byteBuffer(gpu.device.Get(), sizeof(initial),
+                                     D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_SHADER_RESOURCE,
+                                     D3D11_USAGE_IMMUTABLE, initial.data());
+            require(s.shadow->created(target.Get(), initial.data()), "IA initial data was not adopted");
+            ShadowReadInfo info;
+            std::array<uint32_t, 5> output{};
+            require(s.shadow->readBytes(target.Get(), 11, sizeof(output), output.data(), info) &&
+                        output == bits,
+                    "Cross-cell byte read changed uint32 index/NaN payload bits");
+            unsigned char tail = 0;
+            require(s.shadow->readBytes(target.Get(), sizeof(initial) - 1, 1, &tail, info) &&
+                        tail == initial.back(),
+                    "Non-16-byte vertex tail was rounded out of the allocation");
+            std::array<float, 4> constants{9, 9, 9, 9};
+            require(!s.shadow->read(target.Get(), 0, D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT, 0, 4, constants,
+                                    info) &&
+                        constants == std::array<float, 4>{},
+                    "Adopted IA facts bypassed constant-buffer legality");
+            require(s.shadow->stats().queued == 0, "Observed IA bytes unnecessarily queued readback");
+            target.Reset();
+            released(s);
+            s.close();
+            ++scenarios;
+            std::cout << "scenario " << scenarios << " passed\n";
+        }
+        // An in-flight byte ticket cannot overwrite a newer UpdateSubresource.
+        // A later real GPU copy invalidates those CPU facts and must recover cold.
+        {
+            auto initial = byteValues(27, 0x21), replacement = byteValues(27, 0xA5),
+                 copied = byteValues(27, 0x5A);
+            auto target = byteBuffer(gpu.device.Get(), static_cast<unsigned>(initial.size()),
+                                     D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, initial.data());
+            Session s(gpu);
+            ShadowReadInfo info;
+            std::array<unsigned char, 14> output{};
+            require(!s.shadow->readBytes(target.Get(), 13, sizeof(output), output.data(), info),
+                    "Revision fixture IA data was not genuinely cold");
+            gpu.context->UpdateSubresource(target.Get(), 0, nullptr, replacement.data(), 0, 0);
+            require(s.shadow->readBytes(target.Get(), 13, sizeof(output), output.data(), info) &&
+                        std::memcmp(output.data(), replacement.data() + 13, sizeof(output)) == 0,
+                    "IA update failed to replace cached bytes before old ticket retirement");
+            s.collect();
+            require(s.shadow->stats().stale == 1 && s.shadow->stats().published == 0,
+                    "Old IA ticket overwrote the new resource revision");
+            const std::array<unsigned char, 3> patch{0xFF, 0x7F, 0x80};
+            const D3D11_BOX tail{24, 0, 0, 27, 1, 1};
+            gpu.context->UpdateSubresource(target.Get(), 0, &tail, patch.data(), 0, 0);
+            std::array<unsigned char, 4> patched{};
+            require(s.shadow->readBytes(target.Get(), 23, sizeof(patched), patched.data(), info) &&
+                        patched ==
+                            std::array<unsigned char, 4>{replacement[23], patch[0], patch[1], patch[2]},
+                    "Partial IA tail update lost the unchanged bytes or its real byte range");
+            auto source = byteBuffer(gpu.device.Get(), static_cast<unsigned>(copied.size()),
+                                     D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, copied.data());
+            gpu.context->CopyResource(target.Get(), source.Get());
+            output.fill(9);
+            require(!s.shadow->readBytes(target.Get(), 13, sizeof(output), output.data(), info) &&
+                        output == std::array<unsigned char, 14>{},
+                    "GPU-written IA bytes reused the old CPU snapshot");
+            s.collect();
+            require(s.shadow->readBytes(target.Get(), 13, sizeof(output), output.data(), info) &&
+                        std::memcmp(output.data(), copied.data() + 13, sizeof(output)) == 0,
+                    "IA cold recovery did not observe the actual GPU copy");
+            source.Reset();
+            target.Reset();
+            released(s);
+            s.close();
+            ++scenarios;
+            std::cout << "scenario " << scenarios << " passed\n";
+        }
+        // Far beyond the CB window, copy just three demanded cells (16+16+7
+        // bytes), not a full 256-KiB geometry pool or a rounded-up tail.
+        {
+            constexpr unsigned bytes = 256 * 1024 + 7, offset = bytes - 25;
+            const auto initial = byteValues(bytes, 0x81);
+            auto target = byteBuffer(gpu.device.Get(), bytes, D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT,
+                                     initial.data());
+            Session s(gpu);
+            ShadowReadInfo info;
+            std::array<unsigned char, 25> output{};
+            require(!s.shadow->readBytes(target.Get(), offset, sizeof(output), output.data(), info),
+                    "Large cold IA pool was trusted without a byte-range ticket");
+            require(!s.shadow->readBytes(target.Get(), offset, sizeof(output), output.data(), info) &&
+                        s.shadow->stats().queued == 1,
+                    "Large IA reads duplicated the pending resource ticket");
+            s.collect();
+            require(s.shadow->readBytes(target.Get(), offset, sizeof(output), output.data(), info) &&
+                        std::memcmp(output.data(), initial.data() + offset, sizeof(output)) == 0,
+                    "Large IA range inherited a CB window or wrong staging origin");
+            const auto stats = s.shadow->stats();
+            require(stats.copiedBytes == 39 && stats.peakBytes < bytes && stats.published == 1 &&
+                        stats.wcBytes == 0,
+                    "Large IA cold recovery copied or shadowed the whole allocation");
+            target.Reset();
+            released(s);
+            s.close();
+            ++scenarios;
+            std::cout << "scenario " << scenarios << " passed\n";
+        }
+        // The same demanded cells are refreshed by a real dynamic WC upload.
+        // The obsolete partial staging lease remains owned until its fence retires.
+        {
+            constexpr unsigned bytes = 256 * 1024 + 7, offset = bytes - 25;
+            const auto initial = byteValues(bytes, 0x13), replacement = byteValues(bytes, 0xB7);
+            auto target = byteBuffer(gpu.device.Get(), bytes, D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DYNAMIC,
+                                     initial.data());
+            Session s(gpu);
+            ShadowReadInfo info;
+            std::array<unsigned char, 25> output{};
+            require(!s.shadow->readBytes(target.Get(), offset, sizeof(output), output.data(), info),
+                    "WC IA fixture did not queue its initial sparse cold read");
+            writeBytes(gpu, target.Get(), replacement);
+            require(s.shadow->readBytes(target.Get(), offset, sizeof(output), output.data(), info) &&
+                        std::memcmp(output.data(), replacement.data() + offset, sizeof(output)) == 0,
+                    "Sparse IA WC update failed to refresh its nonaligned tail");
+            require(s.shadow->stats().wcBytes == 39 && s.shadow->stats().wcCopies == 1 &&
+                        s.shadow->stats().pending == 1 && s.shadow->stats().peakBytes < bytes,
+                    "IA WC observation scanned the whole pool or freed a pending range");
+            s.collect();
+            require(s.shadow->stats().stale == 1 && s.shadow->stats().published == 0 &&
+                        s.shadow->readBytes(target.Get(), offset, sizeof(output), output.data(), info) &&
+                        std::memcmp(output.data(), replacement.data() + offset, sizeof(output)) == 0,
+                    "Sparse cold data overwrote the newer IA WC revision");
+            target.Reset();
+            released(s);
+            s.close();
+            ++scenarios;
+            std::cout << "scenario " << scenarios << " passed\n";
+        }
+        // Reject actual GPU-write-capable buffers before adoption. CB bytes may
+        // not bypass their own binding-window contract through the IA entry point.
+        {
+            Session s(gpu);
+            ShadowReadInfo info;
+            const auto initial = byteValues(64, 0x11);
+            const unsigned bindings[]{D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_UNORDERED_ACCESS,
+                                      D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_STREAM_OUTPUT,
+                                      D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_CONSTANT_BUFFER};
+            for (const auto bind : bindings) {
+                auto target = byteBuffer(gpu.device.Get(), static_cast<unsigned>(initial.size()), bind,
+                                         D3D11_USAGE_DEFAULT, initial.data());
+                std::array<unsigned char, 4> output{9, 9, 9, 9};
+                require(!s.shadow->readBytes(target.Get(), 0, sizeof(output), output.data(), info) &&
+                            !info.owned && output == std::array<unsigned char, 4>{},
+                        "IA read accepted a non-IA or GPU-write-capable buffer");
+                if (bind != D3D11_BIND_CONSTANT_BUFFER)
+                    require(!s.shadow->created(target.Get(), initial.data()),
+                            "Unsafe IA flags were attached by creation");
+            }
+            require(s.shadow->stats().bytes == 0 && s.shadow->stats().queued == 0,
+                    "Rejected IA buffer flags consumed the shared budget or queued a GPU copy");
+            s.close();
+            ++scenarios;
+            std::cout << "scenario " << scenarios << " passed\n";
+        }
+        // A partial IA ticket has exactly the same no-early-release contract as
+        // the original CB ticket, including stop without a CPU staging Map.
+        {
+            constexpr unsigned bytes = 256 * 1024 + 7, offset = bytes - 25;
+            const auto initial = byteValues(bytes, 0x27);
+            auto target = byteBuffer(gpu.device.Get(), bytes, D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DEFAULT,
+                                     initial.data());
+            Session s(gpu);
+            GpuGate gate(gpu);
+            ShadowReadInfo info;
+            std::array<unsigned char, 25> output{};
+            require(!s.shadow->readBytes(target.Get(), offset, sizeof(output), output.data(), info),
+                    "Gated IA range did not queue a cold ticket");
+            const auto charged = s.shadow->stats().bytes;
+            s.detach();
+            require(!s.shadow->stop(), "Stop retired a GPU-blocked IA range");
+            require(s.shadow->stats().pending == 1 && s.shadow->stats().bytes == charged,
+                    "Stopped IA range lost its staging charge before GPU retirement");
+            target.Reset();
+            require(s.shadow->stats().liveBuffers == 1,
+                    "Pending IA range lost its application-resource lease");
+            gate.open();
+            gpu.complete();
+            require(s.shadow->stop(), "Completed IA range required CPU readback during stop");
+            const auto stats = s.shadow->stats();
+            require(stats.pending == 0 && stats.stale == 1 && stats.published == 0 &&
+                        stats.copiedBytes == 0 && stats.failed == 0,
+                    "Stopped IA retirement published discarded bytes or bypassed its ticket");
+            released(s);
             s.close();
             ++scenarios;
             std::cout << "scenario " << scenarios << " passed\n";

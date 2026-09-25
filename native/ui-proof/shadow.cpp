@@ -1,5 +1,6 @@
 #include "shadow.h"
 #include "constants.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -12,6 +13,17 @@ namespace dspaa::proof {
 namespace {
 using Microsoft::WRL::ComPtr;
 constexpr GUID bufferKey{0xa41ac69b, 0xc695, 0x498b, {0x92, 0x4f, 0x39, 0x04, 0x8c, 0x0c, 0x11, 0x23}};
+constexpr unsigned cellBytes = D3D11_COMMONSHADER_CONSTANT_BUFFER_COMPONENTS * sizeof(float);
+using CellBytes = std::array<unsigned char, cellBytes>;
+bool constantBuffer(const D3D11_BUFFER_DESC& desc) {
+    return desc.BindFlags == D3D11_BIND_CONSTANT_BUFFER && desc.ByteWidth && desc.ByteWidth % cellBytes == 0;
+}
+bool inputBuffer(const D3D11_BUFFER_DESC& desc) {
+    constexpr unsigned input = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER;
+    constexpr unsigned allowed = input | D3D11_BIND_SHADER_RESOURCE;
+    // Shared/tiled aliases can mutate without this owner's write observation.
+    return desc.ByteWidth && (desc.BindFlags & input) && !(desc.BindFlags & ~allowed) && !desc.MiscFlags;
+}
 struct Budget {
     const uint64_t limit;
     std::atomic<uint64_t> bytes{0}, peak{0}, epoch{1}, copied{0}, invalidations{0};
@@ -34,7 +46,7 @@ struct Budget {
     }
 };
 struct Cell {
-    std::array<float, 4> value{};
+    CellBytes value{};
     uint64_t epoch = 0;
     bool valid = false;
 };
@@ -121,29 +133,31 @@ struct __declspec(uuid("FB267A8C-C3C1-4822-ACBD-F47FA124219A")) Facts final : IU
         } else
             snapshotValid = false;
         for (auto& [offset, cell] : cells) {
+            const auto bytes = std::min(cellBytes, description.ByteWidth - offset);
+            const uint64_t end = static_cast<uint64_t>(offset) + bytes;
             if (snapshotValid && snapshotEpoch == epoch) {
-                std::memcpy(cell.value.data(), snapshot.get() + offset, 16);
+                std::memcpy(cell.value.data(), snapshot.get() + offset, bytes);
                 cell.valid = true;
                 cell.epoch = epoch;
-                budget->copied += 16;
-            } else if (offset >= first && offset + 16 <= last) {
+                budget->copied += bytes;
+            } else if (offset >= first && end <= last) {
                 std::memcpy(cell.value.data(), static_cast<const unsigned char*>(source) + offset - first,
-                            16);
-                sourceBytes += 16;
+                            bytes);
+                sourceBytes += bytes;
                 cell.valid = true;
                 cell.epoch = epoch;
-                budget->copied += 16;
-            } else if (offset < last && offset + 16 > first)
+                budget->copied += bytes;
+            } else if (offset < last && end > first)
                 cell.valid = false;
         }
         return sourceBytes;
     }
-    bool readCell(unsigned offset, std::array<float, 4>& output, const char*& failure) {
+    bool readCell(unsigned offset, CellBytes& output, const char*& failure) {
         if (mapping) {
             failure = "buffer-mapped";
             return false;
         }
-        if (offset > description.ByteWidth || description.ByteWidth - offset < 16 || offset % 16) {
+        if (offset >= description.ByteWidth || offset % cellBytes) {
             failure = "cell-physical-range";
             return false;
         }
@@ -171,7 +185,8 @@ struct __declspec(uuid("FB267A8C-C3C1-4822-ACBD-F47FA124219A")) Facts final : IU
         // A newly received full snapshot also heals cells registered by the
         // earlier failed read; it is not restricted to newly inserted entries.
         if (snapshotValid && (description.Usage == D3D11_USAGE_IMMUTABLE || snapshotEpoch == epoch)) {
-            std::memcpy(cell.value.data(), snapshot.get() + offset, 16);
+            std::memcpy(cell.value.data(), snapshot.get() + offset,
+                        std::min(cellBytes, description.ByteWidth - offset));
             cell.valid = true;
             cell.epoch = epoch;
         }
@@ -235,6 +250,7 @@ struct ConstantShadow::Impl {
         ComPtr<IUnknown> sourceIdentity;
         ComPtr<Facts> value;
         uint64_t revision = 0, epoch = 0, charged = 0, completionValue = 0;
+        unsigned first = 0, last = 0; // Exact copied source-byte interval, staging starts at zero.
         bool failed = false;
     };
     std::array<Ticket, maximumPending> tickets;
@@ -278,7 +294,7 @@ struct ConstantShadow::Impl {
         }
         ComPtr<ID3D11Buffer> buffer;
         if (FAILED(resource->QueryInterface(IID_PPV_ARGS(&buffer)))) {
-            failure = "not-constant-buffer";
+            failure = "not-buffer";
             return {};
         }
         ComPtr<ID3D11Device> sourceDevice;
@@ -289,8 +305,8 @@ struct ConstantShadow::Impl {
         }
         D3D11_BUFFER_DESC desc{};
         buffer->GetDesc(&desc);
-        if (desc.BindFlags != D3D11_BIND_CONSTANT_BUFFER || !desc.ByteWidth || desc.ByteWidth % 16) {
-            failure = "invalid-constant-buffer";
+        if (!constantBuffer(desc) && !inputBuffer(desc)) {
+            failure = "unsupported-buffer";
             return {};
         }
         if (!budget->reserve(sizeof(Facts))) {
@@ -320,11 +336,21 @@ struct ConstantShadow::Impl {
         return value && value->budget == budget ? value : ComPtr<Facts>{};
     }
     // Called with Facts::mutex held, on the serialized render thread only.
-    const char* request(ID3D11Buffer* source, const ComPtr<Facts>& value) {
+    const char* request(ID3D11Buffer* source, const ComPtr<Facts>& value, unsigned first, unsigned last) {
         if (value->mapping)
             return "buffer-mapped";
-        if (value->description.ByteWidth > smallBytes)
+        const auto width = value->description.ByteWidth;
+        // The CB route retains its existing large-pool sparse-write contract.
+        // IA may read back only its requested cells, never the whole large pool.
+        if (constantBuffer(value->description) && width > smallBytes)
             return "cold-large-buffer";
+        if (width <= smallBytes) {
+            first = 0;
+            last = width;
+        }
+        if (first >= last || last > width || first % cellBytes || (last != width && last % cellBytes) ||
+            static_cast<uint64_t>(last) - first > static_cast<uint64_t>(maximumCells) * cellBytes)
+            return "cold-readback-range";
         auto sourceIdentity = identity(source);
         if (!sourceIdentity)
             return "resource-identity-unavailable";
@@ -344,7 +370,7 @@ struct ConstantShadow::Impl {
         context->GetPredication(&predicate, &enabled);
         if (predicate)
             return "cold-readback-predicated";
-        const auto bytes = value->description.ByteWidth;
+        const auto bytes = last - first;
         if (!budget->reserve(bytes))
             return "byte-budget";
         D3D11_BUFFER_DESC desc{};
@@ -363,13 +389,20 @@ struct ConstantShadow::Impl {
         empty->sourceIdentity = std::move(sourceIdentity);
         empty->staging = std::move(staging);
         empty->value = value;
+        empty->first = first;
+        empty->last = last;
         empty->revision = value->revision;
         empty->epoch = budget->epoch.load();
         empty->charged = bytes;
         ++budget->pending;
         ++budget->queued;
         capture::Bypass bypass;
-        context->CopyResource(empty->staging.Get(), source);
+        if (first == 0 && last == width)
+            context->CopyResource(empty->staging.Get(), source);
+        else {
+            const D3D11_BOX box{first, 0, 0, last, 1, 1};
+            context->CopySubresourceRegion(empty->staging.Get(), 0, 0, 0, 0, source, 0, &box);
+        }
         const auto valueCompleted = ++nextCompletion;
         if (FAILED(timeline->Signal(completion.Get(), valueCompleted))) {
             // The copy was already submitted. No successful signal means no
@@ -425,8 +458,9 @@ struct ConstantShadow::Impl {
                     value.budget == budget && ticket.revision == value.revision &&
                     ticket.epoch == budget->epoch.load() && !value.mapping) {
                     const auto epoch = ticket.epoch;
-                    if (value.ensureSnapshot()) {
-                        value.update(0, value.description.ByteWidth, mapped.pData, true, epoch);
+                    const bool smallSnapshot = value.description.ByteWidth <= smallBytes;
+                    if (!smallSnapshot || value.ensureSnapshot()) {
+                        value.update(ticket.first, ticket.last, mapped.pData, smallSnapshot, epoch);
                         if (epoch == budget->epoch.load() && budget->active)
                             ++budget->published;
                         else {
@@ -475,6 +509,10 @@ bool ConstantShadow::read(ID3D11Buffer* buffer, unsigned first, unsigned count, 
         auto& s = *impl_;
         if (buffer)
             buffer->GetDesc(&info.description);
+        if (buffer && !constantBuffer(info.description)) {
+            info.failure = "invalid-constant-buffer";
+            return false;
+        }
         auto value = s.adopt(buffer, nullptr, info.failure);
         if (!value)
             return false;
@@ -485,14 +523,18 @@ bool ConstantShadow::read(ID3D11Buffer* buffer, unsigned first, unsigned count, 
         if (!readBoundFloats(
                 info.description.ByteWidth, first, count, offset, components,
                 [&](unsigned position, std::array<float, 4>& cell) {
-                    return value->readCell(position, cell, info.failure);
+                    CellBytes bytes{};
+                    if (!value->readCell(position, bytes, info.failure))
+                        return false;
+                    std::memcpy(cell.data(), bytes.data(), bytes.size());
+                    return true;
                 },
                 output, &failure)) {
             if (failure != BoundReadFailure::Cell)
                 info.failure = rangeFailure(failure);
             else if (info.failure && (std::strcmp(info.failure, "cell-unobserved") == 0 ||
                                       std::strcmp(info.failure, "cell-epoch") == 0))
-                info.failure = s.request(buffer, value);
+                info.failure = s.request(buffer, value, 0, info.description.ByteWidth);
             return false;
         }
         if (!s.budget->active ||
@@ -507,6 +549,68 @@ bool ConstantShadow::read(ID3D11Buffer* buffer, unsigned first, unsigned count, 
         output = {};
         info.failure = "shadow-read-exception";
         return false;
+    }
+}
+bool ConstantShadow::readBytes(ID3D11Buffer* buffer, unsigned byteOffset, unsigned byteCount, void* output,
+                               ShadowReadInfo& info) noexcept {
+    info = {};
+    const auto fail = [&](const char* reason) {
+        if (output && byteCount)
+            std::memset(output, 0, byteCount);
+        info.failure = reason;
+        return false;
+    };
+    if (output && byteCount)
+        std::memset(output, 0, byteCount);
+    try {
+        auto& s = *impl_;
+        if (buffer)
+            buffer->GetDesc(&info.description);
+        if (!output || !byteCount)
+            return fail("byte-read-output");
+        if (!buffer)
+            return fail("no-buffer");
+        if (!inputBuffer(info.description))
+            return fail("invalid-input-buffer");
+        const uint64_t end = static_cast<uint64_t>(byteOffset) + byteCount;
+        if (end > info.description.ByteWidth)
+            return fail("physical-allocation-range");
+        const uint64_t first = byteOffset - byteOffset % cellBytes;
+        const uint64_t last =
+            std::min<uint64_t>((end + cellBytes - 1) / cellBytes * cellBytes, info.description.ByteWidth);
+        if ((end - 1) / cellBytes - first / cellBytes + 1 > maximumCells)
+            return fail("cell-limit");
+        auto value = s.adopt(buffer, nullptr, info.failure);
+        if (!value)
+            return false;
+        info.owned = true;
+        std::lock_guard lock(value->mutex);
+        const auto epoch = s.budget->epoch.load();
+        bool cold = false;
+        for (uint64_t position = first; position < end; position += cellBytes) {
+            CellBytes cell{};
+            if (!value->readCell(static_cast<unsigned>(position), cell, info.failure)) {
+                if (info.failure && (std::strcmp(info.failure, "cell-unobserved") == 0 ||
+                                     std::strcmp(info.failure, "cell-epoch") == 0))
+                    cold = true; // Register every requested cell before queuing one bounded copy.
+                else
+                    return fail(info.failure);
+            } else {
+                const auto begin = std::max<uint64_t>(position, byteOffset);
+                const auto finish = std::min<uint64_t>(position + cellBytes, end);
+                std::memcpy(static_cast<unsigned char*>(output) + (begin - byteOffset),
+                            cell.data() + (begin - position), static_cast<size_t>(finish - begin));
+            }
+        }
+        if (cold)
+            return fail(s.request(buffer, value, static_cast<unsigned>(first), static_cast<unsigned>(last)));
+        if (!s.budget->active ||
+            (value->description.Usage != D3D11_USAGE_IMMUTABLE && epoch != s.budget->epoch.load()))
+            return fail("read-epoch-changed");
+        info.failure = nullptr;
+        return true;
+    } catch (...) {
+        return fail("shadow-byte-read-exception");
     }
 }
 void ConstantShadow::collect() noexcept {

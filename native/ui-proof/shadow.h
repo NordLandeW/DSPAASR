@@ -17,11 +17,12 @@ struct ShadowStats {
     uint64_t adopted = 0, attachmentFailures = 0, liveBuffers = 0;
     bool stopped = false, quarantined = false;
 };
-// Resource-private CPU shadows, observed writes, and cold readback have ONE
-// lifecycle. Write callbacks never submit context commands. read/collect/stop
-// are serialized render-thread operations under the caller's graphics lock;
-// read requires the caller's no-active-query/private-copy permission. Neither
-// read nor collect waits, flushes, or maps the original resource for reading.
+// CB constants and ordinary IA vertex/index bytes share ONE resource-private
+// owner, write observation, budget, cold readback and retirement lifecycle.
+// Write callbacks never submit context commands. Reads/collect/stop are serialized
+// render-thread operations under the caller's graphics lock; reads require its
+// no-active-query/private-copy permission. Reads and collect never wait, flush,
+// or map the original resource for reading.
 class ConstantShadow final : public capture::WriteObserver {
   public:
     static constexpr uint64_t maximumBytes = 16u * 1024u * 1024u;
@@ -34,6 +35,11 @@ class ConstantShadow final : public capture::WriteObserver {
     bool created(ID3D11Buffer* buffer, const void* initial = nullptr) noexcept;
     bool read(ID3D11Buffer* buffer, unsigned first, unsigned count, unsigned offset, unsigned components,
               std::array<float, 4>& output, ShadowReadInfo& info) noexcept;
+    // IA only: VB/IB, optionally SRV, with no GPU-write bind or miscellaneous
+    // sharing/tiled-resource contract. Uses the actual ByteWidth, not a CB window.
+    // The caller provides byteCount writable output bytes; failure clears them.
+    bool readBytes(ID3D11Buffer* buffer, unsigned byteOffset, unsigned byteCount, void* output,
+                   ShadowReadInfo& info) noexcept;
     void collect() noexcept;
     // Nonblocking. Stops adoption/publication, then discards tickets only after
     // their own copy-completion fence retires; this never requires a CPU Map.
