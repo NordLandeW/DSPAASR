@@ -20,11 +20,16 @@ class UiShaderProof {
     // Explicit shutdown result for the capture/presentation owner. Only this
     // closing path may drain the graphics bridge; frame-time inspection never waits.
     bool stop() noexcept;
+    // Retain the first proof failure within one render frame, not the last
+    // successful inspection. Lifetime counters and constant shadows persist.
+    void beginFrame();
     // The capture owner holds the graphics lock while invoking either policy.
     CaptureUiShaderPolicy inspect(ID3D11PixelShader* shader) noexcept;
     bool inspectEffect(ID3D11PixelShader* shader, const CaptureScope& scope,
                        CaptureSupport& support) noexcept;
     UiProofStatus status() const;
+    // Diagnostic identity only; a fingerprint does not authorize any replay.
+    static std::string shaderFingerprint(ID3D11DeviceChild* shader);
 
   private:
     struct Impl;

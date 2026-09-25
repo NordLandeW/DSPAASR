@@ -284,6 +284,54 @@ struct UiShaderProof::Impl final : DeviceObserver {
     using ConstantFailureKey = std::tuple<uint64_t, bool, unsigned, unsigned, unsigned, unsigned, unsigned,
                                           unsigned, bool, std::string>;
     std::vector<ConstantFailureKey> constantFailures;
+    std::vector<std::tuple<uint64_t, std::string, std::string, std::string, unsigned>> effectFailures;
+    void effectFailure(ID3D11PixelShader* pixel, const CaptureScope& scope,
+                       const std::string& reason) noexcept {
+        constexpr size_t maximumDiagnostics = 16;
+        if (!log || effectFailures.size() >= maximumDiagnostics)
+            return;
+        try {
+            auto* context = graphics->context11();
+            ComPtr<ID3D11VertexShader> vertex;
+            context->VSGetShader(&vertex, nullptr, nullptr);
+            const auto ps = UiShaderProof::shaderFingerprint(pixel),
+                       vs = UiShaderProof::shaderFingerprint(vertex.Get());
+            ComPtr<ID3D11BlendState> blend;
+            context->OMGetBlendState(&blend, nullptr, nullptr);
+            D3D11_BLEND_DESC blendDescription{};
+            if (blend)
+                blend->GetDesc(&blendDescription);
+            const unsigned colorWrite =
+                blend ? blendDescription.RenderTarget[0].RenderTargetWriteMask : D3D11_COLOR_WRITE_ENABLE_ALL;
+            const auto key = std::make_tuple(scope.passId, reason, ps, vs, colorWrite);
+            if (std::find(effectFailures.begin(), effectFailures.end(), key) != effectFailures.end())
+                return;
+            effectFailures.push_back(key);
+            ComPtr<ID3D11DepthStencilState> depth;
+            UINT stencilReference = 0;
+            context->OMGetDepthStencilState(&depth, &stencilReference);
+            D3D11_DEPTH_STENCIL_DESC depthDescription{};
+            if (depth)
+                depth->GetDesc(&depthDescription);
+            else {
+                depthDescription.DepthEnable = TRUE;
+                depthDescription.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+                depthDescription.DepthFunc = D3D11_COMPARISON_LESS;
+            }
+            char message[768];
+            std::snprintf(message, sizeof(message),
+                          "capture.effect-unverified pass=0x%llX colorWrite=0x%X depthEnabled=%u "
+                          "depthWrite=%u depthFunc=%u stencilEnabled=%u stencilRef=%u PS=%s VS=%s reason=%s",
+                          static_cast<unsigned long long>(scope.passId), colorWrite,
+                          depthDescription.DepthEnable ? 1u : 0u,
+                          static_cast<unsigned>(depthDescription.DepthWriteMask),
+                          static_cast<unsigned>(depthDescription.DepthFunc),
+                          depthDescription.StencilEnable ? 1u : 0u, stencilReference, ps.c_str(), vs.c_str(),
+                          reason.c_str());
+            log(message);
+        } catch (...) {
+        }
+    }
     Impl(std::shared_ptr<Dx11Dx12> bridge, std::function<void(const char*)> output)
         : graphics(std::move(bridge)),
           shadow(std::make_shared<proof::ConstantShadow>(graphics->device11(), graphics->context11())),
@@ -648,6 +696,15 @@ bool UiShaderProof::stop() noexcept {
         return false;
     }
 }
+std::string UiShaderProof::shaderFingerprint(ID3D11DeviceChild* shader) {
+    ShaderFacts facts;
+    return data(shader, shaderKey, facts) ? facts.hash : "unobserved";
+}
+void UiShaderProof::beginFrame() {
+    std::lock_guard lock(impl_->statusMutex);
+    impl_->observation.reason.clear();
+    impl_->observation.shaderHash.clear();
+}
 CaptureUiShaderPolicy UiShaderProof::inspect(ID3D11PixelShader* shader) noexcept {
     try {
         if (impl_->stopped)
@@ -660,13 +717,15 @@ CaptureUiShaderPolicy UiShaderProof::inspect(ID3D11PixelShader* shader) noexcept
         ++impl_->observation.inspected;
         if (result.unitAlphaVerified)
             ++impl_->observation.accepted;
-        impl_->observation.reason = reason;
-        impl_->observation.shaderHash = shaderHash.data();
+        if (impl_->observation.reason.empty()) {
+            impl_->observation.reason = reason;
+            impl_->observation.shaderHash = shaderHash.data();
+        }
         return result;
     } catch (const std::exception& error) {
         std::lock_guard lock(impl_->statusMutex);
         ++impl_->observation.inspected;
-        if (impl_->observation.reason != error.what())
+        if (impl_->observation.reason.empty())
             impl_->observation.reason = error.what();
     } catch (...) {
     }
@@ -682,18 +741,23 @@ bool UiShaderProof::inspectEffect(ID3D11PixelShader* shader, const CaptureScope&
         std::string reason;
         std::array<char, 65> shaderHash{};
         const bool accepted = impl_->inspectEffect(shader, scope, support, reason, shaderHash);
+        if (!accepted)
+            impl_->effectFailure(shader, scope, reason);
         std::lock_guard lock(impl_->statusMutex);
         ++impl_->observation.inspected;
         if (accepted)
             ++impl_->observation.accepted;
-        impl_->observation.reason = std::move(reason);
-        impl_->observation.shaderHash = shaderHash.data();
+        if (impl_->observation.reason.empty()) {
+            impl_->observation.reason = std::move(reason);
+            impl_->observation.shaderHash = shaderHash.data();
+        }
         return accepted;
     } catch (const std::exception& error) {
         try {
             std::lock_guard lock(impl_->statusMutex);
             ++impl_->observation.inspected;
-            impl_->observation.reason = error.what();
+            if (impl_->observation.reason.empty())
+                impl_->observation.reason = error.what();
         } catch (...) {
         }
     } catch (...) {

@@ -1,14 +1,16 @@
 #include "capture.h"
 #include "capture-trace.h"
 #include "channel.h"
-#include "ui-proof/guard.h"
 #include "scene-depth.h"
+#include "ui-proof/guard.h"
 #include <MinHook.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <set>
+#include <tuple>
 
 namespace dspaa {
 namespace {
@@ -75,23 +77,76 @@ struct FrameCapture::Impl {
     bool enabled=false,stopped=false,quarantined=false,commandsReceived=false;
     bool followingTransfers=false;
     DspAaCaptureStatus observation{};
-    DspAaDepthCopyResult depthResult{sizeof(DspAaDepthCopyResult),1};
-    unsigned traceCount=0;
-    Impl(std::shared_ptr<Dx11Dx12> bridge,PresentationLog output):graphics(std::move(bridge)),log(output) {
-        if(!graphics)throw std::invalid_argument("Capture pipeline needs the facade's graphics owner");
-        const auto initialized=MH_Initialize();
-        if(initialized!=MH_OK&&initialized!=MH_ERROR_ALREADY_INITIALIZED)throw std::runtime_error("Initialize private capture detours");
-        proof=std::make_unique<UiShaderProof>(graphics,log);
-        CaptureOwnerCreateInfo info;info.graphics=graphics;
-        info.uiShaderPolicy=[this](ID3D11PixelShader* shader){return proof->inspect(shader);};
-        info.effectShaderPolicy=[this](ID3D11PixelShader* shader,const CaptureScope& scope,CaptureSupport& support){
-            return proof->inspectEffect(shader,scope,support);
+    DspAaDepthCopyResult depthResult{sizeof(DspAaDepthCopyResult), 1};
+    unsigned traceCount = 0;
+    uint32_t lastOperation = 0;
+    uint64_t lastPass = 0;
+    std::set<std::tuple<uint32_t, uint64_t, std::string, std::string>> unannotatedDiagnostics;
+    Impl(std::shared_ptr<Dx11Dx12> bridge, PresentationLog output)
+        : graphics(std::move(bridge)), log(output) {
+        if (!graphics)
+            throw std::invalid_argument("Capture pipeline needs the facade's graphics owner");
+        const auto initialized = MH_Initialize();
+        if (initialized != MH_OK && initialized != MH_ERROR_ALREADY_INITIALIZED)
+            throw std::runtime_error("Initialize private capture detours");
+        proof = std::make_unique<UiShaderProof>(graphics, log);
+        CaptureOwnerCreateInfo info;
+        info.graphics = graphics;
+        info.uiShaderPolicy = [this](ID3D11PixelShader* shader) { return proof->inspect(shader); };
+        info.effectShaderPolicy = [this](ID3D11PixelShader* shader, const CaptureScope& scope,
+                                         CaptureSupport& support) {
+            return proof->inspectEffect(shader, scope, support);
         };
-        owner=std::make_unique<CaptureOwner>(info);
+        char diagnostic[2]{};
+        if (GetEnvironmentVariableA("DSPAASR_CAPTURE_TRACE_WRITES", diagnostic, sizeof(diagnostic)) == 1 &&
+            diagnostic[0] == '1')
+            info.unannotatedDraw = [this](ID3D11RenderTargetView* target) { traceUnannotated(target); };
+        owner = std::make_unique<CaptureOwner>(info);
         ComPtr<ID3D11Device5> device;
-        graphicsCheck(graphics->device11()->QueryInterface(IID_PPV_ARGS(&device)),"Query Unity snapshot fence device");
-        graphicsCheck(device->CreateFence(0,D3D11_FENCE_FLAG_NONE,IID_PPV_ARGS(&unityFence)),"Create Unity snapshot retirement fence");
-        observation.size=sizeof(observation);observation.version=1;observation.flags=1;
+        graphicsCheck(graphics->device11()->QueryInterface(IID_PPV_ARGS(&device)),
+                      "Query Unity snapshot fence device");
+        graphicsCheck(device->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&unityFence)),
+                      "Create Unity snapshot retirement fence");
+        observation.size = sizeof(observation);
+        observation.version = 1;
+        observation.flags = 1;
+    }
+    void traceUnannotated(ID3D11RenderTargetView* target) {
+        constexpr size_t maximumDiagnostics = 16;
+        if (!log || unannotatedDiagnostics.size() >= maximumDiagnostics)
+            return;
+        auto* context = graphics->context11();
+        ComPtr<ID3D11PixelShader> pixel;
+        ComPtr<ID3D11VertexShader> vertex;
+        context->PSGetShader(&pixel, nullptr, nullptr);
+        context->VSGetShader(&vertex, nullptr, nullptr);
+        const auto ps = UiShaderProof::shaderFingerprint(pixel.Get()),
+                   vs = UiShaderProof::shaderFingerprint(vertex.Get());
+        if (!unannotatedDiagnostics.emplace(lastOperation, lastPass, ps, vs).second)
+            return;
+        ComPtr<ID3D11Resource> output, input;
+        ComPtr<ID3D11ShaderResourceView> srv;
+        target->GetResource(&output);
+        context->PSGetShaderResources(0, 1, &srv);
+        if (srv)
+            srv->GetResource(&input);
+        ComPtr<ID3D11Texture2D> image;
+        D3D11_TEXTURE2D_DESC description{};
+        if (SUCCEEDED(output.As(&image)))
+            image->GetDesc(&description);
+        D3D11_VIEWPORT viewport{};
+        UINT count = 1;
+        context->RSGetViewports(&count, &viewport);
+        char text[768];
+        std::snprintf(text, sizeof(text),
+                      "capture.unannotated frame=%llu generation=%llu lastOperation=%u lastPass=0x%llX "
+                      "output=%p size=%ux%u format=%u input0=%p viewport=%.9g,%.9g,%.9g,%.9g PS=%s VS=%s",
+                      static_cast<unsigned long long>(frame), static_cast<unsigned long long>(generation),
+                      lastOperation, static_cast<unsigned long long>(lastPass), output.Get(),
+                      description.Width, description.Height, description.Format, input.Get(),
+                      viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height, ps.c_str(),
+                      vs.c_str());
+        log(text);
     }
     CaptureTexture resolve(const CaptureTexture& value,bool bound) {
         if(bound){
@@ -150,6 +205,7 @@ void FrameCapture::begin(uint64_t frame,bool enabled) noexcept {
         if(s.trace)s.trace->collect();
         if(s.enabled)s.owner->abort("Capture frame was superseded before its real end-of-frame event");
         s.frame=frame;s.enabled=enabled;s.commandsReceived=false;s.followingTransfers=false;s.lastColor={};reason(s.observation,"");
+        s.proof->beginFrame();
         s.depthResult={sizeof(DspAaDepthCopyResult),1};
         if(!enabled)return;
         D3D11_TEXTURE2D_DESC desc{};s.shadow.texture->GetDesc(&desc);
@@ -161,6 +217,8 @@ void FrameCapture::execute(const CaptureCommand& command) noexcept {
     try {
         auto& s=*impl_;auto lock=s.graphics->lock();const auto& m=command.metadata;
         if(s.stopped||m.applicationFrameId!=s.frame||m.generation!=s.generation||(!s.enabled&&m.operation!=9))return;
+        s.lastOperation = m.operation;
+        s.lastPass = m.passId;
         if(m.operation==8){
             // Diagnostics do not establish any input dependency. A camera event
             // without an RTV is useful evidence, not a reason to cancel later observations.
