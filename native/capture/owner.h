@@ -13,10 +13,10 @@ namespace dspaa {
 // The caller owns camera/pass identification and the validity of its shader
 // sampling contracts. This module never invokes Unity or advances CPU history.
 enum class CaptureScopeKind {
-    SharedPreparation,       // Original only; invalidate stale twins of its outputs.
-    DualColor,               // Original draw, then the same raster work on clean inputs.
-    FullOnlyUiCoverage,      // Original UI; independent private stencil/T/contribution.
-    PartialWrite,            // DualColor, preserving unwritten destination pixels.
+    SharedPreparation,      // Original only; invalidate stale twins of its outputs.
+    DualColor,              // Original draw, then the same raster work on clean inputs.
+    FullOnlyUiCoverage,     // Original UI; independent private stencil/T/contribution.
+    PartialWrite,           // DualColor, preserving unwritten destination pixels.
     ExternalBlurPublication // Original only; its published background remains shared.
 };
 struct CaptureTexture {
@@ -89,6 +89,9 @@ struct CaptureOwnerCreateInfo {
     // Resolve the complete effect dependency/UV contract from the ACTUAL draw,
     // before any private raster work. A declaration/basis alone is not a proof.
     std::function<bool(ID3D11PixelShader*, const CaptureScope&, CaptureSupport&)> effectShaderPolicy;
+    // Optional read-only diagnostic before the first unexplained color write.
+    // Failures in this callback never suppress or replay the original draw.
+    std::function<void(ID3D11RenderTargetView*)> unannotatedDraw;
     // These bound owned capture memory/leases, not frame-time correctness.
     unsigned maximumInFlightFrames = 3;
     unsigned maximumTrackedTextures = 128;
@@ -161,6 +164,7 @@ class CaptureOwner {
     // code remains resident; no global MinHook Uninitialize/hot-unload occurs.
     // False means the complete owner remains quarantined rather than freeing in-flight state.
     bool stop() noexcept;
+
   private:
     struct Impl;
     std::shared_ptr<Impl> impl_;

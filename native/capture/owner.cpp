@@ -134,6 +134,7 @@ struct CaptureOwner::Impl final : capture::Observer, std::enable_shared_from_thi
     ComPtr<ID3D11BlendState> alphaSupportBlend, fragmentSupportBlend;
     std::shared_ptr<Impl> quarantineOwner; // Deliberate, allocation-free safety cycle on unknown retirement.
     bool stopped = false;
+    bool unannotatedDrawReported = false;
 
     explicit Impl(const CaptureOwnerCreateInfo& value) : info(value), graphics(value.graphics) {
         if (!graphics || !info.maximumInFlightFrames || info.maximumInFlightFrames > 8 || !info.maximumTrackedTextures ||
@@ -472,15 +473,44 @@ struct CaptureOwner::Impl final : capture::Observer, std::enable_shared_from_thi
             // Ordinary world/preparation draws do not need a replay snapshot.
             // Still invalidate every tracked output they actually bind.
             if (!arena->records.empty()) {
-                std::array<ID3D11RenderTargetView*, 8> targets{};
-                std::array<ComPtr<ID3D11RenderTargetView>, 8> retained;
-                context->OMGetRenderTargets(8, targets.data(), nullptr);
-                for (size_t i = 0; i < targets.size(); ++i) retained[i].Attach(targets[i]);
-                for (const auto& target : retained) if (auto* output = find(target.Get())) {
-                    if (scope) invalidate(*output);
-                    else if (output->clean) {
-                        invalidate(*output); failure("An unannotated draw changed a captured color dependency");
+                std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> targets{};
+                std::array<ComPtr<ID3D11RenderTargetView>, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> retained;
+                context->OMGetRenderTargets(static_cast<UINT>(targets.size()), targets.data(), nullptr);
+                for (size_t i = 0; i < targets.size(); ++i)
+                    retained[i].Attach(targets[i]);
+                for (const auto& target : retained)
+                    if (auto* output = find(target.Get())) {
+                        if (scope)
+                            invalidate(*output);
+                        else if (output->clean) {
+                            if (!unannotatedDrawReported && state.reason.empty() && info.unannotatedDraw) {
+                                unannotatedDrawReported = true;
+                                try {
+                                    info.unannotatedDraw(target.Get());
+                                } catch (...) {
+                                }
+                            }
+                            // Only this application value is lost. Previously consumed
+                            // values have independent private planes in their outputs.
+                            // A later consumer/seal still has to prove its own input.
+                            invalidate(*output);
+                        }
                     }
+                if (!scope) {
+                    // A graphics draw can also write textures through OM UAVs,
+                    // even when none of its RTVs still has a captured value.
+                    const UINT count = device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1
+                                           ? D3D11_1_UAV_SLOT_COUNT
+                                           : D3D11_PS_CS_UAV_REGISTER_COUNT;
+                    std::array<ID3D11UnorderedAccessView*, D3D11_1_UAV_SLOT_COUNT> unordered{};
+                    std::array<ComPtr<ID3D11UnorderedAccessView>, D3D11_1_UAV_SLOT_COUNT> retainedUnordered;
+                    context->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, count,
+                                                                       unordered.data());
+                    for (size_t i = 0; i < unordered.size(); ++i)
+                        retainedUnordered[i].Attach(unordered[i]);
+                    for (const auto& view : retainedUnordered)
+                        if (auto* output = find(view.Get()))
+                            invalidate(*output);
                 }
             }
             original.run(); return;
@@ -708,6 +738,7 @@ bool CaptureOwner::beginFrame(const CaptureFrameInfo& frame) noexcept {
         if (impl_->arena) { impl_->externalFailure("Previous capture frame was not sealed"); impl_->retire(); }
         impl_->reap();
         impl_->state = {}; impl_->state.hooksReady = true; impl_->state.applicationFrameId = frame.applicationFrameId; impl_->state.generation = frame.generation;
+        impl_->unannotatedDrawReported = false;
         if (!frame.applicationFrameId || !frame.generation || !frame.width || !frame.height || frame.width > 16384 || frame.height > 16384)
             throw std::invalid_argument("Invalid capture frame identity/extent");
         if (impl_->pending.size() >= impl_->info.maximumInFlightFrames) throw std::runtime_error("Capture frame leases are still in flight");

@@ -29,11 +29,18 @@ void sameValue(float actual, float expected, const char* reason) {
 const char shader[] = R"(
 cbuffer Fixture : register(b0) { float4 color; float4 bounds; float4 extent; };
 Texture2D<float4> image : register(t0);
+// One RTV occupies slot zero; the fixture's OM UAV starts immediately after it.
+RWTexture2D<float4> writtenImage : register(u1);
 SamplerState nearestSampler : register(s0);
 float4 vertex(uint id : SV_VertexID) : SV_Position { return float4(id == 2 ? 3 : -1, id == 1 ? 3 : -1, 0, 1); }
 float4 solid(float4 p : SV_Position) : SV_Target {
     if (any(p.xy < bounds.xy) || any(p.xy >= bounds.zw)) discard;
     return color;
+}
+float4 writeUav(float4 p : SV_Position) : SV_Target {
+    float4 value = solid(p);
+    writtenImage[uint2(p.xy)] = value;
+    return value;
 }
 float4 overlapVertex(uint id : SV_VertexID) : SV_Position {
     uint corner = id % 3;
@@ -95,6 +102,7 @@ class Fixture {
     bool conservativeFragments = false;
     uint64_t nextFrame = 0;
     unsigned checkedFrames = 0;
+    unsigned diagnosticCalls = 0;
 
     Fixture() {
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
@@ -159,6 +167,10 @@ class Fixture {
                   (declared.passId == 3 && actual == solid.Get()))) return false;
             support = declared.support; return true;
         };
+        info.unannotatedDraw = [this](ID3D11RenderTargetView*) {
+            ++diagnosticCalls;
+            throw std::runtime_error("Fixture diagnostic failure must not change application drawing");
+        };
         capture = std::make_unique<dspaa::CaptureOwner>(info);
     }
     ~Fixture() {
@@ -166,14 +178,22 @@ class Fixture {
         try { if (debug) errors(); } catch (...) {}
         if (context) context->ClearState();
     }
-    Texture make() {
-        D3D11_TEXTURE2D_DESC description{}; description.Width = width; description.Height = height;
-        description.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; description.MipLevels = description.ArraySize = description.SampleDesc.Count = 1;
-        description.Usage = D3D11_USAGE_DEFAULT; description.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    Texture make(UINT additionalBindings = 0) {
+        D3D11_TEXTURE2D_DESC description{};
+        description.Width = width;
+        description.Height = height;
+        description.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        description.MipLevels = description.ArraySize = description.SampleDesc.Count = 1;
+        description.Usage = D3D11_USAGE_DEFAULT;
+        description.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | additionalBindings;
         Texture result;
-        dspaa::graphicsCheck(device->CreateTexture2D(&description, nullptr, &result.texture), "Create fixture color");
-        dspaa::graphicsCheck(device->CreateRenderTargetView(result.texture.Get(), nullptr, &result.rtv), "Create fixture RTV");
-        dspaa::graphicsCheck(device->CreateShaderResourceView(result.texture.Get(), nullptr, &result.srv), "Create fixture SRV"); return result;
+        dspaa::graphicsCheck(device->CreateTexture2D(&description, nullptr, &result.texture),
+                             "Create fixture color");
+        dspaa::graphicsCheck(device->CreateRenderTargetView(result.texture.Get(), nullptr, &result.rtv),
+                             "Create fixture RTV");
+        dspaa::graphicsCheck(device->CreateShaderResourceView(result.texture.Get(), nullptr, &result.srv),
+                             "Create fixture SRV");
+        return result;
     }
     void bind(const Texture& target, bool withDepth = false) {
         ID3D11ShaderResourceView* empty = nullptr; context->PSSetShaderResources(0, 1, &empty);
@@ -569,10 +589,129 @@ void sharedInvalidation(Fixture& f) {
     require(!f.capture->status().cleanComplete,"Shared invalidation did not reach status");
 }
 void unscopedInvalidation(Fixture& f) {
-    f.begin(); f.blend(D3D11_BLEND_ONE,D3D11_BLEND_ZERO,D3D11_COLOR_WRITE_ENABLE_ALL,false); f.draw({0,0,1,1});
-    f.bindings(f.full,f.solid.Get());
-    require(!f.capture->seal(f.full.captured()) && !f.capture->status().cleanComplete,"Unscoped fast path reused a stale clean twin");
-    close(f.read(f.full.texture.Get()).at(4,4,2),1,"Unscoped fast path suppressed the original draw");
+    const auto diagnostics = f.diagnosticCalls;
+    f.begin();
+    f.blend(D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_INV_SRC_ALPHA);
+    f.draw({0, 0, 1, 0.5f});
+    f.bindings(f.full, f.solid.Get());
+    require(f.diagnosticCalls == diagnostics + 1,
+            "Unscoped write did not reach its isolated diagnostic callback");
+    require(!f.capture->seal(f.full.captured()) && !f.capture->status().cleanComplete,
+            "Unscoped fast path reused a stale clean twin");
+    close(f.read(f.full.texture.Get()).at(4, 4, 2), 0.5f + 0.5f * world[2],
+          "Throwing diagnostic suppressed or duplicated the original draw");
+}
+void consumedUiValue(Fixture& f, const Texture& destination) {
+    f.begin();
+    f.uiScope();
+    f.blend(D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_INV_SRC_ALPHA);
+    f.draw({1, 0, 0, 0.5f}, {4, 4, 20, 12});
+    f.end();
+    require(f.capture->declareTexture(destination.captured()), "Declare independent consumed color");
+    f.context->CopyResource(destination.texture.Get(), f.full.texture.Get());
+    require(f.capture->currentColor(destination.texture.Get()).texture != nullptr,
+            "Color copy did not preserve the consumed value");
+}
+void unscopedConsumedValue(Fixture& f) {
+    consumedUiValue(f, f.post);
+    f.draw({0, 0, 1, 0.5f});
+    require(!f.capture->currentColor(f.full.texture.Get()).texture,
+            "Unscoped overwrite retained the old input value");
+    require(f.capture->currentColor(f.post.texture.Get()).texture != nullptr,
+            "A dead input overwrite invalidated its independent consumer");
+    auto lease = f.seal(f.post);
+    f.complete(lease);
+    f.worldPlane(f.read(lease->clean.Get()));
+    const auto a = f.read(lease->occlusion.Get()), m = f.read(lease->influence.Get()),
+               actual = f.read(f.post.texture.Get());
+    for (unsigned y = 0; y < height; ++y)
+        for (unsigned x = 0; x < width; ++x) {
+            const bool covered = x >= 4 && x < 20 && y >= 4 && y < 12;
+            close(a.at(x, y), covered ? 0.5f : 0.f,
+                  "Source reuse destroyed the consumer's independent opacity");
+            close(m.at(x, y), covered ? 1.f : 0.f,
+                  "Source reuse destroyed the consumer's independent influence");
+            close(actual.at(x, y, 0), covered ? 0.6f : world[0],
+                  "Source reuse changed the already consumed application color");
+        }
+    close(f.read(f.full.texture.Get()).at(1, 1, 2), 0.5f + 0.5f * world[2],
+          "Dead-input invalidation suppressed or duplicated the original draw");
+}
+void unscopedMissingInput(Fixture& f) {
+    consumedUiValue(f, f.post);
+    f.draw({0, 0, 1, 0.5f});
+    require(!f.capture->bindCleanInput(f.post.captured(2), f.full.captured()),
+            "Handoff consumed an invalidated input value");
+    auto handoff = f.seal(f.post);
+    require(!handoff->clean && !handoff->occlusion && !handoff->influence,
+            "Rejected handoff exposed complete planes");
+    handoff.reset();
+
+    consumedUiValue(f, f.post);
+    f.draw({0, 0, 1, 0.5f});
+    f.bind(f.post);
+    f.parameters({0, 0, 0, 0});
+    f.blend(D3D11_BLEND_ONE, D3D11_BLEND_ZERO, D3D11_COLOR_WRITE_ENABLE_ALL, false);
+    auto* source = f.full.srv.Get();
+    f.context->PSSetShaderResources(0, 1, &source);
+    f.context->PSSetShader(f.filter.Get(), nullptr, 0);
+    dspaa::CaptureScope scope;
+    scope.kind = dspaa::CaptureScopeKind::DualColor;
+    scope.passId = 2;
+    scope.fullOverwrite = true;
+    scope.support.basis = "Fixture three-tap filter must reject its invalidated source value";
+    dspaa::CaptureSamplingInput input;
+    input.domains.push_back({});
+    input.domains[0].radiusTexels = {1, 0};
+    scope.support.inputs.push_back(input);
+    scope.support.occlusionResourceSlot = 0;
+    require(f.capture->beginScope(scope), "Begin invalidated-input effect scope");
+    f.context->Draw(3, 0);
+    f.end();
+    require(!f.capture->lastScopeOutput().texture, "Failed color dependency invented a scope output");
+    auto effect = f.seal(f.post);
+    require(!effect->clean && !effect->occlusion && !effect->influence,
+            "Color replay consumed an invalidated input as shared full color");
+    close(f.read(f.post.texture.Get()).at(6, 6, 2), 0.5f + 0.25f * world[2],
+          "Rejected color dependency suppressed the original effect");
+}
+void unscopedUavInvalidation(Fixture& f) {
+    auto destination = f.make(D3D11_BIND_UNORDERED_ACCESS);
+    ComPtr<ID3D11UnorderedAccessView> uav;
+    dspaa::graphicsCheck(f.device->CreateUnorderedAccessView(destination.texture.Get(), nullptr, &uav),
+                         "Create unscoped write UAV");
+    const auto code = compile("writeUav", "ps_5_0");
+    ComPtr<ID3D11PixelShader> writer;
+    dspaa::graphicsCheck(
+        f.device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &writer),
+        "Create unscoped UAV PS");
+    consumedUiValue(f, destination);
+    f.draw({0, 0, 1, 0.5f});
+    require(f.capture->currentColor(destination.texture.Get()).texture != nullptr,
+            "UAV fixture lost B before its actual write");
+    // The RTV's A value is already invalid; only the OM UAV can invalidate B.
+    const UINT targetCount = 1, uavSlot = targetCount;
+    auto* target = f.full.rtv.Get();
+    auto* view = uav.Get();
+    f.context->OMSetRenderTargetsAndUnorderedAccessViews(targetCount, &target, nullptr, uavSlot, 1, &view,
+                                                         nullptr);
+    f.context->PSSetShader(writer.Get(), nullptr, 0);
+    f.draw({0, 0, 1, 0.5f});
+    f.bindings(f.full, writer.Get());
+    ComPtr<ID3D11UnorderedAccessView> retained;
+    f.context->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, uavSlot, 1, &retained);
+    require(retained.Get() == uav.Get(), "Unscoped invalidation changed the application's OM UAV binding");
+    view = nullptr;
+    f.context->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr,
+                                                         nullptr, uavSlot, 1, &view, nullptr);
+    require(!f.capture->currentColor(destination.texture.Get()).texture,
+            "Unscoped OM UAV write retained a stale independent value");
+    require(!f.capture->seal(destination.captured()) && !f.capture->status().cleanComplete,
+            "UAV-modified final color reused its stale private planes");
+    close(f.read(destination.texture.Get()).at(6, 6, 2), 1,
+          "Unscoped UAV write did not reach the original resource");
+    close(f.read(f.full.texture.Get()).at(1, 1, 2), 0.75f + 0.25f * world[2],
+          "UAV invalidation suppressed or duplicated the original color draw");
 }
 void missingSignedProof(Fixture& f) {
     f.nonnegative=false; f.signedWithoutOverlap=false;
@@ -682,6 +821,9 @@ int main() {
         fp32AlphaBoundary(fixture);
         sourceOver(fixture); replaceAndTinyAlpha(fixture); signedCancellation(fixture); stencil(fixture); writableDepthOverlap(fixture);
         filterAndPartial(fixture); mismatchedEffectProof(fixture); missingFiniteRgb(fixture); missingProof(fixture); missingSignedProof(fixture); rasterQuery(fixture); sharedInvalidation(fixture); unscopedInvalidation(fixture);
+        unscopedConsumedValue(fixture);
+        unscopedMissingInput(fixture);
+        unscopedUavInvalidation(fixture);
         fragmentNonfiniteRgb(fixture); fragmentMixedScopes(fixture); fragmentStencilClip(fixture);
         fragmentSampleMask(fixture); fragmentWritableOverlap(fixture); fragmentOptInGates(fixture);
         sourceOver(fixture); // Recovery after an invalidated frame, and safe arena reuse.
