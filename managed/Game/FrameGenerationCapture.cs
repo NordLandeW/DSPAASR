@@ -281,7 +281,8 @@ namespace DSPAAMod.Game
                 ++imageTraceCount;
                 string Describe(RenderTexture texture) => texture ?
                     "0x" + texture.GetNativeTexturePtr().ToInt64().ToString("X16") + " " + texture.width + "x" + texture.height +
-                    " format=" + texture.format + " sRGB=" + texture.sRGB : "display";
+                    " format=" + texture.format + " sRGB=" + texture.sRGB + " depthBits=" + texture.depth +
+                    " depthPtr=0x" + texture.GetNativeDepthBufferPtr().ToInt64().ToString("X16") : "display";
                 log("Capture image-input frame=" + presentation.ApplicationFrameId + " generation=" + presentation.Generation +
                     " camera=" + camera.name + " effect=" + component.GetType().FullName +
                     " source=" + Describe(source) + " destination=" + Describe(destination) +
@@ -329,7 +330,11 @@ namespace DSPAAMod.Game
                         // Native capture checks the real resource and raster state.
                         var target = camera.targetTexture; int display = camera.targetDisplay;
                         var clear = camera.clearFlags; var rect = camera.rect;
-                        if (target || display != 0 || clear != CameraClearFlags.Depth || rect != new Rect(0,0,1,1))
+                        // DSP slightly oversizes the normalized UI rect; Unity
+                        // still reports an exact full-display pixel viewport.
+                        // Test that raster domain, without an arbitrary epsilon.
+                        if (target || display != 0 || clear != CameraClearFlags.Depth ||
+                            camera.pixelRect != new Rect(0,0,Screen.width,Screen.height))
                             throw new InvalidOperationException("Screen UI camera contract changed: target=" +
                                 (target ? target.name : "display") + " display=" + display + " clear=" + clear +
                                 " rect=" + rect.ToString("R", System.Globalization.CultureInfo.InvariantCulture) +
@@ -345,7 +350,9 @@ namespace DSPAAMod.Game
                         Attach(entry, CameraEvent.BeforeForwardOpaque, "DSPAASR screen UI begin", handoff, begin);
                         Attach(entry, CameraEvent.BeforeImageEffects, "DSPAASR screen UI end", Command(CaptureOperation.EndScope));
                     }
-                    Attach(entry, CameraEvent.AfterEverything, "DSPAASR camera color tail end", Command(CaptureOperation.EndTransfers));
+                    // Unity may still copy this camera's image after AfterEverything.
+                    // Keep the shader-verified Copy tail until the next explicit
+                    // handoff/scope or the real end-of-frame event closes it.
                 }
                 if (!trace) return;
                 if (IsMain(camera)) { TraceCanvas(normalCanvas, "normal"); TraceCanvas(topCanvas, "top"); }
