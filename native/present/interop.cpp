@@ -52,10 +52,10 @@ int __cdecl DspAaGetPresentationStatus(DspAaPresentationStatus* value) {
             *value = {};
             value->size = sizeof(*value);
             value->version = DspAaPresentationAbiVersion;
-            strncpy_s(value->message,
-                      "Frame generation requires the explicitly installed early presentation bootstrap and a "
-                      "game restart",
-                      _TRUNCATE);
+            strncpy_s(
+                value->message,
+                "No presentation bridge is active in this process; consult the profile preloader result",
+                _TRUNCATE);
         }
         return 1;
     } catch (...) {

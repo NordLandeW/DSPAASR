@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>DSPAASR.Preloader</AssemblyName>
+    <RootNamespace>DSPAASR.Preloader</RootNamespace>
+    <Version>1.1.0</Version>
+    <Product>DSPAASR</Product>
+    <Description>Early presentation entry for DSPAASR.</Description>
+    <Authors>NordLandeW</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <PathMap>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/..'))=/_/</PathMap>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../managed/Core/PresentationStartup.cs" Link="Core/PresentationStartup.cs" />
+    <Compile Include="../managed/Core/FrameGenerationSettings.cs" Link="Core/FrameGenerationSettings.cs" />
+    <Reference Include="BepInEx"><HintPath>$(BepInExPath)/BepInEx.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Mono.Cecil"><HintPath>$(BepInExPath)/Mono.Cecil.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+  <Target Name="ValidateLocalReferences" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(BepInExPath)/BepInEx.dll')" Text="Set BepInExPath to your BepInEx 5 core directory." />
+    <Error Condition="!Exists('$(BepInExPath)/Mono.Cecil.dll')" Text="The BepInEx core directory must include Mono.Cecil.dll." />
+  </Target>
+</Project>

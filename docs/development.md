@@ -10,7 +10,7 @@ Run the commands below from the repository root. The managed assembly name, nati
 - FSR 3.1.5 Native AA and four SR modes, with SDK-selected dimensions/jitter, automatic reactive masks and optional RCAS sharpening. Unity stays on D3D11; copies and GPU fence waits cross to a same-adapter D3D12 queue.
 - Explicit preset/model selection, independent from SR Quality/Balanced/Performance modes.
 - CNN and Transformer choices must reflect the model actually used. An accepted NGX create/evaluate call alone is not evidence that a deprecated preset was honored.
-- The released SR package does not enable frame generation. This development branch also contains an explicitly opt-in, experimental FSR/DLSS presentation path; its API/probe checks do not certify game image quality or net performance. See the [presentation interface](native-bridge.md#experimental-presentation-interface).
+- Optional FSR/DLSS frame generation uses an experimental presentation path through a standard BepInEx preloader patcher, enabled at startup only when a saved FG backend is selected. API/probe checks alone do not certify game image quality or net performance. See the [presentation interface](native-bridge.md#experimental-presentation-interface).
 - No ray reconstruction, driver overrides or save conversion. The distributed runtime does not replace game assemblies.
 
 ## Native development
@@ -20,27 +20,45 @@ Requires Windows x64, Visual Studio 2022 C++ tools, a Windows SDK, PowerShell 7,
 ```powershell
 pwsh -File tools/fetch-ngx.ps1 -IncludeDevelopment
 pwsh -File tools/fetch-fsr.ps1
+pwsh -File tools/fetch-minhook.ps1
+pwsh -File tools/fetch-streamline.ps1
 cmake --preset windows
 cmake --build --preset release
 ctest --preset release
 ```
 
-Dependencies download from pinned NVIDIA and AMD commits and are checked against pinned SHA256 hashes; each runtime's respective NVIDIA/AMD Authenticode signature is also verified. Existing unexpected files are not overwritten. Dependencies, build outputs and diagnostic artifacts are ignored by Git. Do not copy proprietary game assemblies into this repository.
+Dependencies download from pinned upstream commits and release archives and are checked against pinned SHA256 hashes. Vendor runtime authenticity is verified using the applicable NVIDIA/AMD signatures; see [third-party software](third-party.md) for component-specific checks and licenses. Existing unexpected files are not overwritten. Dependencies, build outputs and diagnostic artifacts are ignored by Git. Do not copy proprietary game assemblies into this repository.
 
-The managed plugin uses local BepInEx 5 and game reference DLLs. Defaults are `C:/Game Modding/BepInEx/BepInEx/core` and `C:/Game Modding/DSPlibs`; override `BepInExPath`/`DspLibsPath` MSBuild properties on another workstation:
+The managed plugin uses BepInEx 5 and game reference DLLs supplied by the developer. Pass `BepInExPath` and `DspLibsPath` explicitly. Replace the bracketed placeholders below with absolute paths for your installation; the BepInEx core directory must contain `BepInEx.dll` and `Mono.Cecil.dll`.
 
 ```powershell
-dotnet build managed/DSPAAMod.csproj -c Release
-# Example: dotnet build managed/DSPAAMod.csproj -c Release -p:DspLibsPath=C:/Local/GameReferences
+$gameDirectory = '<absolute-game-directory>'
+$bepInExCore = '<absolute-BepInEx-core-directory>'
+$gameManaged = Join-Path $gameDirectory 'DSPGAME_Data/Managed'
+dotnet build managed/DSPAAMod.csproj -c Release `
+    "-p:BepInExPath=$bepInExCore" "-p:DspLibsPath=$gameManaged"
+dotnet build preloader/DSPAASR.Preloader.csproj -c Release "-p:BepInExPath=$bepInExCore"
 # Release validation uses the original game DLLs, not publicized development references.
-$gameManaged = 'E:/SteamLibrary/steamapps/common/Dyson Sphere Program/DSPGAME_Data/Managed'
-./tools/test-game-references.ps1 -GameManagedPath $gameManaged
-./tools/package.ps1 -GameManagedPath $gameManaged
+./tools/test-game-references.ps1 -GameManagedPath $gameManaged -BepInExPath $bepInExCore
+./tools/package.ps1 -GameManagedPath $gameManaged -BepInExPath $bepInExCore
 ```
 
-Set `GameManagedPath` to your installed game's unmodified `DSPGAME_Data/Managed` directory; `DSP_GAME_MANAGED_PATH` is the environment-variable alternative. Both scripts accept `BepInExPath` for a nondefault BepInEx 5 core directory. The game-reference check rebuilds all production C# sources, including the Unity UI adapter, into an isolated `build/game-reference-check/` directory. It rejects publicized references and catches direct access to members that are private in the actual game. Access private members through Harmony/reflection instead. Packaging always runs this check and includes that exact checked DLL; the ordinary development reference directory and build outputs are unchanged. This compiler check does not execute Unity or replace in-game menu acceptance.
+Set `GameManagedPath` to your installed game's unmodified `DSPGAME_Data/Managed` directory; `DSP_GAME_MANAGED_PATH` is the environment-variable alternative. Pass the same BepInEx 5 core directory to both scripts; use the minimum supported BepInEx version when checking a release's dependency contract. The game-reference check rebuilds all production C# sources, including the Unity UI adapter, into an isolated `build/game-reference-check/` directory. It rejects publicized references and catches direct access to members that are private in the actual game. Access private members through Harmony/reflection instead. The same entry also rebuilds the standalone preloader against the selected BepInEx/Cecil references, without any game/Unity reference. Packaging always runs these checks and includes both exact checked DLLs; the ordinary development reference directory and build outputs are unchanged. This compiler check does not execute Unity or replace in-game menu acceptance.
 
-Packaging requires Python 3 and Inkscape on the tool search path. It writes a new local `dist/` directory and a flat-root Gale/Thunderstore ZIP: package metadata, changelog, README, 256×256 icon, managed/native DLLs, verified release runtime, license/notices and `SHA256SUMS.json`. It does not deploy, launch, upload or publish anything. Default tests cover preset evidence, WARP texture lifetime/fallback/retirement, CLI errors, verified-download safety, model overrides, Apply/Cancel/Defaults, centered jitter and real managed/native ABI calls. They do not execute Unity or validate the native-menu layout.
+Packaging requires Python 3 and Inkscape on the tool search path. It writes a new local `dist/` directory and a Gale/Thunderstore ZIP with root package metadata, changelog, README, 256×256 icon, managed/native DLLs, verified release runtimes and license/notices, plus `patchers/DSPAASR.Preloader.dll`. `SHA256SUMS.json` covers every payload file recursively with archive-relative slash-separated paths. The manager routes the patcher separately from ordinary root/plugin files; do not flatten that entry. It does not deploy, launch, upload or publish anything. Default tests cover preset evidence, WARP texture lifetime/fallback/retirement, CLI errors, verified-download safety, model overrides, Apply/Cancel/Defaults, centered jitter and real managed/native ABI calls. They do not execute Unity or validate the native-menu layout.
+
+### Preloader helper checks
+
+After the game-reference build, run the configuration and payload-discovery checks in a fresh PowerShell process:
+
+```powershell
+pwsh -NoProfile -File tools/test-preloader.ps1 `
+    -Plugin build/game-reference-check/Release/bin/DSPAAMod.dll `
+    -Preloader build/game-reference-check/Release/preloader/DSPAASR.Preloader.dll `
+    -BepInExPath $bepInExCore -GameManagedPath $gameManaged
+```
+
+This suite invokes the production preloader helpers with temporary copies of the selected assemblies. It covers profile-relative payload discovery, duplicate/disabled/mismatched installations, saved backend values and read-only configuration handling. It does not initialize the preloader, load the native DLL or start the game/GPU. The startup receipt and settings transactions are covered by the managed tests; actual early-entry timing and presentation capabilities still require in-game validation.
 
 
 ### Headless DLAA probe
@@ -54,7 +72,7 @@ New-Item -ItemType Directory -Force artifacts/probe-k | Out-Null
 
 The probe opens **no window**, creates its own D3D11 device, and renders 32 synthetic jittered frames at 1280×720 with depth, zero static-scene motion vectors, and explicit exposure. It writes a PPM image and logs NGX diagnostics. It does not validate game motion vectors or final image quality. Exit 0 requires valid output and a matching application-controlled preset in the runtime's diagnostics; exit 3 means missing evidence, driver control, or a different observed preset. Log syntax is not a stable NVIDIA query ABI, so unfamiliar output remains unverified rather than being declared successful.
 
-E/F are deprecated CNN models; K is first-generation Transformer, L/M second-generation Transformer. Both release and development 310.9.1 libraries have passed these native-resolution probes on an RTX 4070 SUPER. This is a compatibility result for that configuration, not a guarantee for every driver/GPU.
+E/F are deprecated CNN models; K is first-generation Transformer, L/M second-generation Transformer. Run the probes on the target GPU/driver configuration to verify the requested preset with the pinned runtime. A successful result applies to that configuration rather than establishing compatibility for every driver/GPU.
 
 `ngx-probe <runtime-directory> <output-directory> K --bridge-switch` exercises the same exported DLL used by the managed plugin. It submits frames from one thread and consumes opaque tokens on another, switching K → F → L → M → E → K → K on one camera key, 32 frames per stage. Each stage checks actual preset diagnostics, finite output, selected D3D11 context-state restoration, retirement and shutdown. The final repeated K also exercises unchanged-configuration execution with a reset request. This is still a synthetic static scene, not an image-quality benchmark.
 
@@ -82,16 +100,20 @@ This opt-in hardware probe opens no window and does not load NGX. It uses the ex
 
 `tools/game-sandbox.ps1` is an explicit developer workflow, not part of a build, test or package command. Close DSP first and supply a new session directory, a BepInEx 5 core compatible with the installation's Doorstop and an already validated, unpacked package. Match the loader entry-point ABI, not just the BepInEx major version: Doorstop 3 uses `Main`, whereas Doorstop 4 uses `Doorstop.Entrypoint.Start`. A core built for the latter does not load through the former.
 
+Use the explicit `$gameDirectory` and `$bepInExCore` paths from the build setup and select an unpacked, validated package:
+
 ```powershell
+$packageDirectory = '<absolute-unpacked-package-directory>'
 ./tools/game-sandbox.ps1 -Action Prepare -SessionDirectory artifacts/game-check `
-    -CoreDirectory 'C:/Local/BepInEx/core' -PackageDirectory dist/DSPAASR-1.1.0
+    -GameDirectory $gameDirectory -CoreDirectory $bepInExCore -PackageDirectory $packageDirectory
 # Read the emitted OverrideRoot and explicitly set the game's Configs/path.txt to it.
-./tools/game-sandbox.ps1 -Action Run -SessionDirectory artifacts/game-check -MaximumSeconds 1200
+./tools/game-sandbox.ps1 -Action Run -SessionDirectory artifacts/game-check `
+    -GameDirectory $gameDirectory -MaximumSeconds 1200
 # Only if the host was interrupted, after closing DSP:
-./tools/game-sandbox.ps1 -Action Restore -SessionDirectory artifacts/game-check
+./tools/game-sandbox.ps1 -Action Restore -SessionDirectory artifacts/game-check -GameDirectory $gameDirectory
 ```
 
-Use `GameDirectory` when the game is installed elsewhere. Preparation copies the core and plugin into a new private profile and backs up the existing `Configs/path.txt` without changing the game. Run refuses an unredirected data path, an existing game process or modified plugin payload; it requests windowed 1280×720 (the game's own options may override this), records its PID and bounds the session lifetime. In the ordinary mode shown above, the child receives DSP's Steam App ID (`1366540`) without altering the parent environment or Steam configuration. Steam must already be running with access to the game.
+Pass the same `GameDirectory` to Prepare, Run and Restore. Preparation copies the core and plugin into a new private profile and backs up the existing `Configs/path.txt` without changing the game. Run refuses an unredirected data path, an existing game process or modified plugin payload; it requests windowed 1280×720 (the game's own options may override this), records its PID and bounds the session lifetime. In the ordinary mode shown above, the child receives DSP's Steam App ID (`1366540`) without altering the parent environment or Steam configuration. Steam must already be running with access to the game.
 
 The game's own path override isolates its file-based saves, blueprints, achievements and options. It does not isolate Steam account services or Unity PlayerPrefs; use a new in-game Sandbox world, not a personal save. A Steam-free assembly alone also does not separate PlayerPrefs. Before exercising menu/Continue code that records play-version counters, independently verify that a private runtime's player company/product identity does not target the installed game's preferences. File restoration receipts do not establish registry isolation. On exit or timeout, the runner stops only its owned process and restores the original path file byte-for-byte. It refuses to overwrite a concurrent external edit. After an abrupt host termination, retain `sandbox.json` and `path.before` and use Restore rather than copying an entire installation/profile. Logs and receipts remain in the session directory. The default headless `game-sandbox-rollback` test checks this filesystem/refusal contract with disposable fixtures; it never starts the real game.
 
@@ -113,7 +135,7 @@ cmake --preset windows -DDSPAA_BUILD_DRIVER_TOOL=ON
 cmake --build --preset release
 # Invoke from PowerShell; relative output paths are rooted in this project.
 ./tools/run-preset-probes.ps1 -RuntimeVariants dev,rel -IsolateDriverProfile
-# Bridge switching on the release runtime (same explicit isolation permission):
+# Bridge switching on the release runtime (same opt-in):
 ./tools/run-preset-probes.ps1 -RuntimeVariants rel -BridgeSwitch -IsolateDriverProfile
 ```
 

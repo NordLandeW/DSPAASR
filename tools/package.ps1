@@ -22,6 +22,7 @@ if (!$modernInkscape -and !$inkscapeHelp.Contains('--export-png')) { throw 'Unsu
 $files = [ordered]@{
     'build/game-reference-check/Release/bin/DSPAAMod.dll' = 'DSPAAMod.dll'
     'build/native/Release/DSPAANative.dll' = 'DSPAANative.dll'
+    'build/game-reference-check/Release/preloader/DSPAASR.Preloader.dll' = 'patchers/DSPAASR.Preloader.dll'
     'external/ngx/runtime/rel/nvngx_dlss.dll' = 'nvngx_dlss.dll'
     'external/ngx/LICENSE.txt' = 'NVIDIA-RTX-SDK-LICENSE.txt'
     'external/fsr-sdk/Kits/FidelityFX/signedbin/amd_fidelityfx_loader_dx12.dll' = 'amd_fidelityfx_loader_dx12.dll'
@@ -56,7 +57,11 @@ if ($assembly.Version.ToString(3) -ne $metadata.version_number) { throw 'Assembl
 & (Join-Path $PSScriptRoot 'fetch-minhook.ps1')
 & (Join-Path $PSScriptRoot 'fetch-streamline.ps1')
 $null = New-Item -ItemType Directory -Path $output
-foreach ($source in $files.Keys) { Copy-Item -LiteralPath (Join-Path $root $source) -Destination (Join-Path $output $files[$source]) }
+foreach ($source in $files.Keys) {
+    $destination = Join-Path $output $files[$source]
+    $null = New-Item -ItemType Directory -Force -Path (Split-Path $destination -Parent)
+    Copy-Item -LiteralPath (Join-Path $root $source) -Destination $destination
+}
 $icon = Join-Path $output 'icon.png'
 if ($modernInkscape) {
     & $inkscape (Join-Path $root 'pack/icon.svg') --export-type=png --export-area-page --export-width=256 --export-height=256 "--export-filename=$icon"
@@ -65,8 +70,8 @@ if ($modernInkscape) {
 }
 # Some older Inkscape releases return zero even for an unknown option.
 if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $icon -PathType Leaf)) { throw 'Icon rendering failed.' }
-$checksums = @(Get-ChildItem -LiteralPath $output -File | Sort-Object Name | ForEach-Object {
-    [ordered]@{ File = $_.Name; Bytes = $_.Length; SHA256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
+$checksums = @(Get-ChildItem -LiteralPath $output -File -Recurse | Sort-Object FullName | ForEach-Object {
+    [ordered]@{ File = [IO.Path]::GetRelativePath($output, $_.FullName).Replace('\','/'); Bytes = $_.Length; SHA256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
 })
 $checksums | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.json') -Encoding utf8NoBOM
 Add-Type -AssemblyName System.IO.Compression.FileSystem

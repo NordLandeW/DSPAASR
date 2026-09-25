@@ -302,6 +302,56 @@ internal static class Program
         settings.Draft = new FrameGenerationSettings(FrameGenerationBackend.Dlss, FrameGenerationMode.Fixed, 5);
         settings.Apply(); settings.Open(); Require(settings.Draft.GeneratedFrames == 5, "MFG choice was hard-coded to 40-series limits");
         settings.Defaults(); Require(settings.Applied.GeneratedFrames == 5, "FG defaults rewrote applied settings before Apply");
+        var before = settings.Applied;
+        try {
+            settings.Apply(value => { throw new IOException("simulated config save failure"); });
+            throw new Exception("FG swallowed persistence failure");
+        } catch (IOException) { }
+        Require(settings.Applied.Equals(before), "Failed persistence advanced Applied");
+        bool persisted = false;
+        settings.Apply(value => { Require(settings.Applied.Equals(before), "Applied advanced before persistence"); persisted = value.Equals(settings.Draft); });
+        Require(persisted && settings.Applied.Equals(FrameGenerationSettings.Default), "FG did not commit after persistence");
+        var nativeSession = new NativePresentationStatus();
+        var request = new FrameGenerationSettings(FrameGenerationBackend.Dlss);
+        Require(PresentationAvailability.CanRequest(nativeSession, PresentationStartupState.Inactive, request.Backend, true) &&
+            !nativeSession.DlssSupported && PresentationAvailability.NeedsRestart(nativeSession, PresentationStartupState.Inactive, request),
+            "A normal Off startup could not save a future request, or invented current support");
+        foreach (var failure in new[] { PresentationStartupState.Missing, PresentationStartupState.Started, PresentationStartupState.Failed })
+            Require(!PresentationAvailability.CanRequest(nativeSession, failure, request.Backend, true) &&
+                !PresentationAvailability.NeedsRestart(nativeSession, failure, request), "Missing/failed startup was treated as a normal restart request");
+        Require(!PresentationAvailability.CanRequest(nativeSession, PresentationStartupState.Inactive, request.Backend, false), "Missing payload accepted a startup request");
+        settings.Draft = request;
+        Require(PresentationAvailability.NeedsRestart(nativeSession, PresentationStartupState.Inactive, settings.Draft), "Draft failed to request restart");
+        settings.Cancel();
+        Require(!PresentationAvailability.NeedsRestart(nativeSession, PresentationStartupState.Inactive, settings.Draft), "Cancel retained a pending restart");
+        var bridgeSession = new NativePresentationStatus { Flags = 1u | 2u | 4u };
+        foreach (var backend in new[] { FrameGenerationBackend.Off, FrameGenerationBackend.Fsr, FrameGenerationBackend.Dlss }) {
+            var change = new FrameGenerationSettings(backend);
+            Require(PresentationAvailability.CanRequest(bridgeSession, PresentationStartupState.Started, backend, false) &&
+                !PresentationAvailability.NeedsRestart(bridgeSession, PresentationStartupState.Inactive, change), "An existing bridge incorrectly required restart");
+        }
+        bridgeSession.Flags |= 128u;
+        Require(!PresentationAvailability.CanRequest(bridgeSession, PresentationStartupState.Inactive, request.Backend, true), "A quarantined bridge accepted another FG request");
+        const string receiptKey = "DSPAASR.PresentationStartup";
+        string payload = Path.Combine(Path.GetTempPath(), "DSPAASR-receipt-test", "payload");
+        try {
+            Require(PresentationStartup.Read(payload).State == PresentationStartupState.Missing, "No receipt was treated as an inactive startup");
+            Require(PresentationStartup.TryClaim() && !PresentationStartup.TryClaim(), "Preloader initialization claim was not process-single-use");
+            Require(PresentationStartup.Read(payload).State == PresentationStartupState.Failed, "Incomplete initialization hid its failure");
+            PresentationStartup.Publish(PresentationStartupState.Inactive, payload, 0);
+            Require(PresentationStartup.Read(payload + Path.DirectorySeparatorChar).State == PresentationStartupState.Inactive, "Matching inactive payload was rejected");
+            Require(PresentationStartup.Read(payload + "-other").State == PresentationStartupState.Failed, "A different payload inherited another preloader's result");
+            PresentationStartup.Publish(PresentationStartupState.Started, payload, 2);
+            var started = PresentationStartup.Read(payload);
+            Require(started.State == PresentationStartupState.Started && started.RequestedBackend == 2, "Started receipt lost startup intent");
+            Require(!PresentationAvailability.CanRequest(nativeSession, started.State, request.Backend, true), "Hook installation invented an available channel");
+            PresentationStartup.Publish(PresentationStartupState.Inactive, payload, 2);
+            Require(PresentationStartup.Read(payload).State == PresentationStartupState.Failed, "Inactive receipt accepted enabled intent");
+            PresentationStartup.Publish(PresentationStartupState.Failed, payload, 2, "native rejected startup");
+            Require(PresentationStartup.Read(payload).Error.Length > 0 && !PresentationStartup.TryClaim(), "Failure lost diagnostics or allowed retry");
+            AppDomain.CurrentDomain.SetData(receiptKey, new object[] { 0, 1, payload, 0, "" });
+            Require(PresentationStartup.Read(payload).State == PresentationStartupState.Failed, "Unknown receipt schema accepted");
+        } finally { AppDomain.CurrentDomain.SetData(receiptKey, null); }
         try { _ = new FrameGenerationSettings(FrameGenerationBackend.Fsr, FrameGenerationMode.Dynamic); throw new Exception("FSR accepted DLSS Dynamic"); }
         catch (ArgumentException) { }
         try { _ = new FrameGenerationSettings(FrameGenerationBackend.Dlss, generatedFrames: 0); throw new Exception("Zero additional frames accepted"); }

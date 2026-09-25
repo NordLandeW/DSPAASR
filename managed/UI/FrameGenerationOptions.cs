@@ -18,6 +18,7 @@ namespace DSPAAMod.UI
         private int statusRows;
         private uint shownFlags, shownMaximum, shownActive, shownRequested, shownSdkStatus;
         private FrameGenerationSettings shownDraft, shownApplied;
+        private PresentationStartupState shownStartup;
         private readonly Color warningColor;
         private static bool Chinese => (Localization.CurrentLanguageLCID & 0x3ff) == 4;
         private NativePresentationStatus Capabilities => plugin.Presentation?.Status ?? default;
@@ -29,7 +30,7 @@ namespace DSPAAMod.UI
                 // this menu's capabilities; do not close a popup for those changes.
                 return (value.Flags & ~96u) != shownFlags || value.MaximumGeneratedFrames != shownMaximum ||
                     value.ActiveBackend != shownActive || value.RequestedBackend != shownRequested || value.SdkStatus != shownSdkStatus ||
-                    !plugin.FrameGeneration.Draft.Equals(shownDraft) || !plugin.FrameGeneration.Applied.Equals(shownApplied);
+                    plugin.StartupState != shownStartup || !plugin.FrameGeneration.Draft.Equals(shownDraft) || !plugin.FrameGeneration.Applied.Equals(shownApplied);
             }
         }
         public FrameGenerationOptions(Plugin owner, UIComboBox template, Text label, Text statusTemplate, RectTransform content, float spacing)
@@ -63,16 +64,17 @@ namespace DSPAAMod.UI
             var caps = Capabilities; var value = plugin.FrameGeneration.Draft;
             shownFlags = caps.Flags & ~96u; shownMaximum = caps.MaximumGeneratedFrames;
             shownActive = caps.ActiveBackend; shownRequested = caps.RequestedBackend; shownSdkStatus = caps.SdkStatus;
-            shownDraft = value; shownApplied = plugin.FrameGeneration.Applied;
+            shownDraft = value; shownApplied = plugin.FrameGeneration.Applied; shownStartup = plugin.StartupState;
             bool usable = caps.Available && !caps.Quarantined;
+            bool nextStartDlss = !caps.Available && plugin.CanRequestFrameGeneration(FrameGenerationBackend.Dlss);
             synchronizing = true;
             try {
                 backendLabel.text = Chinese ? "帧生成" : "Frame generation";
                 multiplierLabel.text = Chinese ? "帧生成倍率" : "Frame multiplier";
                 reflexLabel.text = "NVIDIA Reflex";
                 GraphicsOptions.SetItems(backend,new[] { Chinese ? "关闭" : "Off", "FSR 2×", "DLSS" },(int)value.Backend);
-                GraphicsOptions.SetItemEnabled(backend,1,usable && caps.FsrRuntimePresent);
-                GraphicsOptions.SetItemEnabled(backend,2,usable && caps.DlssSupported);
+                GraphicsOptions.SetItemEnabled(backend,1,plugin.CanRequestFrameGeneration(FrameGenerationBackend.Fsr));
+                GraphicsOptions.SetItemEnabled(backend,2,plugin.CanRequestFrameGeneration(FrameGenerationBackend.Dlss));
                 var choices = new System.Collections.Generic.List<string> {"2×","3×","4×","5×","6×",Chinese ? "自适应" : "Dynamic"};
                 int index = value.Mode == FrameGenerationMode.Dynamic ? 5 : (int)Math.Min(value.GeneratedFrames - 1,4u);
                 if (value.Mode == FrameGenerationMode.Fixed && value.GeneratedFrames > 5) {
@@ -80,7 +82,8 @@ namespace DSPAAMod.UI
                 }
                 GraphicsOptions.SetItems(multiplier,choices.ToArray(),index);
                 uint maximum = caps.ActiveBackend == 2 ? caps.MaximumGeneratedFrames : 1u;
-                for (int i=0;i<5;++i) GraphicsOptions.SetItemEnabled(multiplier,i,usable && caps.DlssSupported && (uint)(i+1)<=maximum);
+                for (int i=0;i<5;++i) GraphicsOptions.SetItemEnabled(multiplier,i,
+                    (usable && caps.DlssSupported && (uint)(i+1)<=maximum) || (nextStartDlss && i==0));
                 GraphicsOptions.SetItemEnabled(multiplier,5,usable && caps.DynamicSupported && caps.ActiveBackend == 2);
                 if (choices.Count>6) GraphicsOptions.SetItemEnabled(multiplier,6,false);
                 GraphicsOptions.SetItems(reflex,new[] {Chinese ? "关闭" : "Off", Chinese ? "开启" : "On", Chinese ? "开启并增强" : "On + Boost"},(int)value.Reflex);
@@ -96,8 +99,20 @@ namespace DSPAAMod.UI
         private string StatusText(NativePresentationStatus caps, FrameGenerationSettings value, out bool warning)
         {
             warning = false;
-            if (!caps.Available) { warning = true; return Chinese ? "帧生成不可用，请检查模组安装并重启游戏。" : "Frame generation is unavailable. Check the mod installation and restart the game."; }
             if (caps.Quarantined) { warning = true; return Chinese ? "帧生成因错误已停用，请重启游戏。" : "Frame generation was disabled after an error. Restart the game."; }
+            if (!caps.Available) {
+                if (plugin.Presentation != null && plugin.StartupState == PresentationStartupState.Inactive && value.Backend == FrameGenerationBackend.Off)
+                    return string.Empty;
+                if (PresentationAvailability.NeedsRestart(caps, plugin.StartupState, value) && plugin.CanRequestFrameGeneration(value.Backend)) {
+                    string restart = value.Equals(plugin.FrameGeneration.Applied) ?
+                        (Chinese ? "设置已保存。重启游戏以检测支持并启用帧生成。" : "Settings saved. Restart the game to check support and enable frame generation.") :
+                        (Chinese ? "应用设置并重启游戏，以检测支持并启用帧生成。" : "Apply settings and restart the game to check support and enable frame generation.");
+                    if (value.Backend == FrameGenerationBackend.Dlss && value.Reflex == ReflexMode.Off)
+                        return (Chinese ? "DLSS 帧生成需要开启 NVIDIA Reflex。" : "DLSS frame generation requires NVIDIA Reflex.") + "\n" + restart;
+                    return restart;
+                }
+                warning = true; return Chinese ? "帧生成不可用，请检查模组安装并重启游戏。" : "Frame generation is unavailable. Check the mod installation and restart the game.";
+            }
             if (value.Backend == FrameGenerationBackend.Off) {
                 if (!caps.FsrRuntimePresent && !caps.DlssSupported) {
                     warning = true; return Chinese ? "帧生成不可用，请检查显卡、驱动与模组安装。" : "Frame generation is unavailable. Check the GPU, driver and mod installation.";
@@ -144,9 +159,8 @@ namespace DSPAAMod.UI
         private void BackendChanged()
         {
             if (synchronizing || backend.itemIndex<0 || backend.itemIndex>2) return;
-            var caps=Capabilities; var selected=(FrameGenerationBackend)backend.itemIndex;
-            if (selected != FrameGenerationBackend.Off && (!caps.Available || caps.Quarantined ||
-                (selected==FrameGenerationBackend.Fsr ? !caps.FsrRuntimePresent : !caps.DlssSupported))) { Refresh(); return; }
+            var selected=(FrameGenerationBackend)backend.itemIndex;
+            if (!plugin.CanRequestFrameGeneration(selected)) { Refresh(); return; }
             var prior=plugin.FrameGeneration.Draft;
             plugin.FrameGeneration.Draft=new FrameGenerationSettings(selected,
                 selected==FrameGenerationBackend.Fsr?FrameGenerationMode.Fixed:prior.Mode,
@@ -155,7 +169,8 @@ namespace DSPAAMod.UI
         }
         private void MultiplierChanged()
         {
-            if (synchronizing || !showDetails || multiplier.itemIndex<0 || multiplier.itemIndex>5) return;
+            if (synchronizing || !showDetails || multiplier.itemIndex<0 || multiplier.itemIndex>5 ||
+                !plugin.CanRequestFrameGeneration(FrameGenerationBackend.Dlss)) return;
             var caps=Capabilities; var prior=plugin.FrameGeneration.Draft; int index=multiplier.itemIndex;
             bool dynamic=index==5;
             uint maximum=caps.ActiveBackend==2?caps.MaximumGeneratedFrames:1u;

@@ -18,6 +18,14 @@ $game = [IO.Path]::GetFullPath($GameDirectory, $root)
 $pathFile = Join-Path $game 'Configs/path.txt'
 $manifestPath = Join-Path $session 'sandbox.json'
 function Get-Hash([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
+function Get-PayloadTarget([string]$Name) {
+    $relative = $Name.Replace('\','/')
+    $prefix = 'patchers/'
+    if ($relative.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        return Join-Path $session ('BepInEx/patchers/DSPAASR/' + $relative.Substring($prefix.Length))
+    }
+    return Join-Path $session ('BepInEx/plugins/DSPAASR/' + $relative)
+}
 function Assert-SteamFree([string]$ExpectedHash) {
     $assembly = Join-Path $game 'DSPGAME_Data/Managed/Assembly-CSharp.dll'
     $receipt = Join-Path $game 'steam-free-runtime.json'
@@ -68,12 +76,14 @@ if ($Action -eq 'Prepare') {
     $null = New-Item -ItemType Directory -Path $coreTarget,$pluginTarget,(Join-Path $session 'game-data')
     Get-ChildItem -LiteralPath $core -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $coreTarget }
     $copied = @()
-    Get-ChildItem -LiteralPath $package -File | ForEach-Object {
-        $target = Join-Path $pluginTarget $_.Name
+    Get-ChildItem -LiteralPath $package -File -Recurse | ForEach-Object {
+        $name = [IO.Path]::GetRelativePath($package, $_.FullName).Replace('\','/')
+        $target = Get-PayloadTarget $name
+        $null = New-Item -ItemType Directory -Force -Path (Split-Path $target -Parent)
         Copy-Item -LiteralPath $_.FullName -Destination $target
         $hash = Get-Hash $_.FullName
         if ((Get-Hash $target) -ne $hash) { throw 'Sandbox payload copy mismatch.' }
-        $copied += [ordered]@{Name=$_.Name; SHA256=$hash}
+        $copied += [ordered]@{Name=$name; SHA256=$hash}
     }
     $manifest = [ordered]@{GameDirectory=$game; SessionDirectory=$session; OverrideRoot=((Join-Path $session 'game-data').Replace('\','/') + '/');
         OriginalSHA256=(Get-Hash (Join-Path $session 'path.before')); Payload=$copied;
@@ -100,7 +110,7 @@ try {
         throw 'Game data is not redirected to this isolated session; refusing to launch.'
     }
     foreach ($file in $manifest.Payload) {
-        if ((Get-Hash (Join-Path $session ('BepInEx/plugins/DSPAASR/' + $file.Name))) -ne $file.SHA256) { throw 'Sandbox payload changed since preparation.' }
+        if ((Get-Hash (Get-PayloadTarget $file.Name)) -ne $file.SHA256) { throw 'Sandbox payload changed since preparation.' }
     }
     $expectedSteamFree = if ($manifest.PSObject.Properties['SteamFreeAssemblySha256']) { [string]$manifest.SteamFreeAssemblySha256 } else { '' }
     if ($SteamFreeAssemblySha256 -and $SteamFreeAssemblySha256 -ne $expectedSteamFree) {

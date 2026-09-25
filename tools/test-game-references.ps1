@@ -29,4 +29,9 @@ try {
         -p:AppendTargetFrameworkToOutputPath=false
     if ($LASTEXITCODE -ne 0) { throw 'Production plugin build against unmodified game references failed.' }
     Write-Output "Game-reference check passed: $output/bin/DSPAAMod.dll"
+    dotnet build preloader/DSPAASR.Preloader.csproj -c $Configuration --nologo -t:Rebuild `
+        "-p:BepInExPath=$bepInEx" "-p:OutputPath=$output/preloader/" `
+        "-p:IntermediateOutputPath=$output/preloader-obj/" -p:AppendTargetFrameworkToOutputPath=false
+    if ($LASTEXITCODE -ne 0) { throw 'Production preloader build against the selected BepInEx core failed.' }
+    Write-Output "Preloader check passed: $output/preloader/DSPAASR.Preloader.dll"
 } finally { Pop-Location }

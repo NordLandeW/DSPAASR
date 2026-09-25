@@ -14,6 +14,8 @@ try {
     [IO.File]::WriteAllBytes($path, $original)
     [IO.File]::WriteAllBytes((Join-Path $core 'BepInEx.Preloader.dll'), [byte[]](1,2,3))
     [IO.File]::WriteAllBytes((Join-Path $package 'DSPAAMod.dll'), [byte[]](4,5,6))
+    $null = New-Item -ItemType Directory -Path (Join-Path $package 'patchers')
+    [IO.File]::WriteAllBytes((Join-Path $package 'patchers/DSPAASR.Preloader.dll'), [byte[]](31,32,33))
     # Function interception affects only this child script scope: no unrelated running game
     # may make a filesystem unit test nondeterministic; Run still cannot reach Process.Start.
     function Get-Process { param($Name, $ErrorAction); return $null }
@@ -21,6 +23,19 @@ try {
     $beforeHash = (Get-FileHash -LiteralPath $path).Hash
     $manifest = Get-Content (Join-Path $session 'sandbox.json') -Raw | ConvertFrom-Json
     Require ($manifest.OriginalSHA256 -eq $beforeHash) 'Preparation changed original game config'
+    $patcher = Join-Path $session 'BepInEx/patchers/DSPAASR/DSPAASR.Preloader.dll'
+    Require ((Get-FileHash $patcher).Hash -eq (Get-FileHash (Join-Path $package 'patchers/DSPAASR.Preloader.dll')).Hash) 'Patcher was not installed to the standard profile path'
+    Require (!(Test-Path (Join-Path $session 'BepInEx/plugins/DSPAASR/patchers'))) 'Patcher was nested inside the ordinary plugin payload'
+    [IO.File]::WriteAllText($path, $manifest.OverrideRoot)
+    [IO.File]::WriteAllBytes($patcher, [byte[]](34))
+    $failed = $false
+    try { & $runner -Action Run -GameDirectory $game -SessionDirectory $session } catch {
+        $failed = $_.Exception.Message -like '*payload changed*'
+    }
+    Require $failed 'Modified preloader payload passed the launch integrity gate'
+    Require (!(Test-Path (Join-Path $session 'process.json'))) 'Changed patcher created a game process receipt'
+    [IO.File]::WriteAllBytes($patcher, [byte[]](31,32,33))
+    Require ((Get-FileHash -LiteralPath $path).Hash -eq $beforeHash) 'Changed-patcher refusal did not restore the path override'
     $failed = $false
     try { & $runner -Action Run -GameDirectory $game -SessionDirectory $session } catch {
         $failed = $_.Exception.Message -like '*not redirected*'

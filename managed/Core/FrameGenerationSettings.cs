@@ -44,6 +44,12 @@ namespace DSPAAMod.Core
         public void Open() { Draft = Applied; }
         public void Cancel() { Draft = Applied; }
         public void Defaults() { Draft = FrameGenerationSettings.Default; }
-        public void Apply() { Applied = Draft; }
+        public void Apply() => Apply(null);
+        public void Apply(Action<FrameGenerationSettings> persist)
+        {
+            var value = Draft;
+            persist?.Invoke(value);
+            Applied = value;
+        }
     }
 }

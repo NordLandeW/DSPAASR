@@ -22,6 +22,21 @@ namespace DSPAAMod
         internal GraphicsOptions Options { get; private set; }
         internal FrameGenerationController Presentation { get; private set; }
         internal FrameGenerationSettingsSession FrameGeneration { get; private set; }
+        internal PresentationStartupState StartupState => PresentationStartup.Read(Path.GetDirectoryName(Info.Location)).State;
+        internal bool CanRequestFrameGeneration(FrameGenerationBackend backend)
+        {
+            if (Presentation == null) return backend == FrameGenerationBackend.Off;
+            var caps = Presentation?.Status ?? default;
+            if (caps.Available || backend == FrameGenerationBackend.Off)
+                return PresentationAvailability.CanRequest(caps, StartupState, backend, false);
+            string directory = Path.GetDirectoryName(Info.Location);
+            bool Has(string name) => File.Exists(Path.Combine(directory, name));
+            bool present = backend == FrameGenerationBackend.Fsr ?
+                Has("amd_fidelityfx_loader_dx12.dll") && Has("amd_fidelityfx_framegeneration_dx12.dll") :
+                Has("sl.interposer.dll") && Has("sl.common.dll") && Has("sl.dlss_g.dll") &&
+                Has("sl.reflex.dll") && Has("sl.pcl.dll") && Has("nvngx_dlssg.dll");
+            return PresentationAvailability.CanRequest(caps, StartupState, backend, present);
+        }
         private ConfigEntry<AaTechnique> technique;
         private ConfigEntry<ModelSelection> model;
         private ConfigEntry<ResolutionMode> resolution;
@@ -55,7 +70,7 @@ namespace DSPAAMod
                 catch (ArgumentOutOfRangeException) { initial = AaSettings.Default; Logger.LogWarning("Invalid settings; using safe defaults without overwriting the config."); }
                 Settings = new SettingsSession(initial);
                 frameGeneration = Config.Bind("FrameGeneration", "Backend", FrameGenerationBackend.Off,
-                    "Off/Fsr/Dlss, independently of AA/SR. Requires the explicit early presentation installation and game restart. Off retains the native bridge but unloads the FG backend.");
+                    "Off/Fsr/Dlss, independently of AA/SR. The preloader creates the presentation bridge only when FG is selected at startup. Enabling FG without an active bridge requires restart; an existing bridge supports live switching and remains until game exit even after FG is turned Off.");
                 frameGenerationMode = Config.Bind("FrameGeneration", "Mode", FrameGenerationMode.Fixed,
                     "Fixed or DLSS Dynamic; availability is queried from the current SDK/device. Dynamic is not eAuto.");
                 generatedFrames = Config.Bind("FrameGeneration", "AdditionalFrames", 1u,
@@ -111,14 +126,28 @@ namespace DSPAAMod
             Renderer.Configure(Settings.Applied);
             Logger.LogInfo("AA settings applied: " + Settings.Applied.Technique + ", resolution " + Settings.Applied.Resolution + ", model " + Settings.Applied.Model);
         }
-        internal void ApplyFrameGeneration()
+        private void StoreFrameGeneration(FrameGenerationSettings value)
         {
-            FrameGeneration.Apply();
-            var value = FrameGeneration.Applied;
             frameGeneration.Value = value.Backend; frameGenerationMode.Value = value.Mode; generatedFrames.Value = value.GeneratedFrames;
             reflex.Value = value.Reflex; dynamicTargetFrameRate.Value = value.DynamicTargetFrameRate; frameLimitMicroseconds.Value = value.FrameLimitMicroseconds;
-            Config.Save();
-            if (Presentation == null || !Presentation.Apply(value)) Logger.LogWarning("Frame generation request could not be activated; check presentation status.");
+        }
+        internal void ApplyFrameGeneration()
+        {
+            FrameGeneration.Apply(value => {
+                bool autoSave = Config.SaveOnConfigSet;
+                Config.SaveOnConfigSet = false;
+                try { StoreFrameGeneration(value); Config.Save(); }
+                catch { StoreFrameGeneration(FrameGeneration.Applied); throw; }
+                finally { Config.SaveOnConfigSet = autoSave; }
+            });
+            var applied = FrameGeneration.Applied;
+            var caps = Presentation?.Status ?? default;
+            if (Presentation != null && !caps.Available && !caps.Quarantined && StartupState == PresentationStartupState.Inactive) {
+                Logger.LogInfo(applied.Backend == FrameGenerationBackend.Off ? "Frame generation remains Off; native presentation retained." :
+                    "Frame generation request saved; restart the game to check support and enable the presentation bridge.");
+                return;
+            }
+            if (Presentation == null || !Presentation.Apply(applied)) Logger.LogWarning("Frame generation request could not be activated; check presentation status.");
         }
         internal void Guard(Action action)
         {

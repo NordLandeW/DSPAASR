@@ -18,11 +18,12 @@ def validate(path):
         "amd_fidelityfx_framegeneration_dx12.dll", "STREAMLINE-LICENSE.txt",
         "sl.interposer.dll", "sl.common.dll", "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll", "nvngx_dlssg.dll",
         "nvngx_dlss.license.txt", "reflex.license.txt",
+        "patchers/DSPAASR.Preloader.dll",
     }
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
         if len(names) != len(set(names)) or set(names) != expected:
-            raise ValueError("Archive must contain exactly the intended flat-root package files")
+            raise ValueError("Archive must contain exactly the intended root payload and standard patchers entry")
         corrupt = archive.testzip()
         if corrupt:
             raise ValueError(f"ZIP CRC failure: {corrupt}")
@@ -74,7 +75,7 @@ def validate(path):
                 raise ValueError(f"Unexpected Streamline production runtime or incomplete license: {name}")
         for name in ("README.md", "LICENSE", "third-party.md", "NVIDIA-RTX-SDK-LICENSE.txt", "NVIDIA-DLSS-NOTICES.txt", "AMD-FSR-SDK-LICENSE.md"):
             archive.read(name).decode("utf-8")
-    print(f"Validated {manifest['name']} {version}: {len(expected)} flat-root files, metadata, icon, CRCs and payload hashes.")
+    print(f"Validated {manifest['name']} {version}: {len(expected)} files, standard preloader entry, metadata, icon, CRCs and recursive payload hashes.")
 
 
 if __name__ == "__main__":
