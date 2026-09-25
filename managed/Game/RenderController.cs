@@ -23,6 +23,7 @@ namespace DSPAAMod.Game
             public CommandBuffer OpaqueCapture;
             public readonly WorldTextOverlay WorldText = new WorldTextOverlay();
             public bool ReportedWorldText;
+            public string WorldTextFallback;
             public int WorldTextFrame = -1;
             public int RequestedWidth, RequestedHeight;
             public bool QueryIssued, TargetOverridden, SrThisRender, InputsCopied;
@@ -51,6 +52,121 @@ namespace DSPAAMod.Game
         private readonly Dictionary<Camera, CameraState> cameras = new Dictionary<Camera, CameraState>();
         private readonly List<CameraState> retired = new List<CameraState>();
         private readonly Action<string> report;
+        private readonly WorldTextOverlay frameGenerationNavigation = new WorldTextOverlay();
+        private Camera navigationCamera;
+        private int navigationFrame = -1;
+        private bool drawingNavigation, preparingNavigation;
+        private int preparedNavigationFrame = -1;
+        internal FrameGenerationController Presentation { get; set; }
+        private bool OwnsNavigation(Camera value) => navigationCamera && navigationCamera == value && navigationFrame == Time.frameCount;
+
+        internal void PrepareFrameGenerationNavigation(Camera camera, Matrix4x4 projection) =>
+            AcquireFrameGenerationNavigation(camera, projection, true);
+        internal void BeginFrameGenerationNavigation(Camera camera, Matrix4x4 projection) =>
+            AcquireFrameGenerationNavigation(camera, projection, false);
+        private void AcquireFrameGenerationNavigation(Camera camera, Matrix4x4 projection, bool beforeCanvas)
+        {
+            if (!OwnsNavigation(camera)) EndFrameGenerationNavigation();
+            if (!camera || camera != GameCamera.main) return;
+            string unavailable = frameGenerationNavigation.Begin(camera, projection, beforeCanvas);
+            if (unavailable != null)
+            {
+                // The board remains in world color. FG must present the original
+                // frame, whereas SR can keep running with that original board.
+                frameGenerationNavigation.End();
+                throw new NotSupportedException(unavailable);
+            }
+            navigationCamera = camera;
+            navigationFrame = Time.frameCount;
+        }
+        internal void SetFrameGenerationNavigationProjection(Camera camera, Matrix4x4 projection)
+        {
+            if (OwnsNavigation(camera)) frameGenerationNavigation.SetProjection(projection);
+        }
+        internal void DrawFrameGenerationNavigationBefore(Camera next)
+        {
+            // A subsequent display camera begins only after the world camera's
+            // complete image-effect/AfterEverything sequence (and native H copy).
+            // Off-screen effect cameras and our disabled manual camera cannot
+            // consume this scope or recursively redraw the board.
+            if (drawingNavigation || !navigationCamera || navigationFrame != Time.frameCount || !next ||
+                next == navigationCamera || next.targetTexture || next.targetDisplay != navigationCamera.targetDisplay ||
+                next.depth <= navigationCamera.depth) return;
+            FinishFrameGenerationNavigation();
+        }
+        internal void FinishFrameGenerationNavigation()
+        {
+            if (drawingNavigation) return;
+            try
+            {
+                if (!navigationCamera || navigationFrame != Time.frameCount) return;
+                drawingNavigation = true;
+                int count = frameGenerationNavigation.Draw(null);
+                if (count > 0 && !reportedFrameGenerationNavigation)
+                {
+                    information("World navigation text: " + count + " original renderers submitted after the FG world-color boundary.");
+                    reportedFrameGenerationNavigation = true;
+                }
+            }
+            finally { drawingNavigation = false; EndFrameGenerationNavigation(); }
+        }
+        private bool reportedFrameGenerationNavigation;
+        internal void EndFrameGenerationNavigation()
+        {
+            try { frameGenerationNavigation.End(); }
+            finally { navigationCamera = null; navigationFrame = -1; }
+        }
+        private void PrepareCanvasNavigation()
+        {
+            // One owner and one attempt before Canvas batching. Manual camera
+            // draws and subsequent Canvas callbacks must not acquire it again.
+            if (preparingNavigation || drawingNavigation || preparedNavigationFrame == Time.frameCount) return;
+            var camera = GameCamera.main;
+            if (!camera || !camera.isActiveAndEnabled || camera.targetTexture || camera.targetDisplay != 0 ||
+                camera.stereoEnabled || camera.rect != new Rect(0, 0, 1, 1)) return;
+            bool fg = Presentation?.CanPrepareNavigation(camera) == true;
+            if (!fg && (!settings.Temporal || !ActiveAvailability.Available)) return;
+            preparingNavigation = true;
+            preparedNavigationFrame = Time.frameCount;
+            CameraState state = null;
+            try
+            {
+                if (fg)
+                {
+                    Presentation.PrepareNavigation(camera, camera.projectionMatrix);
+                    return;
+                }
+                var behaviour = camera.GetComponent<PostProcessingBehaviour>();
+                if (!behaviour || !behaviour.isActiveAndEnabled || !behaviour.profile || behaviour.profile.debugViews.willInterrupt) return;
+                state = GetCameraState(behaviour);
+                if (state == null || state.Faulted) return;
+                BeginWorldText(state, camera.projectionMatrix, true);
+            }
+            catch (Exception error)
+            {
+                string message = error.Message;
+                try { state?.WorldText.End(); }
+                catch (Exception restore) { message += "; restoration: " + restore.Message; }
+                if (state != null) Fail(state, message);
+                else report("Navigation canvas preparation failed: " + message);
+            }
+            finally { preparingNavigation = false; }
+        }
+        private void BeginWorldText(CameraState state, Matrix4x4 projection, bool beforeCanvas = false)
+        {
+            string unavailable = state.WorldText.Begin(state.Camera, projection, beforeCanvas);
+            if (unavailable != null && state.WorldTextFallback != unavailable)
+                report("Navigation text uses its original world pass; SR remains active: " + unavailable);
+            state.WorldTextFallback = unavailable;
+            state.WorldTextFrame = Time.frameCount;
+        }
+        private int DrawWorldText(WorldTextOverlay overlay, RenderTexture destination)
+        {
+            bool previous = drawingNavigation;
+            drawingNavigation = true;
+            try { return overlay.Draw(destination); }
+            finally { drawingNavigation = previous; }
+        }
         private readonly Action<string> information;
         private readonly Func<NativeBridge> acquireNative;
         private readonly Action<TaaComponent, Vector2> setJitter;
@@ -66,6 +182,8 @@ namespace DSPAAMod.Game
         public UpscalerAvailability Availability => supportQueries[0].Availability;
         public UpscalerAvailability FsrAvailability => supportQueries[1].Availability;
         public UpscalerAvailability GetAvailability(AaChoice choice) => choice == AaChoice.Fsr ? FsrAvailability : Availability;
+        internal bool NeedsMotionVectors(Camera camera) => camera && settings.Temporal &&
+            cameras.TryGetValue(camera, out var state) && state.Prepared && !state.Faulted;
         private bool FsrSelected => settings.Technique == AaTechnique.Fsr;
         private UpscalerAvailability ActiveAvailability => FsrSelected ? FsrAvailability : Availability;
         private string BackendName => FsrSelected ? "FSR" : "DLSS";
@@ -155,6 +273,7 @@ namespace DSPAAMod.Game
                 supportQueries[i] = new SupportQuery { Availability = UpscalerAvailability.ForPlatform(
                     SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11, SystemInfo.graphicsDeviceVendorID,
                     SystemInfo.supportsMotionVectors, SystemInfo.supportsComputeShaders, (UpscalerBackend)i) };
+            Canvas.preWillRenderCanvases += PrepareCanvasNavigation;
         }
         public void RequestUpscalerSupport() { supportRequested = true; }
         private void UpdateSupport(SupportQuery query)
@@ -203,12 +322,11 @@ namespace DSPAAMod.Game
             settings = value;
             Status = value.Temporal ? "Waiting for a compatible camera." : "Using " + value.Technique;
         }
-        public void BeforeCull(PostProcessingBehaviour behaviour)
+        private CameraState GetCameraState(PostProcessingBehaviour behaviour)
         {
-            if (DiagnosticActive && behaviour) TraceStage("post.preCull-entry", behaviour.GetComponent<Camera>());
-            if (!behaviour || !behaviour.profile) return;
+            if (!behaviour || !behaviour.profile) return null;
             Camera camera = behaviour.GetComponent<Camera>();
-            if (!camera || settings.Technique == AaTechnique.Original) return;
+            if (!camera || settings.Technique == AaTechnique.Original) return null;
             if (!cameras.TryGetValue(camera, out var state))
             {
                 // Follow the serialized pipeline reference; do not assume the game's
@@ -216,11 +334,21 @@ namespace DSPAAMod.Game
                 bool owned = false;
                 foreach (var controller in UnityEngine.Object.FindObjectsOfType<PostEffectController>())
                     if (controller.postScript == behaviour) { owned = true; break; }
-                if (!owned) return;
+                if (!owned) return null;
                 state = new CameraState { Camera = camera, Behaviour = behaviour, Key = ++nextKey };
                 cameras.Add(camera, state);
             }
-            Restore(state); // Also recovers a previous render that was interrupted.
+            return state;
+        }
+        public void BeforeCull(PostProcessingBehaviour behaviour)
+        {
+            if (DiagnosticActive && behaviour) TraceStage("post.preCull-entry", behaviour.GetComponent<Camera>());
+            var state = GetCameraState(behaviour);
+            if (state == null) return;
+            Camera camera = state.Camera;
+            // Recover old render overrides without releasing this frame's Canvas
+            // isolation, which was already consumed by Unity's batch preparation.
+            Restore(state, state.WorldTextFrame == Time.frameCount);
             state.Prepared = false;
             state.SrThisRender = false;
             state.InputsCopied = false;
@@ -305,12 +433,13 @@ namespace DSPAAMod.Game
                         state.OpaqueCapture.Blit(BuiltinRenderTextureType.CameraTarget, state.Targets.OpaqueColor);
                         camera.AddCommandBuffer(CameraEvent.BeforeForwardAlpha, state.OpaqueCapture);
                     }
-                    state.WorldText.Begin(camera, projection);
-                    state.WorldTextFrame = Time.frameCount;
+                    // FG owns the same board through the later H boundary;
+                    // do not suppress or draw it a second time at SR resolve.
+                    if (!OwnsNavigation(camera)) BeginWorldText(state, projection);
                 }
                 catch (Exception error)
                 {
-                    Restore(state);
+                    Restore(state, state.WorldTextFrame == Time.frameCount);
                     state.SrThisRender = false;
                     if (state.Presenter) state.Presenter.enabled = false;
                     Fail(state, error.Message); return;
@@ -334,7 +463,7 @@ namespace DSPAAMod.Game
         {
             if (state.RequestedWidth != width || state.RequestedHeight != height || (state.Targets != null && !state.Targets.Valid))
             {
-                Retire(state);
+                Retire(state, true); // HUD isolation is independent of SR target allocation.
                 state.Key = ++nextKey;
                 state.RequestedWidth = width; state.RequestedHeight = height;
                 state.ReportedPreset = 0;
@@ -517,7 +646,7 @@ namespace DSPAAMod.Game
             if (taa.context == null || !taa.context.camera || !cameras.TryGetValue(taa.context.camera, out var state)) return;
             try
             {
-                int count = state.WorldText.Draw(destination);
+                int count = DrawWorldText(state.WorldText, destination);
                 if (count > 0 && !state.ReportedWorldText)
                 {
                     information("World navigation text: " + count + " renderers after temporal reconstruction at " +
@@ -549,7 +678,17 @@ namespace DSPAAMod.Game
             if (DiagnosticActive) TraceStage("image." + effect.GetType().Name, camera, null, source, destination);
             if (!camera || !cameras.TryGetValue(camera, out var state)) return null;
             bool temporalStack = effect == state.Behaviour;
-            if (temporalStack) state.WorldText.RestoreVisibility();
+            if (temporalStack)
+            {
+                state.WorldText.RestoreVisibility();
+                // Support/size warm-up or a pre-cull failure can leave this frame
+                // on original AA. Put the isolated board back before that PP stack.
+                if (!state.Prepared && state.WorldText.PendingCount > 0)
+                {
+                    try { DrawWorldText(state.WorldText, source); }
+                    catch (Exception error) { Fail(state, error.Message); }
+                }
+            }
             if (!state.SrThisRender || state.Targets == null) return null;
             if (!temporalStack && !state.ImageResult) return null; // An effect before temporal reconstruction.
             if (temporalStack)
@@ -587,17 +726,17 @@ namespace DSPAAMod.Game
             scope.State.ImageResult = scope.Target;
             // Honor Unity's original image-effect chain destinations while retaining
             // a separate native-size chain; later registered effects consume the latter.
-            if (scope.Target != scope.OriginalDestination) FrameGenerationEffects.Copy(scope.Target, scope.OriginalDestination, false);
+            if (scope.Target != scope.OriginalDestination) Graphics.Blit(scope.Target, scope.OriginalDestination);
         }
         public bool Present(Camera camera, RenderTexture source, RenderTexture destination)
         {
             if (!camera || !cameras.TryGetValue(camera, out var state) || !state.SrThisRender) return false;
             RestoreTarget(state);
             RenderTexture final = state.ImageResult ? state.ImageResult : source;
-            if (final != destination) FrameGenerationEffects.Copy(final, destination, true);
+            if (final != destination) Graphics.Blit(final, destination);
             // Graphics.Blit(null) uses Camera.main.targetTexture. That target has
             // already been restored; the world RT must never absorb the screen blit.
-            if (final != state.OriginalTarget && destination != state.OriginalTarget) FrameGenerationEffects.Copy(final, state.OriginalTarget, true);
+            if (final != state.OriginalTarget && destination != state.OriginalTarget) Graphics.Blit(final, state.OriginalTarget);
             state.SrThisRender = false;
             state.ImageResult = null;
             return true;
@@ -614,15 +753,18 @@ namespace DSPAAMod.Game
                 {
                     // A changed/interrupted stack did not invoke temporal resolve.
                     // Preserve visibility this frame, then use the original path.
-                    state.WorldText.Draw(destination);
+                    DrawWorldText(state.WorldText, destination);
                     Fail(state, "Temporal resolve was skipped; navigation text restored after the stack for this fallback frame.");
                 }
             }
             finally { Restore(state); }
         }
-        private static void Restore(CameraState state)
+        private static void Restore(CameraState state, bool keepNavigation = false)
         {
-            try { state.WorldText.End(); }
+            try
+            {
+                if (!keepNavigation) { state.WorldText.End(); state.WorldTextFrame = -1; }
+            }
             finally
             {
                 RestoreTarget(state);
@@ -664,8 +806,9 @@ namespace DSPAAMod.Game
                 cameras.Remove(camera);
             }
         }
-        private void Retire(CameraState state)
+        private void Retire(CameraState state, bool keepNavigation = false)
         {
+            if (!keepNavigation) state.WorldText.Dispose();
             if (state.Presenter) state.Presenter.enabled = false;
             if (state.Targets == null && !state.QueryIssued && !state.SizingAnchor) return;
             Capture?.Cancel(state.Targets, "Camera render targets retired.");
@@ -691,6 +834,7 @@ namespace DSPAAMod.Game
         }
         public void Update()
         {
+            if (navigationFrame != Time.frameCount) EndFrameGenerationNavigation();
             for (int i = 0; i < supportQueries.Length; ++i)
                 if (supportRequested || (settings.Temporal && i == (FsrSelected ? 1 : 0))) UpdateSupport(supportQueries[i]);
             if (diagnosticThrough >= 0 && Time.frameCount > diagnosticThrough) FinishDiagnostic();
@@ -720,6 +864,9 @@ namespace DSPAAMod.Game
         }
         public void Shutdown()
         {
+            Canvas.preWillRenderCanvases -= PrepareCanvasNavigation;
+            EndFrameGenerationNavigation();
+            frameGenerationNavigation.Dispose();
             FinishDiagnostic();
             Capture?.Cancel("Renderer shutdown.");
             foreach (var state in cameras.Values) { Restore(state); Retire(state); }

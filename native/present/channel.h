@@ -1,15 +1,15 @@
 #pragma once
 #include "api.h"
-#include "frame.h"
 #include "facade.h"
+#include "frame.h"
 #include "sl/runtime.h"
-#include "capture.h"
 #include <atomic>
 #include <d3d11.h>
 #include <mutex>
 #include <optional>
 
 namespace dspaa {
+class WorldColor;
 struct PresentationConfiguration {
     uint32_t backend = 0, mode = 0, generatedFrames = 1, reflex = 1;
     float dynamicTargetFrameRate = 0;
@@ -18,9 +18,10 @@ struct PresentationConfiguration {
 };
 struct PresentationSubmission {
     DspAaPresentationInputs metadata{};
-    std::array<Microsoft::WRL::ComPtr<ID3D11Resource>, 7> resources;
-    CapturedUiLease captureLease;
-    std::string incompleteReason;
+    std::array<Microsoft::WRL::ComPtr<ID3D11Resource>, 5> resources;
+    std::shared_ptr<const void> worldLifetime;
+    // Evidence from the captured world RTV, not inferred from swapchain color space.
+    bool hudlessSrgbView = false;
 };
 struct BackendObservation {
     bool generating = false, dynamic = false, vsync = false, quarantined = false;
@@ -45,15 +46,18 @@ class PresentationChannel {
     void reason(const char* text, bool quarantined = false);
     void detach() noexcept;
     DspAaPresentationStatus status() const;
-    std::shared_ptr<SlRuntime> runtime() const { return runtime_; }
-    void bindCapture(const std::shared_ptr<FrameCapture>& capture);
-    std::shared_ptr<FrameCapture> capture() const;
+    std::shared_ptr<SlRuntime> runtime() const {
+        return runtime_;
+    }
+    void bindWorldColor(const std::shared_ptr<WorldColor>& world);
+    std::shared_ptr<WorldColor> worldColor() const;
+
   private:
     std::shared_ptr<SlRuntime> runtime_;
     PresentationLog log_;
     mutable std::mutex mutex_;
     PresentationConfiguration configuration_;
-    std::weak_ptr<FrameCapture> capture_;
+    std::weak_ptr<WorldColor> world_;
     std::unique_ptr<PresentationSubmission> pending_;
     DspAaPresentationStatus status_{};
     uint64_t nextFrame_ = 0, lastPublished_ = 0;
@@ -61,10 +65,12 @@ class PresentationChannel {
 };
 // Called once at the authorized early entry, before presentation hooks/devices.
 // Missing/unavailable SL never prevents the independent Native or FSR paths.
-void initializePresentationRuntime(const std::filesystem::path& runtime, const std::filesystem::path& logs, PresentationLog log) noexcept;
+void initializePresentationRuntime(const std::filesystem::path& runtime, const std::filesystem::path& logs,
+                                   PresentationLog log) noexcept;
 std::shared_ptr<SlRuntime> earlyPresentationRuntime();
 std::string presentationRuntimeFailure();
-std::shared_ptr<PresentationChannel> registerPresentationChannel(const std::filesystem::path& runtime, PresentationLog log);
+std::shared_ptr<PresentationChannel> registerPresentationChannel(const std::filesystem::path& runtime,
+                                                                 PresentationLog log);
 std::shared_ptr<PresentationChannel> presentationChannel();
 void* queuePresentationInputs(const DspAaPresentationInputs* frame);
 void cancelPresentationInputs(void* token);

@@ -22,7 +22,7 @@ namespace DSPAAMod.Interop
     {
         public uint Size, Version;
         public ulong ApplicationFrameId, Generation;
-        public IntPtr Hudless, Depth, Motion, OcclusionAlpha, UiInfluence, FsrDistortion, SlDistortion;
+        public IntPtr Hudless, Depth, Motion, FsrDistortion, SlDistortion;
         public uint RenderWidth, RenderHeight, Flags, Reserved;
         public float JitterX, JitterY, MotionScaleX, MotionScaleY;
         public float Milliseconds, CameraNear, CameraFar, VerticalFov;
@@ -36,6 +36,7 @@ namespace DSPAAMod.Interop
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)] public float[] ClipToPrevClip;
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)] public float[] PrevClipToClip;
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] public int[] GenerationRect;
+        public uint LogicalOutputWidth, LogicalOutputHeight;
         public static NativePresentationInputs Create() => new NativePresentationInputs {
             CameraPosition = new float[3], CameraUp = new float[3], CameraRight = new float[3], CameraForward = new float[3],
             CameraViewToClip = new float[16], ClipToCameraView = new float[16], ClipToPrevClip = new float[16], PrevClipToClip = new float[16],
@@ -68,6 +69,7 @@ namespace DSPAAMod.Interop
     // must neither create a late swap-chain hook nor tear down a live presenter.
     public sealed class PresentationBridge
     {
+        public const uint AbiVersion = 3;
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate uint Abi();
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int ConfigureNative(ref NativePresentationConfiguration value);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int BeginNative(ref NativePresentationBegin value);
@@ -89,7 +91,7 @@ namespace DSPAAMod.Interop
         public static uint StatusSize => (uint)Marshal.SizeOf(typeof(NativePresentationStatus));
         public PresentationBridge(NativeBridge library)
         {
-            if (library.Get<Abi>("DspAaGetPresentationAbiVersion")() != 1 || ConfigurationSize != 32 || BeginSize != 24 || InputsSize != 464 || StatusSize != 472)
+            if (library.Get<Abi>("DspAaGetPresentationAbiVersion")() != AbiVersion || ConfigurationSize != 32 || BeginSize != 24 || InputsSize != 456 || StatusSize != 472)
                 throw new InvalidOperationException("Native/managed presentation ABI mismatch.");
             configure = library.Get<ConfigureNative>("DspAaConfigurePresentation");
             begin = library.Get<BeginNative>("DspAaBeginPresentationFrame");
@@ -101,12 +103,12 @@ namespace DSPAAMod.Interop
             if (RenderEvent == IntPtr.Zero) throw new InvalidOperationException("Missing presentation render event.");
         }
         public bool Configure(NativePresentationConfiguration value)
-        { value.Size = ConfigurationSize; value.Version = 1; return configure(ref value) == 1; }
+        { value.Size = ConfigurationSize; value.Version = AbiVersion; return configure(ref value) == 1; }
         public bool Begin(out NativePresentationBegin value)
-        { value = new NativePresentationBegin { Size = BeginSize, Version = 1 }; return begin(ref value) == 1; }
+        { value = new NativePresentationBegin { Size = BeginSize, Version = AbiVersion }; return begin(ref value) == 1; }
         public bool SimulationEnd(ulong id) => simulationEnd(id) == 1;
         public IntPtr Queue(ref NativePresentationInputs value)
-        { value.Size = InputsSize; value.Version = 1; return queue(ref value); }
+        { value.Size = InputsSize; value.Version = AbiVersion; return queue(ref value); }
         public void Cancel(IntPtr token) { if (token != IntPtr.Zero) cancel(token); }
         public bool TryGetStatus(out NativePresentationStatus value)
         { value = new NativePresentationStatus { Size = StatusSize, MessageBytes = new byte[384] }; return status(ref value) == 1; }

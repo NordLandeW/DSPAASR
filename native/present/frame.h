@@ -16,9 +16,8 @@ struct PresentImage {
 // until their copy fence actually completes, not merely until Present returns.
 struct FrameImages {
     PresentImage finalColor, hudless, depth, motion;
-    PresentImage occlusionAlpha, uiInfluence;
     PresentImage fsrDistortion; // Optional RG normalized UV_after - UV_before.
-    PresentImage slDistortion; // Optional RGBA bidirectional mapping in the SL contract.
+    PresentImage slDistortion;  // Optional RGBA bidirectional mapping in the SL contract.
 };
 struct PresentationFrame {
     uint64_t generation = 0, applicationFrameId = 0;
@@ -27,6 +26,8 @@ struct PresentationFrame {
     Microsoft::WRL::ComPtr<ID3D12Fence> readyFence;
     uint64_t readyValue = 0;
     bool inputsComplete = false, reset = true, depthInverted = false, depthInfinite = false;
+    // R: content-local raster/depth/motion dimensions, independent of the full
+    // display allocation and of generationRect (the content's display extent).
     unsigned renderWidth = 0, renderHeight = 0;
     float jitterX = 0, jitterY = 0, motionScaleX = 1, motionScaleY = 1;
     float deltaMilliseconds = 0, cameraNear = 0, cameraFar = 0, verticalFov = 0;

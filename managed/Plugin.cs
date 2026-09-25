@@ -74,6 +74,7 @@ namespace DSPAAMod
                 try { Presentation = new FrameGenerationController(this, AcquireNative(), fgInitial, text => Logger.LogInfo(text), text => Logger.LogWarning(text)); }
                 catch (Exception error) { Logger.LogWarning("Frame generation unavailable; AA/SR remain independent: " + error.Message); }
                 Renderer = new RenderController(initial, AcquireNative, text => Logger.LogWarning(text), text => Logger.LogInfo(text));
+                Renderer.Presentation = Presentation;
                 Renderer.Capture = new FrameCapture(Path.Combine(Paths.CachePath, "DSPAAMod", "captures"), text => Logger.LogInfo(text));
                 Options = new GraphicsOptions(this);
                 harmony = new Harmony(Id);
@@ -83,7 +84,8 @@ namespace DSPAAMod
             catch (Exception error)
             {
                 harmony?.UnpatchSelf();
-                Presentation?.Dispose();
+                Guard(() => Presentation?.Dispose());
+                Guard(() => Renderer?.Shutdown());
                 Instance = null;
                 Logger.LogError(error);
             }
@@ -131,7 +133,7 @@ namespace DSPAAMod
                 Renderer.Update();
                 Presentation?.Update();
                 Options.Update();
-                if (captureShortcut.Value.IsDown() && Presentation?.Capture?.RequestTrace() != true)
+                if (captureShortcut.Value.IsDown())
                 {
                     if (Settings.Applied.Technique == AaTechnique.Dlss) Renderer.RequestCapture();
                     else Logger.LogInfo("Select DLSS before requesting a frame capture.");

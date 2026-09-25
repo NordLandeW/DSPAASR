@@ -6,9 +6,9 @@ using UnityEngine.Rendering;
 namespace DSPAAMod.Game
 {
     // This unlit, ZTest-Always world HUD is not ordinary opaque scene geometry.
-    // Keep the game's generated TextMesh, material and transform; only move its
-    // draw from the jittered world input to the native-size temporal resolve.
-    internal sealed class WorldTextOverlay
+    // Keep the game's TextMesh or sail Canvas, materials and transforms; only
+    // move their draw to native-size temporal resolve, or after H when using FG.
+    internal sealed class WorldTextOverlay : System.IDisposable
     {
         private struct Entry
         {
@@ -22,24 +22,37 @@ namespace DSPAAMod.Game
         private GameObject group;
         private TextMesh[] texts;
         private Camera camera;
+        private int begunFrame = -1;
+        private string unavailable;
+        private readonly SailCanvasOverlay canvas = new SailCanvasOverlay();
         private Matrix4x4 view, projection;
-        public int PendingCount => entries.Count;
-        public void Begin(Camera current, Matrix4x4 nonJitteredProjection)
+        private Rect viewport;
+        public int PendingCount => entries.Count + canvas.PendingCount;
+        public void SetProjection(Matrix4x4 value) => projection = value;
+        public string Begin(Camera current, Matrix4x4 nonJitteredProjection, bool beforeCanvas = false)
         {
+            // Canvas batches retain their layer before camera pre-cull. Continue
+            // the early scope; restoring/re-borrowing here loses that isolation.
+            if (camera == current && begunFrame == Time.frameCount)
+            {
+                UpdateCamera(current, nonJitteredProjection);
+                return unavailable;
+            }
             End();
-            if (current != GameCamera.main) return;
+            if (!current || current != GameCamera.main) return null;
             if (!indicator) indicator = Object.FindObjectOfType<UISailIndicator>(true);
-            if (!indicator || !indicator.group || !indicator.group.activeInHierarchy) return;
+            if (!indicator || !indicator.group || !indicator.group.activeInHierarchy) return null;
             if (group != indicator.group || texts == null)
             {
                 group = indicator.group;
                 texts = group.GetComponentsInChildren<TextMesh>(true);
             }
             camera = current;
-            view = current.worldToCameraMatrix;
-            projection = nonJitteredProjection;
+            begunFrame = Time.frameCount;
+            UpdateCamera(current, nonJitteredProjection);
             try
             {
+                unavailable = canvas.Begin(current, group, beforeCanvas);
                 foreach (var text in texts)
                 {
                     if (!text || !text.gameObject.activeInHierarchy || string.IsNullOrEmpty(text.text)) continue;
@@ -52,8 +65,15 @@ namespace DSPAAMod.Game
                     if (!material || !material.shader || material.shader.name != "GUI/Text Shader" || material.passCount != 1) continue;
                     if (visibility.Suppress(renderer)) entries.Add(new Entry { Renderer = renderer, Material = material });
                 }
+                return unavailable;
             }
             catch { End(); throw; }
+        }
+        private void UpdateCamera(Camera current, Matrix4x4 nonJitteredProjection)
+        {
+            view = current.worldToCameraMatrix;
+            projection = nonJitteredProjection;
+            viewport = current.pixelRect;
         }
         public void RestoreVisibility() => visibility.Restore();
         public int Draw(RenderTexture destination)
@@ -61,12 +81,12 @@ namespace DSPAAMod.Game
             // Never rely on DrawRenderer bypassing forceRenderingOff. World geometry
             // has finished at OnRenderImage; restore renderers before the explicit draw.
             RestoreVisibility();
-            if (entries.Count == 0 || !camera) { entries.Clear(); return 0; }
+            if (PendingCount == 0 || !camera) { End(); return 0; }
             var previous = RenderTexture.active;
             int count = 0;
             try
             {
-                using (var commands = new CommandBuffer { name = "DSPAAMod native-resolution world text" })
+                if (entries.Count > 0) using (var commands = new CommandBuffer { name = "DSPAAMod native-resolution world text" })
                 {
                     if (destination) commands.SetRenderTarget(destination);
                     else commands.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
@@ -85,18 +105,28 @@ namespace DSPAAMod.Game
                     commands.SetViewProjectionMatrices(camera.worldToCameraMatrix, camera.projectionMatrix);
                     Graphics.ExecuteCommandBuffer(commands);
                 }
-                return count;
+                return count + canvas.Draw(destination, view, projection, viewport);
             }
             finally
             {
                 RenderTexture.active = previous;
                 entries.Clear();
+                canvas.End();
             }
         }
         public void End()
         {
             try { RestoreVisibility(); }
-            finally { entries.Clear(); camera = null; }
+            finally
+            {
+                try { canvas.End(); }
+                finally { entries.Clear(); camera = null; begunFrame = -1; unavailable = null; }
+            }
+        }
+        public void Dispose()
+        {
+            try { End(); }
+            finally { canvas.Dispose(); }
         }
     }
 }

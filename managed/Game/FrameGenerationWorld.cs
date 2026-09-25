@@ -13,23 +13,26 @@ namespace DSPAAMod.Game
     {
         private readonly FrameGenerationController presentation;
         private readonly Action<string> warning;
-        private Camera camera, historyCamera;
+        private Camera camera, depthCamera, historyCamera;
         private DepthTextureMode savedDepth, installedDepth;
-        private bool ownsDepth, history;
-        private ulong seen, copied, previousId, previousGeneration, depthEpoch;
-        public NativeCaptureTexture DepthSource => new NativeCaptureTexture { Resource = depthPointer, Epoch = depthEpoch };
+        private bool ownsDepth, depthHistoryReady, history, previousInputYFlip;
+        private ulong seen, rastered, copied, previousId, previousGeneration;
         public Matrix4x4 UnjitteredProjection => unjittered;
-        private int width, height, scene;
+        private int width, height, scene, rasterWidth, rasterHeight, logicalWidth, logicalHeight;
         private RenderTexture depth, motion;
         private IntPtr depthPointer, motionPointer;
         private Matrix4x4 unjittered, renderedProjection, previousViewProjection;
         private Vector3 previousPosition;
         private Quaternion previousRotation;
         private string lastFailure;
-        private readonly bool traceDepthAttachment = Environment.GetEnvironmentVariable("DSPAASR_CAPTURE_DEPTH_BINDINGS") == "1";
-        private readonly System.Collections.Generic.HashSet<int> tracedDepthScenes = new System.Collections.Generic.HashSet<int>();
+        private Camera eventCamera;
+        private readonly CommandBuffer worldEnd = new CommandBuffer { name = "DSPAASR world-color boundary" };
+        private readonly CommandBuffer worldInputs = new CommandBuffer { name = "DSPAASR independent FG depth/motion" };
         public bool InputsReady => copied != 0 && copied == presentation.ApplicationFrameId;
         public bool OwnsFrameCamera(Camera value) => camera && value == camera && seen == presentation.ApplicationFrameId;
+        internal static bool AcceptsCamera(Camera value) => value && value == GameCamera.main && value.isActiveAndEnabled &&
+            !value.targetTexture && value.targetDisplay == 0 && !value.stereoEnabled && !value.orthographic &&
+            value.rect == new Rect(0,0,1,1) && SystemInfo.supportsMotionVectors;
         public FrameGenerationWorld(FrameGenerationController owner, Action<string> warn)
         {
             presentation = owner; warning = warn;
@@ -39,18 +42,23 @@ namespace DSPAAMod.Game
         }
         public void BeforeCull(Camera value)
         {
-            if (!presentation.Capturing || !value || value != GameCamera.main) return;
+            presentation.NavigationBefore(value);
+            if (!presentation.Capturing || !AcceptsCamera(value)) return;
             ulong id = presentation.ApplicationFrameId;
             if (seen == id) return; // Manual screenshot/preview cannot replace the main-display snapshot.
-            if (value.targetTexture || value.targetDisplay != 0 || value.stereoEnabled || value.orthographic ||
-                value.rect != new Rect(0,0,1,1) || !SystemInfo.supportsMotionVectors) return;
-            RestoreDepth();
+            RequestDepth(value);
             seen = id; copied = 0;
             camera = value;
+            logicalWidth = Screen.width; logicalHeight = Screen.height;
+            rasterWidth = rasterHeight = 0;
             unjittered = renderedProjection = value.projectionMatrix;
-            savedDepth = value.depthTextureMode;
-            installedDepth = savedDepth | DepthTextureMode.Depth | DepthTextureMode.MotionVectors;
-            value.depthTextureMode = installedDepth; ownsDepth = true;
+            presentation.BeginNavigation(value, unjittered);
+            if (eventCamera != value) {
+                if (eventCamera) eventCamera.RemoveCommandBuffer(CameraEvent.AfterEverything, worldEnd);
+                eventCamera = value; eventCamera.AddCommandBuffer(CameraEvent.AfterEverything, worldEnd);
+            }
+            worldEnd.Clear();
+            worldEnd.IssuePluginEventAndData(presentation.RenderEvent, 3, new IntPtr(unchecked((long)id)));
         }
         // Harmony also invokes this AFTER the original PP pre-cull so an inactive
         // TAA's stale nonJitteredProjectionMatrix is never mistaken for this frame.
@@ -60,50 +68,63 @@ namespace DSPAAMod.Game
             var profile = behaviour.profile;
             if (profile && profile.antialiasing.enabled && profile.antialiasing.settings.method == AntialiasingModel.Method.Taa &&
                 !profile.debugViews.willInterrupt) unjittered = camera.nonJitteredProjectionMatrix;
+            presentation.NavigationProjection(camera, unjittered);
         }
         private void BeforeRaster(Camera value)
         {
-            if (presentation.Capturing && camera && value == camera && seen == presentation.ApplicationFrameId)
+            if (presentation.Capturing && camera && value == camera && seen == presentation.ApplicationFrameId) {
+                // The SR target is still bound here. Its final image effect restores
+                // the logical target before onPostRender, so pixelWidth there is L, not R.
+                rasterWidth = value.pixelWidth; rasterHeight = value.pixelHeight;
                 renderedProjection = value.projectionMatrix; // PP may reset it in OnPostRender before our callback.
+            }
         }
         private void AfterRaster(Camera value)
         {
-            if (!presentation.Capturing || !camera || value != camera || seen != presentation.ApplicationFrameId || copied == seen) return;
+            if (!presentation.Capturing || !camera || value != camera || seen != presentation.ApplicationFrameId || rastered == seen) return;
+            rastered = seen; // A repeated render cannot turn the same warm-up frame into valid history.
+            // Enabling motion vectors in pre-cull is too late to provide an
+            // earlier camera transform on this first render. Present Final only
+            // until Unity has completed a render with a persistent request.
+            if (!depthHistoryReady) { depthHistoryReady = true; return; }
             try {
-                if (traceDepthAttachment && tracedDepthScenes.Count < 8 && tracedDepthScenes.Add(GameCamera.sceneIndex)) {
-                    var active = value.activeTexture;
-                    warning("FG depth-attachment diagnostic frame=" + seen + " scene=" + GameCamera.sceneIndex +
-                        " active=" + (active ? active.name : "none") + (active ? " size=" + active.width + "x" + active.height +
-                        " color=" + active.format + " depthBits=" + active.depth + " samples=" + active.antiAliasing +
-                        " colorPtr=0x" + active.GetNativeTexturePtr().ToInt64().ToString("X16") +
-                        " depthPtr=0x" + active.GetNativeDepthBufferPtr().ToInt64().ToString("X16") : ""));
-                }
-                int w = value.pixelWidth, h = value.pixelHeight;
-                if (w <= 0 || h <= 0) return;
+                int w = rasterWidth, h = rasterHeight;
+                if (w <= 0 || h <= 0 || logicalWidth <= 0 || logicalHeight <= 0) return;
                 EnsureTargets(w,h);
-                using (var commands = new CommandBuffer { name = "DSPAASR independent FG depth/motion" }) {
-                    commands.Blit(BuiltinRenderTextureType.Depth, depth);
-                    commands.Blit(BuiltinRenderTextureType.MotionVectors, motion);
-                    Graphics.ExecuteCommandBuffer(commands);
-                }
+                // Built-in depth/motion use Unity's render-texture projection;
+                // H/Final use the native display surface. Transform the texel
+                // domain, vector basis and all camera metadata together.
+                var projection = GL.GetGPUProjectionMatrix(unjittered, true);
+                var raster = GL.GetGPUProjectionMatrix(renderedProjection, true);
+                bool flipY = projection.m11 * unjittered.m11 < 0;
+                var scale = new Vector2(1, flipY ? -1 : 1);
+                var offset = new Vector2(0, flipY ? 1 : 0);
+                var toDisplay = Matrix4x4.Scale(new Vector3(1, scale.y, 1));
+                projection = toDisplay * projection; raster = toDisplay * raster;
+                worldInputs.Clear();
+                worldInputs.Blit(BuiltinRenderTextureType.Depth, depth, scale, offset);
+                worldInputs.Blit(BuiltinRenderTextureType.MotionVectors, motion, scale, offset);
+                Graphics.ExecuteCommandBuffer(worldInputs);
                 ref var inputs = ref presentation.Inputs;
                 inputs.Depth = depthPointer; inputs.Motion = motionPointer;
                 inputs.RenderWidth = (uint)w; inputs.RenderHeight = (uint)h;
-                inputs.MotionScaleX = -w; inputs.MotionScaleY = -h; // Unity current-minus-previous UV -> SDK pixel displacement.
+                inputs.LogicalOutputWidth = (uint)logicalWidth; inputs.LogicalOutputHeight = (uint)logicalHeight;
+                // Blit reorders texels without negating their RG values. Convert
+                // Unity current-minus-previous RT UV to previous-minus-current
+                // display pixels; a reflected Y basis therefore has +height.
+                inputs.MotionScaleX = -w; inputs.MotionScaleY = flipY ? h : -h;
                 inputs.Milliseconds = Mathf.Max(Time.unscaledDeltaTime, .000001f) * 1000;
                 inputs.CameraNear = value.nearClipPlane; inputs.CameraFar = value.farClipPlane;
                 inputs.VerticalFov = value.fieldOfView * Mathf.Deg2Rad;
                 inputs.PreExposure = inputs.ViewSpaceToMeters = 1;
                 inputs.Flags = 16u | (SystemInfo.usesReversedZBuffer ? 4u : 0u);
-                var projection = GL.GetGPUProjectionMatrix(unjittered, true);
-                var raster = GL.GetGPUProjectionMatrix(renderedProjection, true);
                 var anchor = new Vector4(0,0,-1,1);
                 var cleanPoint = projection * anchor; var rasterPoint = raster * anchor;
                 inputs.JitterX = (rasterPoint.x / rasterPoint.w - cleanPoint.x / cleanPoint.w) * w * .5f;
                 inputs.JitterY = -(rasterPoint.y / rasterPoint.w - cleanPoint.y / cleanPoint.w) * h * .5f;
                 var viewProjection = projection * value.worldToCameraMatrix;
                 bool reset = !history || historyCamera != value || previousId + 1 != seen || previousGeneration != presentation.Generation ||
-                    scene != GameCamera.sceneIndex || (value.transform.position - previousPosition).sqrMagnitude > 100f ||
+                    previousInputYFlip != flipY || scene != GameCamera.sceneIndex || (value.transform.position - previousPosition).sqrMagnitude > 100f ||
                     Quaternion.Angle(value.transform.rotation, previousRotation) > 30f;
                 var toPrevious = reset ? Matrix4x4.identity : previousViewProjection * viewProjection.inverse;
                 Store(inputs.CameraViewToClip, projection); Store(inputs.ClipToCameraView, projection.inverse);
@@ -113,9 +134,9 @@ namespace DSPAAMod.Game
                 if (reset) inputs.Flags |= 2u;
                 previousViewProjection = viewProjection; previousPosition = value.transform.position; previousRotation = value.transform.rotation;
                 previousId = seen; previousGeneration = presentation.Generation; scene = GameCamera.sceneIndex; historyCamera = value;
-                history = true; copied = seen;
-                // 'complete' is deliberately NOT set here. The UI capture owner
-                // must prove the matching clean/occlusion/influence planes too.
+                previousInputYFlip = flipY; history = true; copied = seen;
+                // EOF marks these metadata inputs ready. Native publication still
+                // requires the same frame's post-world, pre-screen-UI snapshot.
             } catch (Exception error) {
                 history = false; copied = 0;
                 if (lastFailure != error.Message) { lastFailure = error.Message; warning("FG world inputs unavailable: " + error.Message); }
@@ -131,8 +152,7 @@ namespace DSPAAMod.Game
         private void EnsureTargets(int w, int h)
         {
             if (w == width && h == height && depth && motion && depth.IsCreated() && motion.IsCreated()) return;
-            RetireTargets(); width = w; height = h; history = false; ++depthEpoch;
-            if (depthEpoch == 0) throw new InvalidOperationException("World depth allocation identity wrapped.");
+            RetireTargets(); width = w; height = h; history = false;
             try { depth = Create("FG depth",RenderTextureFormat.RFloat,w,h,out depthPointer);
                 motion = Create("FG motion",RenderTextureFormat.RGHalf,w,h,out motionPointer); }
             catch { RetireTargets(); throw; }
@@ -151,12 +171,32 @@ namespace DSPAAMod.Game
                 Marshal.AddRef(pointer); return texture;
             } catch { texture.Release(); UnityEngine.Object.Destroy(texture); throw; }
         }
-        public void EndFrame() { RestoreDepth(); camera = null; }
+        public void EndFrame()
+        {
+            presentation.EndNavigation();
+            // The request belongs to the active camera, not an individual frame.
+            // Clearing MotionVectors at EOF makes Unity discard its previous VP.
+            // SR may have begun consuming the same flags after our acquisition.
+            // Turning FG off must not erase SR's still-active camera history.
+            if (!depthCamera || depthCamera != GameCamera.main || !depthCamera.isActiveAndEnabled ||
+                (!presentation.TemporalRequested && !presentation.SharesMotionRequest(depthCamera)))
+                RestoreDepth();
+            camera = null; worldEnd.Clear();
+        }
+        private void RequestDepth(Camera value)
+        {
+            const DepthTextureMode required = DepthTextureMode.Depth | DepthTextureMode.MotionVectors;
+            if (ownsDepth && depthCamera == value && (value.depthTextureMode & required) == required) return;
+            RestoreDepth();
+            depthCamera = value; savedDepth = value.depthTextureMode;
+            installedDepth = savedDepth | required;
+            value.depthTextureMode = installedDepth; ownsDepth = true;
+        }
         private void RestoreDepth()
         {
             // Do not overwrite unrelated flag changes made by another component.
-            if (ownsDepth && camera && camera.depthTextureMode == installedDepth) camera.depthTextureMode = savedDepth;
-            ownsDepth = false;
+            if (ownsDepth && depthCamera && depthCamera.depthTextureMode == installedDepth) depthCamera.depthTextureMode = savedDepth;
+            depthCamera = null; ownsDepth = false; depthHistoryReady = false; history = false;
         }
         private void RetireTargets()
         {
@@ -172,7 +212,9 @@ namespace DSPAAMod.Game
         public void Dispose()
         {
             Camera.onPreCull -= BeforeCull; Camera.onPreRender -= BeforeRaster; Camera.onPostRender -= AfterRaster;
-            EndFrame(); RetireTargets();
+            EndFrame(); RestoreDepth(); RetireTargets();
+            if (eventCamera) eventCamera.RemoveCommandBuffer(CameraEvent.AfterEverything, worldEnd);
+            eventCamera = null; worldEnd.Dispose(); worldInputs.Dispose();
         }
     }
 }

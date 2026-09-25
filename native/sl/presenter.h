@@ -36,13 +36,17 @@ struct SlPresenterStatus {
 // and marker calls on its runtime may overlap; lifecycle changes require engine
 // quiescence. This owner creates its queue through the upgraded proxy device and
 // owns the HWND's sole real swapchain. No other backend may overlap it.
+// Final plus HUDless/depth/motion use SDK UI handling without application UI
+// alpha/color tags or optional UI Recomposition. This does not promise the same
+// UI quality as a separately rendered, correctly tagged UI layer.
 class SlPresenter {
   public:
     explicit SlPresenter(const SlPresenterCreateInfo& info);
     ~SlPresenter();
     SlPresenter(const SlPresenter&) = delete;
     SlPresenter& operator=(const SlPresenter&) = delete;
-    HRESULT present(FrameLease frame, const PresentArguments& arguments, const SlGenerationRequest& request) noexcept;
+    HRESULT present(FrameLease frame, const PresentArguments& arguments,
+                    const SlGenerationRequest& request) noexcept;
     HRESULT resize(const DXGI_SWAP_CHAIN_DESC1& description, uint64_t generation) noexcept;
     PresentRetirement stop() noexcept;
     HRESULT setFullscreenState(BOOL fullscreen, IDXGIOutput* output) noexcept;
@@ -59,6 +63,7 @@ class SlPresenter {
     // ownership to the application. The caller closes that returned handle.
     IDXGISwapChain4* swapChainForQueries() const noexcept;
     SlPresenterStatus status() const;
+
   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

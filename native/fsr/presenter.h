@@ -28,8 +28,8 @@ struct FsrPresenterCreateInfo {
 struct FsrPresenterStatus {
     std::string algorithm, swapChainVersion, reason;
     uint64_t applicationPresents = 0;
-    // Callback/dispatch counts are submission evidence, not measured display FPS.
-    uint64_t successfulDispatches = 0, realCallbacks = 0, generatedCallbacks = 0;
+    // Successful FG dispatches are submission evidence, not measured display FPS.
+    uint64_t successfulDispatches = 0;
     uint64_t frameGenerationMemoryBytes = 0, swapChainMemoryBytes = 0;
     bool generationActive = false, providerVerified = false, quarantined = false;
 };
@@ -37,6 +37,8 @@ struct FsrPresenterStatus {
 // One externally serialized caller owns all public operations (including status
 // and queries). SDK callbacks never enter that caller or Unity. This object owns
 // the only real chain on its HWND.
+// Final is the SDK backbuffer; HUDLessColor enables the SDK's UI extraction.
+// No application occlusion alpha, signed residual or UI present callback is used.
 class FsrPresenter {
   public:
     explicit FsrPresenter(const FsrPresenterCreateInfo& info);

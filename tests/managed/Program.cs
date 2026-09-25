@@ -320,29 +320,16 @@ internal static class Program
         var bridge = new NativeBridge(root, Path.Combine(root, "data"));
         var callback = Marshal.GetDelegateForFunctionPointer<RenderEvent>(bridge.RenderEvent);
         var presentation = new PresentationBridge(bridge);
+        Require(PresentationBridge.InputsSize == 456 &&
+            (int)Marshal.OffsetOf<NativePresentationInputs>(nameof(NativePresentationInputs.LogicalOutputWidth)) == 448 &&
+            (int)Marshal.OffsetOf<NativePresentationInputs>(nameof(NativePresentationInputs.LogicalOutputHeight)) == 452,
+            "Presentation logical/display domain extension has the wrong ABI layout");
         Require(presentation.TryGetStatus(out var presentationStatus) && !presentationStatus.Available && presentationStatus.Message.Length > 0,
             "No-bootstrap state invented presentation support or lost its reason");
         Require(!presentation.Begin(out _) && !presentation.Configure(new NativePresentationConfiguration { GeneratedFrames = 1, Reflex = 1 }),
             "A late SR-only DLL created presentation ownership");
         var noFrame = NativePresentationInputs.Create();
         Require(presentation.Queue(ref noFrame) == IntPtr.Zero, "Presentation accepted an unallocated application frame");
-        var capture = new CaptureBridge(bridge, presentation.RenderEvent);
-        Require(capture.TryGetStatus(out var captureStatus) && !captureStatus.Ready && captureStatus.Reason.Length > 0,
-            "Capture ABI invented an early graphics owner in an SR-only process");
-        Require(capture.TryGetDepthCopyResult(out var depthCopyResult) && depthCopyResult.Flags == 0 &&
-            !depthCopyResult.Submitted(1,1,1), "An SR-only process invented a submitted depth-copy receipt");
-        var receipt = new NativeDepthCopyResult { Version = 1, Flags = 3, ApplicationFrameId = 7, Generation = 9, RequestId = 11 };
-        Require(receipt.Submitted(7,9,11) && !receipt.Submitted(8,9,11) && !receipt.Submitted(7,10,11) &&
-            !receipt.Submitted(7,9,12) && !receipt.Submitted(7,9,0), "Depth-copy success escaped its frame/generation/request identity");
-        receipt.Flags = 1;
-        Require(!receipt.Submitted(7,9,11), "An executed but failed depth copy was treated as usable");
-        Require(capture.Queue(new NativeCaptureCommand { ApplicationFrameId = 1, Generation = 1, OcclusionSlot = -1,
-            OcclusionDomain = NativeCaptureDomain.Identity }) == IntPtr.Zero,
-            "Capture queued graphics work without an early facade");
-        capture.Cancel(new IntPtr(123456)); // Opaque late/unknown handles are harmless, not native pointers.
-        Require((int)Marshal.OffsetOf<NativeCaptureCommand>(nameof(NativeCaptureCommand.Source)) == 56 &&
-            (int)Marshal.OffsetOf<NativeCaptureStatus>(nameof(NativeCaptureStatus.ReasonBytes)) == 104,
-            "Capture metadata no longer matches the native command/status layout");
         Require((int)Marshal.OffsetOf<NativeFrame>(nameof(NativeFrame.JitterX)) == 72, "Frame temporal payload has the wrong ABI offset");
         Require(Marshal.SizeOf<NativeFrame>() == 112 && (int)Marshal.OffsetOf<NativeFrame>(nameof(NativeFrame.OutputWidth)) == 96,
             "SR frame extension broke the ABI v2 prefix/size");
