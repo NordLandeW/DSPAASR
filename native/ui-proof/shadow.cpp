@@ -224,6 +224,9 @@ const char* rangeFailure(BoundReadFailure failure) {
 struct ConstantShadow::Impl {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
+    ComPtr<ID3D11DeviceContext4> timeline;
+    ComPtr<ID3D11Fence> completion;
+    uint64_t nextCompletion = 0;
     ComPtr<IUnknown> deviceIdentity;
     const std::shared_ptr<Budget> budget;
     std::mutex adoptionMutex;
@@ -231,7 +234,7 @@ struct ConstantShadow::Impl {
         ComPtr<ID3D11Buffer> source, staging;
         ComPtr<IUnknown> sourceIdentity;
         ComPtr<Facts> value;
-        uint64_t revision = 0, epoch = 0, charged = 0;
+        uint64_t revision = 0, epoch = 0, charged = 0, completionValue = 0;
         bool failed = false;
     };
     std::array<Ticket, maximumPending> tickets;
@@ -244,6 +247,10 @@ struct ConstantShadow::Impl {
         c->GetDevice(&actual);
         if (identity(actual.Get()).Get() != deviceIdentity.Get())
             throw std::invalid_argument("Constant shadow context belongs to another device");
+        ComPtr<ID3D11Device5> newer;
+        if (FAILED(device.As(&newer)) || FAILED(context.As(&timeline)) ||
+            FAILED(newer->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&completion))))
+            throw std::runtime_error("Constant shadow requires its own GPU retirement fence");
     }
     ComPtr<Facts> adopt(ID3D11Resource* resource, const void* initial, const char*& failure) {
         failure = nullptr;
@@ -330,6 +337,8 @@ struct ConstantShadow::Impl {
         }
         if (!empty)
             return "cold-readback-slots-full";
+        if (nextCompletion == UINT64_MAX - 1)
+            return "cold-fence-exhausted";
         ComPtr<ID3D11Predicate> predicate;
         BOOL enabled = FALSE;
         context->GetPredication(&predicate, &enabled);
@@ -361,13 +370,40 @@ struct ConstantShadow::Impl {
         ++budget->queued;
         capture::Bypass bypass;
         context->CopyResource(empty->staging.Get(), source);
+        const auto valueCompleted = ++nextCompletion;
+        if (FAILED(timeline->Signal(completion.Get(), valueCompleted))) {
+            // The copy was already submitted. No successful signal means no
+            // retirement receipt, even if a later ticket's signal succeeds.
+            empty->failed = true;
+            ++budget->failed;
+            return "cold-signal-failed";
+        }
+        empty->completionValue = valueCompleted;
         return "cold-readback-queued";
+    }
+    void retire(Ticket& ticket) noexcept {
+        const auto charge = ticket.charged;
+        ticket = {};
+        budget->bytes.fetch_sub(charge);
+        --budget->pending;
     }
     void collect() noexcept {
         capture::Bypass bypass;
+        const auto completed = completion->GetCompletedValue();
+        // UINT64_MAX denotes device removal, not completion of every ticket.
+        if (completed == UINT64_MAX)
+            return;
         for (auto& ticket : tickets) {
-            if (!ticket.staging || ticket.failed)
+            if (!ticket.staging || !ticket.completionValue || completed < ticket.completionValue)
                 continue;
+            // Stopping discards data, not GPU ownership. Once this exact copy's
+            // fence has retired, discarding needs no CPU staging Map at all.
+            if (!budget->active || ticket.failed) {
+                if (!ticket.failed)
+                    ++budget->stale;
+                retire(ticket);
+                continue;
+            }
             D3D11_MAPPED_SUBRESOURCE mapped{};
             const auto result =
                 context->Map(ticket.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
@@ -378,8 +414,9 @@ struct ConstantShadow::Impl {
                 ++budget->failed;
                 continue;
             }
-            // A successful nonblocking map is the retirement witness, including
-            // for stale revisions. There is no age-based recycling or busy loop.
+            // GPU retirement alone cannot authorize CPU data. Publication still
+            // requires a successful nonblocking Map and the complete identity /
+            // owner / revision / epoch check below.
             try {
                 auto current = facts(ticket.source.Get());
                 auto& value = *ticket.value.Get();
@@ -403,10 +440,7 @@ struct ConstantShadow::Impl {
                 ++budget->failed;
             }
             context->Unmap(ticket.staging.Get(), 0);
-            const auto charge = ticket.charged;
-            ticket = {};
-            budget->bytes.fetch_sub(charge);
-            --budget->pending;
+            retire(ticket);
         }
     }
 };

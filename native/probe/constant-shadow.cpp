@@ -1,3 +1,4 @@
+#include "graphics/dx11-dx12.h"
 #include "ui-proof/shadow.h"
 #include <MinHook.h>
 #include <array>
@@ -52,8 +53,8 @@ struct Gpu {
         if (event)
             CloseHandle(event);
     }
-    // Only the probe waits on an explicit semantic witness. Production shadow
-    // uses DO_NOT_WAIT and has no flush/fence/wait path. Timeout isolates a hang.
+    // Only the probe waits here. Production shadow polls its own GPU fence and
+    // uses DO_NOT_WAIT for active publication, with no flush/wait path.
     void complete() {
         const auto value = ++sequence;
         check(extended->Signal(fence.Get(), value), "Signal probe completion fence");
@@ -82,6 +83,33 @@ struct Gpu {
             }
         }
         return result;
+    }
+};
+// A CPU-signallable private fence makes the unretired branch deterministic.
+// No timing assumption or application/desktop resource is involved. Every exit
+// releases the gate, including an assertion exception before the explicit open.
+struct GpuGate {
+    std::shared_ptr<dspaa::Dx11Dx12> graphics;
+    ComPtr<ID3D12Fence> release;
+    ComPtr<ID3D11Fence> wait;
+    explicit GpuGate(Gpu& gpu) : graphics(dspaa::acquireDx11Dx12(gpu.device.Get())) {
+        check(graphics->device12()->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&release)),
+              "Create private probe gate");
+        ComPtr<ID3D11Device5> device;
+        check(gpu.device.As(&device), "Query private probe gate device");
+        HANDLE shared = nullptr;
+        check(graphics->device12()->CreateSharedHandle(release.Get(), nullptr, GENERIC_ALL, nullptr, &shared),
+              "Share private probe gate");
+        const auto opened = device->OpenSharedFence(shared, IID_PPV_ARGS(&wait));
+        CloseHandle(shared);
+        check(opened, "Open private probe gate in D3D11");
+        check(gpu.extended->Wait(wait.Get(), 1), "Queue private probe GPU gate");
+    }
+    ~GpuGate() {
+        release->Signal(1);
+    }
+    void open() {
+        check(release->Signal(1), "Open private probe GPU gate");
     }
 };
 std::vector<float> values(unsigned bytes, float first) {
@@ -128,9 +156,9 @@ struct Session {
     }
     void collect() {
         gpu.complete();
-        // GPU fence completion does not guarantee that the driver's first
-        // DO_NOT_WAIT staging Map is CPU-ready. Retirement is witnessed only by
-        // a successful Map in collect(), exactly as in the production owner.
+        // GPU retirement does not guarantee that the driver's first DO_NOT_WAIT
+        // Map is CPU-ready. Active publication must also await a successful Map;
+        // stopped owners instead discard already-retired tickets without it.
         // This opt-in probe may wait; the deadline only isolates a driver hang.
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         do {
@@ -354,6 +382,38 @@ int main() {
             released(second);
             first.close();
             second.close();
+            ++scenarios;
+            std::cout << "scenario " << scenarios << " passed\n";
+        }
+        // Unlike CPU readback, stop needs only the copy's GPU retirement. Hold
+        // that copy behind an explicit gate, then complete it without ever
+        // allowing active publication or requiring a CPU staging Map.
+        {
+            auto initial = values(96, 61);
+            auto target = buffer(gpu.device.Get(), 96, D3D11_USAGE_DEFAULT, &initial);
+            Session s(gpu);
+            GpuGate gate(gpu);
+            std::array<float, 4> output{};
+            ShadowReadInfo info;
+            require(!s.read(target.Get(), 48, 4, output, info), "Gated stop fixture was not cold");
+            const auto charged = s.shadow->stats().bytes;
+            s.detach();
+            require(!s.shadow->stop(), "Stop claimed an explicitly blocked GPU copy was retired");
+            require(s.shadow->stats().pending == 1 && s.shadow->stats().bytes == charged,
+                    "Stop recycled or refunded an unretired copy");
+            gpu.unbind();
+            target.Reset();
+            require(s.shadow->stats().liveBuffers == 1,
+                    "Stopped copy lost its source lease before retirement");
+            gate.open();
+            gpu.complete();
+            require(s.shadow->stop(), "GPU-retired stopped copy unnecessarily awaited CPU Map readiness");
+            const auto stopped = s.shadow->stats();
+            require(stopped.pending == 0 && stopped.published == 0 && stopped.copiedBytes == 0 &&
+                        stopped.stale == 1 && stopped.failed == 0,
+                    "Stopped retirement published/copied discarded constants or lost the ticket");
+            released(s);
+            s.close();
             ++scenarios;
             std::cout << "scenario " << scenarios << " passed\n";
         }

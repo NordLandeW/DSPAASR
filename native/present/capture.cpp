@@ -278,9 +278,26 @@ DspAaDepthCopyResult FrameCapture::depthCopyResult() const {
     auto lock=impl_->graphics->lock();return impl_->depthResult;
 }
 bool FrameCapture::stop() noexcept {
-    if(!impl_)return true;
-    try {auto& s=*impl_;auto lock=s.graphics->lock();if(s.stopped)return !s.quarantined;s.stopped=true;
-        if(!s.owner->stop()){s.quarantined=true;return false;}s.proof.reset();return true;
-    }catch(...){impl_->quarantined=true;return false;}
+    if (!impl_)
+        return true;
+    try {
+        auto& s = *impl_;
+        auto lock = s.graphics->lock();
+        if (s.stopped)
+            return !s.quarantined;
+        s.stopped = true;
+        // Close both admissions even when one owner cannot prove retirement.
+        const bool captureRetired = s.owner->stop();
+        const bool proofRetired = !s.proof || s.proof->stop();
+        if (!captureRetired || !proofRetired) {
+            s.quarantined = true;
+            return false;
+        }
+        s.proof.reset();
+        return true;
+    } catch (...) {
+        impl_->quarantined = true;
+        return false;
+    }
 }
 } // namespace dspaa

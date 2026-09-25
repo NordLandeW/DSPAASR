@@ -35,10 +35,11 @@ class ConstantShadow final : public capture::WriteObserver {
     bool read(ID3D11Buffer* buffer, unsigned first, unsigned count, unsigned offset, unsigned components,
               std::array<float, 4>& output, ShadowReadInfo& info) noexcept;
     void collect() noexcept;
-    // Nonblocking. An unretired/failed ticket is not recycled. Destruction with
-    // unknown retirement quarantines its bounded owner, rather than uncharging
-    // live GPU work. Destruction never submits context commands; normal shutdown
-    // calls stop/collect under the graphics lock until tickets have retired.
+    // Nonblocking. Stops adoption/publication, then discards tickets only after
+    // their own copy-completion fence retires; this never requires a CPU Map.
+    // Failed signals, device removal and incomplete copies keep their leases and
+    // charges. Normal shutdown drains the same graphics context, then calls stop
+    // again. Destruction issues no context commands and quarantines unknown work.
     bool stop() noexcept;
     ShadowStats stats() const noexcept;
     void mapped(ID3D11DeviceContext*, ID3D11Resource*, unsigned, D3D11_MAP,

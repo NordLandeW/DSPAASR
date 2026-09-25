@@ -17,9 +17,15 @@ class UiShaderProof {
     ~UiShaderProof();
     UiShaderProof(const UiShaderProof&) = delete;
     UiShaderProof& operator=(const UiShaderProof&) = delete;
+    // Explicit shutdown result for the capture/presentation owner. Only this
+    // closing path may drain the graphics bridge; frame-time inspection never waits.
+    bool stop() noexcept;
+    // The capture owner holds the graphics lock while invoking either policy.
     CaptureUiShaderPolicy inspect(ID3D11PixelShader* shader) noexcept;
-    bool inspectEffect(ID3D11PixelShader* shader, const CaptureScope& scope, CaptureSupport& support) noexcept;
+    bool inspectEffect(ID3D11PixelShader* shader, const CaptureScope& scope,
+                       CaptureSupport& support) noexcept;
     UiProofStatus status() const;
+
   private:
     struct Impl;
     std::shared_ptr<Impl> impl_;

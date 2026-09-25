@@ -277,6 +277,7 @@ struct UiShaderProof::Impl final : DeviceObserver {
     std::function<void(const char*)> log;
     mutable std::mutex statusMutex;
     UiProofStatus observation;
+    bool stopped = false, retired = false; // Serialized by the graphics lock.
     // Moving pool origins must not consume the diagnostic budget every frame.
     // Deduplicate by pass/pin/failure and binding layout (not firstConstant),
     // with a fixed maximum of 16 records for this owner, never reset per frame.
@@ -596,12 +597,33 @@ UiShaderProof::UiShaderProof(std::shared_ptr<Dx11Dx12> graphics, std::function<v
     impl_ = std::move(next);
 }
 UiShaderProof::~UiShaderProof() {
+    // Explicit stop owns graphics commands and its result. Constructor unwind
+    // or an omitted stop must not start a drain from a destructor; the shadow
+    // retains any unproven GPU work without issuing context commands.
+    if (impl_)
+        capture::detachWrites(impl_->shadow.get());
+}
+bool UiShaderProof::stop() noexcept {
     if (!impl_)
-        return;
+        return true;
     capture::detachWrites(impl_->shadow.get());
     try {
         auto lock = impl_->graphics->lock();
-        const bool retired = impl_->shadow->stop();
+        if (impl_->stopped)
+            return impl_->retired;
+        impl_->stopped = true;
+        try {
+            impl_->retired = impl_->shadow->stop();
+            if (!impl_->retired) {
+                // Only shutdown waits. Admission is already closed, and this
+                // same-context drain covers every issued cold-copy signal.
+                impl_->graphics->drain();
+                impl_->retired = impl_->shadow->stop();
+            }
+        } catch (...) {
+            // Unknown retirement remains charged/retained and propagates to
+            // FrameCapture and the presentation owner, not just this log.
+        }
         const auto s = impl_->shadow->stats();
         if (impl_->log) {
             char message[512];
@@ -615,14 +637,21 @@ UiShaderProof::~UiShaderProof() {
                 static_cast<unsigned long long>(s.wcNanoseconds), static_cast<unsigned long long>(s.queued),
                 static_cast<unsigned long long>(s.published), static_cast<unsigned long long>(s.stale),
                 static_cast<unsigned long long>(s.pending), static_cast<unsigned long long>(s.failed),
-                static_cast<unsigned long long>(s.attachmentFailures), retired ? 1u : 0u);
-            impl_->log(message);
+                static_cast<unsigned long long>(s.attachmentFailures), impl_->retired ? 1u : 0u);
+            try {
+                impl_->log(message);
+            } catch (...) {
+            }
         }
+        return impl_->retired;
     } catch (...) {
+        return false;
     }
 }
 CaptureUiShaderPolicy UiShaderProof::inspect(ID3D11PixelShader* shader) noexcept {
     try {
+        if (impl_->stopped)
+            return {};
         impl_->shadow->collect();
         const char* reason = "";
         std::array<char, 65> shaderHash{};
@@ -647,6 +676,8 @@ bool UiShaderProof::inspectEffect(ID3D11PixelShader* shader, const CaptureScope&
                                   CaptureSupport& support) noexcept {
     support = {};
     try {
+        if (impl_->stopped)
+            return false;
         impl_->shadow->collect();
         std::string reason;
         std::array<char, 65> shaderHash{};
