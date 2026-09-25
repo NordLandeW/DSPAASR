@@ -41,13 +41,13 @@ namespace DSPAAMod
             try
             {
                 technique = Config.Bind("Antialiasing", "Technique", AaTechnique.Original,
-                    "Original preserves game AA; Fxaa/Taa use the game's filters; Dlss/Fsr use the selected resolution mode; Fsr always selects the analytical algorithm. Legacy Dlaa migrates to Dlss with native-resolution DLAA. Changing this file requires restart.");
+                    "Original preserves game AA; Fxaa/Taa use the game's filters; Dlss/Fsr use the selected resolution mode. Legacy Dlaa migrates to Dlss with native-resolution DLAA. Changing this file requires restart.");
                 model = Config.Bind("Antialiasing", "Model", ModelSelection.Recommended,
                     "Recommended: K for DLAA/Quality/Balanced, M for Performance, L for UltraPerformance. Explicit CNN/K/L/M overrides persist independently of resolution mode.");
                 resolution = Config.Bind("Antialiasing", "Resolution", ResolutionMode.Dlaa,
                     "DLSS/FSR resolution mode: Dlaa means native-resolution AA (DLAA or FSR Native AA); SR modes query the selected SDK for actual lower world-render dimensions. Model selection remains independent. Changing this file requires restart.");
                 fsrSharpness = Config.Bind("FSR", "Sharpness", 0f,
-                    "Analytical FSR RCAS sharpening, 0 (disabled) to 1 (maximum). Independent of DLSS model. Changing this file requires restart.");
+                    "FSR RCAS sharpening, 0 (disabled) to 1 (maximum). Independent of DLSS model. Changing this file requires restart.");
                 captureShortcut = Config.Bind("Diagnostics", "CaptureShortcut", new KeyboardShortcut(KeyCode.F10, KeyCode.LeftControl, KeyCode.LeftShift),
                     "Explicitly trace two Unity frames in LogOutput.log and capture consecutive DLSS submissions (raw color/depth/motion/output) into BepInEx/cache/DSPAAMod/captures. An incomplete pair fails at the end of the trace window. Nothing runs until this shortcut is pressed; captures can be large. Changing this file requires restart.");
                 AaSettings initial;
@@ -78,7 +78,7 @@ namespace DSPAAMod
                 Options = new GraphicsOptions(this);
                 harmony = new Harmony(Id);
                 harmony.PatchAll(typeof(Plugin).Assembly);
-                Logger.LogInfo("DSPAASR loaded. DLSS and analytical FSR use the selected AA/SR resolution mode; animated objects may exhibit visual artifacts. No driver settings are modified.");
+                Logger.LogInfo("DSPAASR loaded. DLSS and FSR use the selected AA/SR resolution mode; animated objects may exhibit visual artifacts. No driver settings are modified.");
             }
             catch (Exception error)
             {

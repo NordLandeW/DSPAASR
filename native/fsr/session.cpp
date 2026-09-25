@@ -111,6 +111,8 @@ FsrResolution FsrDevice::resolution(unsigned width, unsigned height, unsigned qu
     size.pOutRenderWidth = &result.width;
     size.pOutRenderHeight = &result.height;
     fsrCheck(impl_->api.Query(nullptr, &size.header), "Query FSR render dimensions");
+    if (!result.width || !result.height || result.width > width || result.height > height)
+        throw std::runtime_error("Invalid render dimensions returned by FSR");
     int32_t phases = 0;
     ffxQueryDescUpscaleGetJitterPhaseCount jitter{};
     jitter.header = {FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT, &version.header};
@@ -118,8 +120,8 @@ FsrResolution FsrDevice::resolution(unsigned width, unsigned height, unsigned qu
     jitter.displayWidth = width;
     jitter.pOutPhaseCount = &phases;
     fsrCheck(impl_->api.Query(nullptr, &jitter.header), "Query FSR jitter phases");
-    if (!result.width || !result.height || result.width > width || result.height > height || phases <= 0)
-        throw std::runtime_error("Invalid dimensions or jitter phase count returned by FSR");
+    if (phases <= 0)
+        throw std::runtime_error("Invalid jitter phase count returned by FSR");
     result.phases = static_cast<unsigned>(phases);
     return result;
 }

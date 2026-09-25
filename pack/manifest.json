@@ -1,6 +1,6 @@
 {
     "name": "DSPAASR",
-    "description": "Anti-aliasing and super resolution for Dyson Sphere Program. Choose TAA, NVIDIA DLAA/DLSS or analytical AMD FSR 3.1 Native AA/SR from the game's graphics settings. Includes independent DLSS CNN/K/L/M model selection.",
+    "description": "Anti-aliasing and super resolution for Dyson Sphere Program. Choose TAA, NVIDIA DLAA/DLSS or AMD FSR 3.1 Native AA/SR from the game's graphics settings. Includes independent DLSS CNN/K/L/M model selection.",
     "version_number": "1.1.0",
     "dependencies": [
         "xiaoye97-BepInEx-5.4.17"

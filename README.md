@@ -1,10 +1,10 @@
 # DSPAASR
 
-DSPAASR expands the game's graphics settings with more anti-aliasing and super-resolution options. Alongside MSAA and FXAA, you can select the game's built-in TAA, use NVIDIA DLAA at native resolution, or enable DLSS or analytical AMD FSR 3.1 Super Resolution. FSR also provides native-resolution anti-aliasing.
+DSPAASR expands the game's graphics settings with more anti-aliasing and super-resolution options. Alongside MSAA and FXAA, you can select the game's built-in TAA or enable DLSS or AMD FSR 3.1 Super Resolution.
 
-After installation, open the game's **Graphics** settings to choose your anti-aliasing / super-resolution mode and configuration. DLSS resolution modes and model presets can be selected independently.
+After installation, open the game's **Graphics** settings to choose your anti-aliasing / super-resolution mode and configuration. SR resolution modes and model presets can be selected independently.
 
-Super resolution supports **DLSS and analytical FSR 3.1**. FSR is not restricted to AMD hardware and does not select the hardware-specific ML provider. It requires a compatible D3D12/Shader Model 6.2 device on the same adapter as the game's D3D11 renderer. The screenshots below compare the earlier DLSS/native-AA modes.
+Super resolution supports **DLSS and FSR 3.1**.
 
 ![Six-way anti-aliasing and super-resolution comparison](https://raw.githubusercontent.com/NordLandeW/DSPAASR/v1.0.0/docs/images/DSPAASR-comparison.png)
 
@@ -12,9 +12,9 @@ Super resolution supports **DLSS and analytical FSR 3.1**. FSR is not restricted
 
 ![MSAA 8x on the outer quarters and DLAA in the middle half](https://raw.githubusercontent.com/NordLandeW/DSPAASR/v1.0.0/docs/images/DSPAASR-MSAA8x-DLAA-MSAA8x.png)
 
-DLSS, including DLAA, can introduce visual artifacts:
+DLSS, including its DLAA mode, can introduce the following known visual artifacts:
 
-- **Transformer K** may make some particle effects less visible.
+- **CNN/Transformer K** may make some particle effects less visible.
 - **Transformer M/L** are more demanding on the GPU.
 - **All models** may misinterpret some rotating material animations, smearing their detail into what looks like a stationary ring.
 - Moving objects may exhibit ghosting.
@@ -23,11 +23,11 @@ This mod only provides partial fixes for some of the more noticeable visual issu
 
 -----------
 
-DSPAASR 扩展了游戏的画质设置，提供更多抗锯齿与超分辨率选项。除了 MSAA 和 FXAA，还可以选择游戏内置的 TAA、原生分辨率下的 NVIDIA DLAA，或启用 DLSS、分析式 AMD FSR 3.1 超分辨率。FSR 也提供原生分辨率抗锯齿。
+DSPAASR 扩展了游戏的画质设置，提供更多抗锯齿与超分辨率选项。除了 MSAA 和 FXAA，还可以选择游戏内置的 TAA，或启用 DLSS 与 AMD FSR 3.1 超分辨率。
 
-安装后，进入游戏原生的**画质设置**界面，即可调整抗锯齿／超分辨率选项及其配置。DLSS 的分辨率档位与模型配置可以独立选择。
+安装后，进入游戏原生的**画质设置**界面，即可调整抗锯齿／超分辨率选项及其配置。分辨率档位与模型配置可以独立选择。
 
-超分辨率支持 **DLSS 与分析式 FSR 3.1**。FSR 不限定 AMD 显卡，也不选择硬件专属的 ML 实现；需要与游戏 D3D11 渲染器位于同一显卡的兼容 D3D12／Shader Model 6.2 设备。以下截图仍是此前 DLSS／原生抗锯齿模式的对照。
+超分辨率支持 **DLSS 与 FSR 3.1**。
 
 ![Six-way anti-aliasing and super-resolution comparison](https://raw.githubusercontent.com/NordLandeW/DSPAASR/v1.0.0/docs/images/DSPAASR-comparison.png)
 
@@ -35,9 +35,9 @@ DSPAASR 扩展了游戏的画质设置，提供更多抗锯齿与超分辨率选
 
 ![MSAA 8x on the outer quarters and DLAA in the middle half](https://raw.githubusercontent.com/NordLandeW/DSPAASR/v1.0.0/docs/images/DSPAASR-MSAA8x-DLAA-MSAA8x.png)
 
-DLSS（包括 DLAA 模式）可能引入一些视觉问题：
+DLSS（包括 DLAA 模式）可能引入一些已知的视觉问题：
 
-- **Transformer K** 可能使部分粒子效果变得不明显。
+- **CNN/Transformer K** 可能使部分粒子效果变得不明显。
 - **Transformer M/L** 对 GPU 性能的要求较高。
 - **所有模型**都可能错误处理部分旋转的材质动画，将细节涂抹成静止的圆环。
 - 移动物件可能出现拖影。

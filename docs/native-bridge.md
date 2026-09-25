@@ -46,7 +46,7 @@ The caller spatially upscales the actual input into the output before the native
 
 The official NGX D3D11 API saves/restores immediate-context state (integration guide section 5.2.5). The switching probe additionally checks selected viewport/topology/compute-shader state across calls; it is not an exhaustive proof of every binding or a substitute for Unity testing.
 
-## Analytical FSR extension and cross-API ownership
+## FSR extension and cross-API ownership
 
 FSR is an additive extension of ABI 2; it does not reinterpret the frame's reserved fields. `DspAaQueueFsrFrame(frame, parameters)` takes the same 112-byte frame plus a **40-byte** `DspAaFsrParameters`: size, near/far clip distances, vertical FOV in radians, pre-exposure, view-space-to-meters, sharpening strength, zero reserved word, then an optional opaque-only color pointer at offset 32. The optional texture is input-sized RGBA16F/SRV on the same D3D11 device and is retained with all other frame inputs. The caller supplies perspective camera parameters, physical near/far distances, finite positive exposure/scale and sharpening in [0,1]; the backend handles reversed-depth near/far ordering. Preset/model evidence applies to NGX only.
 

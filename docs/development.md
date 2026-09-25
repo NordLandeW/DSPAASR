@@ -1,13 +1,13 @@
 # Developing DSPAASR
 
-DSPAASR uses a custom Direct3D 11 NGX bridge, a same-adapter D3D11/D3D12 analytical FSR bridge and a BepInEx 5 adapter. This guide covers building, packaging and testing the integration. For installation and graphics settings, see the [project README](../README.md) and [settings guide](usage.md).
+DSPAASR uses a custom Direct3D 11 NGX bridge, a same-adapter D3D11/D3D12 FSR bridge and a BepInEx 5 adapter. This guide covers building, packaging and testing the integration. For installation and graphics settings, see the [project README](../README.md) and [settings guide](usage.md).
 
 Run the commands below from the repository root. The managed assembly name, native ABI and `dspaa.mod` configuration identity retain their original names for compatibility.
 
 ## Scope
 
 - Native-resolution DLAA and genuine lower-resolution DLSS Super Resolution, with SDK-selected input dimensions and native-resolution output/UI.
-- Analytical FSR 3.1.5 Native AA and four SR modes, with SDK-selected dimensions/jitter, automatic reactive masks and optional RCAS sharpening. Unity stays on D3D11; copies and GPU fence waits cross to a same-adapter D3D12 queue.
+- FSR 3.1.5 Native AA and four SR modes, with SDK-selected dimensions/jitter, automatic reactive masks and optional RCAS sharpening. Unity stays on D3D11; copies and GPU fence waits cross to a same-adapter D3D12 queue.
 - Explicit preset/model selection, independent from SR Quality/Balanced/Performance modes.
 - CNN and Transformer choices must reflect the model actually used. An accepted NGX create/evaluate call alone is not evidence that a deprecated preset was honored.
 - No frame generation, ray reconstruction, driver overrides or save conversion. The runtime does not replace game assemblies.
