@@ -2,6 +2,7 @@
 #include "blit.h"
 #include "capture/hooks.h"
 #include "constants.h"
+#include "default-ui.h"
 #include "effect-pins.h"
 #include "effects.h"
 #include "shadow.h"
@@ -36,7 +37,9 @@ enum class Kind : uint32_t {
     TextAlpha,
     TextAdditive,
     Translucent,
-    Dashboard
+    Dashboard,
+    DefaultVs,
+    DefaultPremultiplied
 };
 struct ShaderFacts {
     Kind kind = Kind::Unknown;
@@ -72,7 +75,8 @@ ShaderFacts identify(const void* bytes, SIZE_T count, bool vertex) {
         {"4EFB1D2E69625325E72BF9F8BE691CD0BB617F529B45476198DA99439C8B17E4", Kind::WidgetVs},
         {"7BAE2FE4BECBAE50E41A68CF246CA69FF7731F1A8F23E04D5A6006AB8923EF80", Kind::NavigationVs},
         {"B62E9EFD8A2B6998BC87351E8B724353DED29A9B271C9911458CF3691508782C", Kind::TextVs},
-        {"3D1189B9D29D5856637982D29525018F3869A4D86470D37B0A390C248D281D4C", Kind::TranslucentVs}};
+        {"3D1189B9D29D5856637982D29525018F3869A4D86470D37B0A390C248D281D4C", Kind::TranslucentVs},
+        {"BB6C244F507942E083B2328D0C3B4E2519D666D81805CC4F1EACB676F7CECB0C", Kind::DefaultVs}};
     const std::pair<const char*, Kind> ps[] = {
         {"8ECF949216A72CCD1876C6BDDECD8C0F30350760B9D18E64A708FF1BE4069FF6", Kind::WidgetAlpha},
         {"5D87E3C3507B018417B015C61CC62829F356D7863A3DB252DE42ED71874C5DFB", Kind::WidgetAdditive},
@@ -81,7 +85,13 @@ ShaderFacts identify(const void* bytes, SIZE_T count, bool vertex) {
         {"F182860B81EBA71D21BD9CC893171EB91DDF6536BB16A2CC4388612AE07F3782", Kind::TextAdditive},
         {"8A833F28E7BC58605EAD70ECB5B23EDEA711EF0AAA30C17474D6335A47ECC07C", Kind::Translucent},
         {"43CF3CFDD35AE60322ABEA09F56E1D2EDF9B6CEC29A7D01CB00F7DB8EE87F483", Kind::Translucent},
-        {"6205AA6AA3C822E607830C1E1574874F1C2E21DABF6151497F26EC0ED1171754", Kind::Dashboard}};
+        {"6205AA6AA3C822E607830C1E1574874F1C2E21DABF6151497F26EC0ED1171754", Kind::Dashboard},
+        // Exact non-stereo UI/Default variants: none, alpha clip, rect, both.
+        // All four pair with DefaultVs; a shader name never grants admission.
+        {"C3F5AA2458CBF03ED2AFACC862A26BA8AF0CFF47B8844409B688D6FB3835D5F0", Kind::DefaultPremultiplied},
+        {"942B42EA9E10BFC8B5212419D6141F5069D98BE9FC26DFD698D4F937E36D4074", Kind::DefaultPremultiplied},
+        {"A1FC44C15A7AD1C264788712EEC3218413B7A7E8FCA072B305EE8ECBBA9BF7DD", Kind::DefaultPremultiplied},
+        {"6FF5417FDDF3DF7D4431E39BD03A2891B2B7E66E23B1AD6DB02F7B3AD6E5020B", Kind::DefaultPremultiplied}};
     const auto* begin = vertex ? vs : ps;
     const auto n = vertex ? std::size(vs) : std::size(ps);
     for (size_t i = 0; i < n; ++i)
@@ -588,6 +598,23 @@ struct UiShaderProof::Impl final : DeviceObserver {
         LayoutFacts input;
         if (!data(layout.Get(), layoutKey, input) || !input.color32)
             return reject("UI COLOR0 is not verified UNORM Color32");
+        if (ps.kind == Kind::DefaultPremultiplied) {
+            if (vs.kind != Kind::DefaultVs || !texture(0, 0))
+                return reject("Default UI requires its exact VS and UNORM main texture/sampler");
+            std::array<float, 4> color{}, sampleAdd{}, gamma{};
+            // These offsets belong to each stage's actual b0 binding window.
+            // The stages need not share a buffer, slice, or update revision.
+            if (!constants(true, 0, 32, 4, color) || !constants(false, 0, 48, 4, sampleAdd) ||
+                !constants(true, 0, 104, 1, gamma))
+                return reject("Default UI tint/sample-add/gamma CB words are not observed at their bindings");
+            if (const auto* failure = proof::defaultUiFailure(color, sampleAdd, gamma[0]))
+                return reject(failure);
+            CaptureUiShaderPolicy policy;
+            policy.unitAlphaVerified = true;
+            policy.nonnegativeRgbVerified = true;
+            policy.finiteRgbVerified = true;
+            return policy; // Existing contribution path; no new fragment/signed fallback.
+        }
         if (ps.kind == Kind::Translucent) {
             std::array<float, 4> sampleAdd{};
             if (vs.kind != Kind::TranslucentVs || !texture(0, 0) || !constants(false, 2, sampleAdd) ||

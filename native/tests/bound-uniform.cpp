@@ -1,4 +1,5 @@
 #include "ui-proof/constants.h"
+#include "ui-proof/default-ui.h"
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -7,7 +8,83 @@
 
 namespace {
 void require(bool value,const char* reason) {
-    if(!value){std::cerr<<reason<<'\n';std::exit(1);}
+    if (!value) {
+        std::cerr << reason << '\n';
+        std::exit(1);
+    }
+}
+void defaultUiConstants() {
+    using dspaa::proof::defaultUiFailure;
+    const std::array<float, 4> tint{1, 2, 4, 0.5f}, add{0, 1, 2, 0};
+    require(!defaultUiFailure(tint, add, 0.f), "Finite nonnegative HDR UI tint/sample-add was rejected");
+    for (float alpha : {0.f, 1.f}) {
+        auto color = tint;
+        color[3] = alpha;
+        require(!defaultUiFailure(color, add, 0.f), "Legal UI material alpha endpoint was rejected");
+    }
+    auto signedZero = add;
+    signedZero[3] = -0.f;
+    require(!defaultUiFailure(tint, signedZero, 0.f),
+            "Arithmetic sample-add zero was confused with a raw shader boolean");
+    const auto infinity = std::numeric_limits<float>::infinity();
+    const auto nan = std::numeric_limits<float>::quiet_NaN();
+    for (float alpha : {-0.01f, std::nextafter(1.f, infinity), infinity, -infinity, nan}) {
+        auto color = tint;
+        color[3] = alpha;
+        require(defaultUiFailure(color, add, 0.f), "Out-of-range/nonfinite material alpha was certified");
+    }
+    for (float alpha : {-0.01f, 0.01f, infinity, -infinity, nan}) {
+        auto sampleAdd = add;
+        sampleAdd[3] = alpha;
+        require(defaultUiFailure(tint, sampleAdd, 0.f), "Nonzero/nonfinite alpha sample-add was certified");
+    }
+    for (unsigned channel = 0; channel < 3; ++channel) {
+        for (float invalid : {-0.01f, infinity, -infinity, nan}) {
+            auto color = tint;
+            color[channel] = invalid;
+            color[3] = 0;
+            require(defaultUiFailure(color, add, 0.f), "Zero alpha hid signed/nonfinite pre-premultiply RGB");
+            auto sampleAdd = add;
+            sampleAdd[channel] = invalid;
+            color = tint;
+            color[channel] = 0;
+            require(defaultUiFailure(color, sampleAdd, 0.f), "Zero tint hid invalid sampled RGB arithmetic");
+        }
+    }
+    const auto maximum = std::numeric_limits<float>::max();
+    auto color = tint;
+    color[0] = maximum;
+    require(!defaultUiFailure(color, add, 0.f), "Finite maximum tint without RGB amplification was rejected");
+    auto amplified = add;
+    amplified[0] = 1;
+    require(defaultUiFailure(color, amplified, 0.f),
+            "Finite inputs with overflowing RGB product were certified");
+    color[0] = maximum / 4;
+    require(!defaultUiFailure(color, amplified, 0.f), "Safe large finite RGB product was rejected");
+    // This exact real product fits FP32, but rounding (sampleAdd + 1) upward
+    // before multiplication makes the actual shader multiply overflow.
+    color[0] = std::bit_cast<float>(std::uint32_t{0x737ffffc});
+    amplified[0] = std::bit_cast<float>(std::uint32_t{0x4b800001});
+    require(defaultUiFailure(color, amplified, 0.f),
+            "RGB proof ignored the intermediate FP32 addition rounding");
+
+    // The gamma flag is an integer CB word, including when it looks like float
+    // -0 or a denormal. Read its actual lane through a nonzero binding window;
+    // neither the range reader nor the numerical admission may normalize bits.
+    for (std::uint32_t word : {0u, 1u, 0x80000000u, 0x3f800000u, 0x7fc00000u, 0xffffffffu}) {
+        unsigned observed = 0;
+        auto cell = [&](unsigned offset, std::array<float, 4>& result) {
+            observed = offset;
+            result = {9, 9, std::bit_cast<float>(word), 9};
+            return offset == 352;
+        };
+        std::array<float, 4> gamma{};
+        require(dspaa::proof::readBoundFloats(512, 16, 16, 104, 1, cell, gamma) && observed == 352 &&
+                    std::bit_cast<std::uint32_t>(gamma[0]) == word,
+                "Gamma CB word changed bits or ignored its shader binding window");
+        require((defaultUiFailure(tint, add, gamma[0]) == nullptr) == (word == 0),
+                "Default UI movc condition was treated as floating-point zero instead of raw zero bits");
+    }
 }
 }
 int main() {
@@ -97,5 +174,6 @@ int main() {
         require(reads.empty() && value==std::array<float,4>{} && failure!=BoundReadFailure::None,
             "Invalid range touched memory, exposed stale data or lost its failure category");
     }
-    std::cout<<"Bound uniform components: allocation/window intersection, remote cells, tails, overflow and fail-closed reads passed\n";
+    defaultUiConstants();
+    std::cout<<"Bound uniform components and Default UI numerical admission: binding windows, raw gamma bits, alpha and finite nonnegative RGB passed\n";
 }
