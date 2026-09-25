@@ -101,11 +101,17 @@ void STDMETHODCALLTYPE drawAuto(ID3D11DeviceContext* self) {
 void STDMETHODCALLTYPE indexedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buffer, UINT offset) {
     using F = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
     Operation op; op.kind = OperationKind::UnsupportedDraw;
+    op.indirectKind = IndirectDrawKind::IndexedInstanced;
+    op.indirectArguments = buffer;
+    op.indirectOffset = offset;
     invoke(self, op, [&] { original<39, F>()(self, buffer, offset); });
 }
 void STDMETHODCALLTYPE indirect(ID3D11DeviceContext* self, ID3D11Buffer* buffer, UINT offset) {
     using F = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
     Operation op; op.kind = OperationKind::UnsupportedDraw;
+    op.indirectKind = IndirectDrawKind::Instanced;
+    op.indirectArguments = buffer;
+    op.indirectOffset = offset;
     invoke(self, op, [&] { original<40, F>()(self, buffer, offset); });
 }
 void STDMETHODCALLTYPE begin(ID3D11DeviceContext* self, ID3D11Asynchronous* query) {

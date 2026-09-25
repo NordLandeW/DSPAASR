@@ -1,4 +1,5 @@
 #include "capture/gpu.h"
+#include "capture/hooks.h"
 #include "capture/owner.h"
 #include "ui-proof/blit.h"
 #include "ui-proof/shadow.h"
@@ -112,6 +113,7 @@ class Fixture {
     unsigned checkedFrames = 0;
     unsigned diagnosticCalls = 0;
     decltype(dspaa::CaptureOwnerCreateInfo::effectShaderPolicy) specialEffect;
+    decltype(dspaa::CaptureOwnerCreateInfo::unsupportedDraw) specialUnsupported;
 
     Fixture() {
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
@@ -185,6 +187,10 @@ class Fixture {
         info.unannotatedDraw = [this](ID3D11RenderTargetView*) {
             ++diagnosticCalls;
             throw std::runtime_error("Fixture diagnostic failure must not change application drawing");
+        };
+        info.unsupportedDraw = [this](const dspaa::CaptureScope& scope, const dspaa::capture::Operation& op) {
+            if (specialUnsupported)
+                specialUnsupported(scope, op);
         };
         capture = std::make_unique<dspaa::CaptureOwner>(info);
     }
@@ -772,6 +778,67 @@ void sharedUavInvalidation(Fixture& f) {
         originalOnlyUavInvalidation(f, &scope, true);
     }
 }
+void indirectDiagnostic(Fixture& f) {
+    for (const bool indexed : {false, true}) {
+        // Prefix catches accidentally reporting a zero argument offset. The extra
+        // word is unused by the nonindexed command, not an inferred draw count.
+        const std::array<UINT, 6> words{0, 3, 1, 0, 0, 0};
+        D3D11_BUFFER_DESC description{};
+        description.ByteWidth = static_cast<UINT>(sizeof(words));
+        description.Usage = D3D11_USAGE_DEFAULT;
+        description.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
+        const D3D11_SUBRESOURCE_DATA initial{words.data(), 0, 0};
+        ComPtr<ID3D11Buffer> arguments;
+        dspaa::graphicsCheck(f.device->CreateBuffer(&description, &initial, &arguments),
+                             "Create rejected indirect arguments");
+        const std::array<uint16_t, 3> indices{0, 1, 2};
+        description.ByteWidth = static_cast<UINT>(sizeof(indices));
+        description.MiscFlags = 0;
+        description.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        const D3D11_SUBRESOURCE_DATA indexData{indices.data(), 0, 0};
+        ComPtr<ID3D11Buffer> indexBuffer;
+        dspaa::graphicsCheck(f.device->CreateBuffer(&description, &indexData, &indexBuffer),
+                             "Create rejected indirect indices");
+        f.begin();
+        f.uiScope();
+        f.blend(D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_INV_SRC_ALPHA);
+        f.parameters({1, 0, 0, 0.5f});
+        f.context->IASetIndexBuffer(indexBuffer.Get(), DXGI_FORMAT_R16_UINT, 0);
+        unsigned calls = 0;
+        bool association = false;
+        f.specialUnsupported = [&](const dspaa::CaptureScope& scope, const dspaa::capture::Operation& op) {
+            ++calls;
+            ComPtr<ID3D11PixelShader> actual;
+            f.context->PSGetShader(&actual, nullptr, nullptr);
+            association = scope.kind == dspaa::CaptureScopeKind::FullOnlyUiCoverage && scope.passId == 1 &&
+                          op.kind == dspaa::capture::OperationKind::UnsupportedDraw &&
+                          op.indirectKind == (indexed ? dspaa::capture::IndirectDrawKind::IndexedInstanced
+                                                      : dspaa::capture::IndirectDrawKind::Instanced) &&
+                          op.indirectArguments == arguments.Get() && op.indirectOffset == sizeof(UINT) &&
+                          actual.Get() == f.solid.Get();
+            throw std::runtime_error("Deliberately failing indirect diagnostic");
+        };
+        auto draw = [&] {
+            if (indexed)
+                f.context->DrawIndexedInstancedIndirect(arguments.Get(), sizeof(UINT));
+            else
+                f.context->DrawInstancedIndirect(arguments.Get(), sizeof(UINT));
+        };
+        draw();
+        require(calls == 1 && association,
+                "Indirect rejection diagnostic lost actual scope/call association");
+        draw();
+        require(calls == 1, "A later draw replaced the first-rejection diagnostic");
+        f.specialUnsupported = {};
+        f.end();
+        const auto status = f.capture->status();
+        require(!status.cleanComplete && !status.colorReplays && !status.coverageReplays,
+                "Indirect diagnostic authorized capture replay");
+        f.bindings(f.full, f.solid.Get());
+        close(f.read(f.full.texture.Get()).at(4, 4, 0), 0.8f,
+              "Throwing indirect diagnostic suppressed or duplicated the original draw");
+    }
+}
 void nativeClipTransfer(Fixture& f) {
     using Vertex = dspaa::proof::ClipBlitVertex;
     const std::array<Vertex, 4> quad{
@@ -1066,6 +1133,7 @@ int main() {
         unscopedMissingInput(fixture);
         originalOnlyUavInvalidation(fixture);
         sharedUavInvalidation(fixture);
+        indirectDiagnostic(fixture);
         nativeClipTransfer(fixture);
         fragmentNonfiniteRgb(fixture); fragmentMixedScopes(fixture); fragmentStencilClip(fixture);
         fragmentSampleMask(fixture); fragmentWritableOverlap(fixture); fragmentOptInGates(fixture);

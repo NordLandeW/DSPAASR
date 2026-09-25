@@ -9,6 +9,8 @@ enum class OperationKind {
     ClearView, Discard, Update, GenerateMips, Dispatch, ExecuteList,
     QueryBegin, QueryEnd, CpuWrite, UavWrite, ResourceLod
 };
+// Descriptive metadata only. Indirect/auto calls remain unsupported for replay.
+enum class IndirectDrawKind { Auto, IndexedInstanced, Instanced };
 // Exact direct draw arguments, observed before the application's call. These
 // describe IA consumption; they never authorize geometry or a replay themselves.
 struct DrawArguments {
@@ -32,6 +34,9 @@ struct Operation {
     const D3D11_RECT* rectangles = nullptr;
     unsigned rectangleCount = 0;
     DrawArguments draw;
+    IndirectDrawKind indirectKind = IndirectDrawKind::Auto;
+    ID3D11Buffer* indirectArguments = nullptr; // Borrowed for this synchronous observation only.
+    unsigned indirectOffset = 0;
 };
 // Stack-only synchronous call. run() suppresses nested driver entry-point
 // aliases, and guarantees the application's original operation runs once.

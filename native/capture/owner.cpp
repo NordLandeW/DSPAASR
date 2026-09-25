@@ -644,8 +644,15 @@ struct CaptureOwner::Impl final : capture::Observer, std::enable_shared_from_thi
             case OperationKind::UnsupportedDraw: {
                 const bool shared = scope && (scope->kind == CaptureScopeKind::SharedPreparation ||
                                               scope->kind == CaptureScopeKind::ExternalBlurPublication);
-                if (scope && !shared)
+                if (scope && !shared) {
+                    if (state.reason.empty() && info.unsupportedDraw) {
+                        try {
+                            info.unsupportedDraw(*scope, operation);
+                        } catch (...) {
+                        }
+                    }
                     failure("Indirect/auto draw has no bounded capture replay contract");
+                }
                 drawOutputs([&](Record& output, ID3D11RenderTargetView*) {
                     if (!shared && output.clean)
                         failure("An unsupported draw changed a captured dependency");

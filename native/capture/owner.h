@@ -10,6 +10,7 @@
 namespace dspaa {
 namespace capture {
 struct DrawArguments;
+struct Operation;
 }
 // All calls below execute in the ORIGINAL Unity immediate-context command order
 // (normally ordered render events), never by setting a main-thread global flag.
@@ -97,6 +98,9 @@ struct CaptureOwnerCreateInfo {
     // Optional read-only diagnostic before the first unexplained color write.
     // Failures in this callback never suppress or replay the original draw.
     std::function<void(ID3D11RenderTargetView*)> unannotatedDraw;
+    // Exact scope/call association for a first indirect/auto rejection. Borrowed
+    // metadata is valid only during this read-only, exception-isolated callback.
+    std::function<void(const CaptureScope&, const capture::Operation&)> unsupportedDraw;
     // These bound owned capture memory/leases, not frame-time correctness.
     unsigned maximumInFlightFrames = 3;
     unsigned maximumTrackedTextures = 128;

@@ -1,5 +1,6 @@
 #include "capture.h"
 #include "capture-trace.h"
+#include "capture/hooks.h"
 #include "channel.h"
 #include "scene-depth.h"
 #include "ui-proof/guard.h"
@@ -82,6 +83,9 @@ struct FrameCapture::Impl {
     uint32_t lastOperation = 0;
     uint64_t lastPass = 0;
     std::set<std::tuple<uint32_t, uint64_t, std::string, std::string>> unannotatedDiagnostics;
+    static constexpr size_t maximumDiagnostics = 16;
+    std::set<std::tuple<CaptureScopeKind, uint64_t, capture::IndirectDrawKind, std::string, std::string>>
+        unsupportedDiagnostics;
     Impl(std::shared_ptr<Dx11Dx12> bridge, PresentationLog output)
         : graphics(std::move(bridge)), log(output) {
         if (!graphics)
@@ -99,8 +103,12 @@ struct FrameCapture::Impl {
         };
         char diagnostic[2]{};
         if (GetEnvironmentVariableA("DSPAASR_CAPTURE_TRACE_WRITES", diagnostic, sizeof(diagnostic)) == 1 &&
-            diagnostic[0] == '1')
+            diagnostic[0] == '1') {
             info.unannotatedDraw = [this](ID3D11RenderTargetView* target) { traceUnannotated(target); };
+            info.unsupportedDraw = [this](const CaptureScope& scope, const capture::Operation& operation) {
+                traceUnsupported(scope, operation);
+            };
+        }
         owner = std::make_unique<CaptureOwner>(info);
         ComPtr<ID3D11Device5> device;
         graphicsCheck(graphics->device11()->QueryInterface(IID_PPV_ARGS(&device)),
@@ -112,7 +120,6 @@ struct FrameCapture::Impl {
         observation.flags = 1;
     }
     void traceUnannotated(ID3D11RenderTargetView* target) {
-        constexpr size_t maximumDiagnostics = 16;
         if (!log || unannotatedDiagnostics.size() >= maximumDiagnostics)
             return;
         auto* context = graphics->context11();
@@ -146,6 +153,58 @@ struct FrameCapture::Impl {
                       description.Width, description.Height, description.Format, input.Get(),
                       viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height, ps.c_str(),
                       vs.c_str());
+        log(text);
+    }
+    void traceUnsupported(const CaptureScope& scope, const capture::Operation& operation) {
+        if (!log || unsupportedDiagnostics.size() >= maximumDiagnostics)
+            return;
+        auto* context = graphics->context11();
+        ComPtr<ID3D11PixelShader> pixel;
+        ComPtr<ID3D11VertexShader> vertex;
+        context->PSGetShader(&pixel, nullptr, nullptr);
+        context->VSGetShader(&vertex, nullptr, nullptr);
+        const auto ps = UiShaderProof::shaderFingerprint(pixel.Get()),
+                   vs = UiShaderProof::shaderFingerprint(vertex.Get());
+        if (!unsupportedDiagnostics.emplace(scope.kind, scope.passId, operation.indirectKind, ps, vs).second)
+            return;
+        const char* call = "DrawAuto";
+        switch (operation.indirectKind) {
+        case capture::IndirectDrawKind::Auto:
+            break;
+        case capture::IndirectDrawKind::IndexedInstanced:
+            call = "DrawIndexedInstancedIndirect";
+            break;
+        case capture::IndirectDrawKind::Instanced:
+            call = "DrawInstancedIndirect";
+            break;
+        }
+        D3D11_BUFFER_DESC arguments{};
+        if (operation.indirectArguments)
+            operation.indirectArguments->GetDesc(&arguments);
+        ComPtr<ID3D11RenderTargetView> target;
+        ComPtr<ID3D11Resource> output;
+        ComPtr<ID3D11Texture2D> image;
+        context->OMGetRenderTargets(1, &target, nullptr);
+        if (target)
+            target->GetResource(&output);
+        D3D11_TEXTURE2D_DESC description{};
+        if (output && SUCCEEDED(output.As(&image)))
+            image->GetDesc(&description);
+        D3D11_VIEWPORT viewport{};
+        UINT count = 1;
+        context->RSGetViewports(&count, &viewport);
+        char text[1024];
+        std::snprintf(
+            text, sizeof(text),
+            "capture.unsupported-draw frame=%llu generation=%llu scope=%u pass=0x%llX call=%s "
+            "arguments=%p argumentOffset=%u argumentBytes=%u argumentUsage=%u argumentBind=0x%X "
+            "argumentMisc=0x%X output=%p size=%ux%u format=%u viewport=%.9g,%.9g,%.9g,%.9g PS=%s VS=%s",
+            static_cast<unsigned long long>(frame), static_cast<unsigned long long>(generation),
+            static_cast<unsigned>(scope.kind), static_cast<unsigned long long>(scope.passId), call,
+            static_cast<void*>(operation.indirectArguments), operation.indirectOffset, arguments.ByteWidth,
+            arguments.Usage, arguments.BindFlags, arguments.MiscFlags, static_cast<void*>(output.Get()),
+            description.Width, description.Height, description.Format, viewport.TopLeftX, viewport.TopLeftY,
+            viewport.Width, viewport.Height, ps.c_str(), vs.c_str());
         log(text);
     }
     CaptureTexture resolve(const CaptureTexture& value,bool bound) {
