@@ -2,7 +2,7 @@
 
 ## Status and requirements
 
-DSPAASR adds native anti-aliasing controls, NVIDIA DLAA/DLSS and analytical AMD FSR 3.1.5 Native AA/Super Resolution to the game's graphics settings. FSR uses the official analytical provider, not FSR's hardware-specific ML implementation. The tested GPU is an RTX 4070 SUPER; this is not an exhaustive cross-GPU compatibility result. Moving objects, particles and animated materials can show artifacts. Menu layout across UI scales and the complete scene/resize lifecycle require broader testing.
+DSPAASR adds native anti-aliasing controls, NVIDIA DLAA/DLSS and AMD FSR 3.1.5 Native AA/Super Resolution to the game's graphics settings. The tested GPU is an RTX 4070 SUPER; this is not an exhaustive cross-GPU compatibility result. Moving objects, particles and animated materials can show artifacts. Menu layout across UI scales and the complete scene/resize lifecycle require broader testing.
 
 Target: Dyson Sphere Program's Unity 2022.3.62f3c1 Mono build on Windows x64, D3D11 and BepInEx 5.4.x. DLSS/DLAA additionally require a supported NVIDIA RTX GPU and a compatible driver; FSR and the original AA modes do not have that NVIDIA-only requirement. FSR additionally requires D3D12/Shader Model 6.2, D3D11 shared fences and compatible shared texture formats on the same graphics adapter. Unity itself remains on D3D11; the FSR bridge has additional copies and synchronization costs. An unsupported backend/device, missing runtime or unverified preset leaves original game AA available. Other mods changing the same AA controls/render hooks may be incompatible. Hot-unloading the native plugin is not supported; restart the game to remove it.
 
@@ -24,7 +24,7 @@ Open the game's graphics options. The former MSAA/FXAA rows become up to three a
 
 When graphics settings are opened, DLSS capability is checked on the game's actual rendering device. The DLSS entry is disabled while checking or when unsupported, with an explanation beneath the AA controls. Non-NVIDIA devices and unsupported graphics backends are rejected before NGX is loaded; NVIDIA devices are checked through NGX rather than an RTX model-name list. A driver-update requirement is shown when the runtime reports one. Original AA choices remain available. Existing saved DLSS/model/resolution values are preserved, but rendering uses the game's original AA while DLSS is unavailable. After correcting a runtime/driver problem, restart the game to check again.
 
-FSR is checked independently on the same actual rendering device. A non-NVIDIA adapter is not rejected merely by vendor name, and a failed DLSS check does not disable a supported FSR entry. The check must establish interop and an analytical provider before selection; it does not claim compatibility from a GPU-name list. The runtime file reports 4.1.1.2740, while the selected analytical algorithm is 3.1.5—these are different version fields. Missing or incompatible FSR components leave original AA available without silently selecting ML or changing the saved backend.
+FSR is checked independently on the game's actual rendering device, including cross-API resource sharing and FSR 3.1.5 availability. A failed DLSS check leaves a supported FSR entry available. Missing or incompatible FSR components preserve the saved selection and use original game AA as a fallback.
 
 Opening the menu does not alter existing game settings. Explicit AA selections choose one technique rather than retaining an invisible MSAA/FXAA combination. Model selection and resolution mode are independent:
 
@@ -62,7 +62,7 @@ For FSR, set `Technique = Fsr` and choose the same `Resolution` values. `Resolut
 
 `BepInEx/LogOutput.log` reports the requested and observed preset when a camera first succeeds. Detailed vendor diagnostics are under `BepInEx/cache/DSPAAMod/ngx.log`. The bridge requires a matching **application-controlled runtime creation log**; it never treats the value saved in the configuration as proof of the actual model.
 
-For FSR, successful camera status identifies the analytical provider and actual input/output sizes instead of an NVIDIA preset. Provider selection is made and verified through the official runtime API. FSR has no CNN/K/L/M setting.
+For FSR, successful camera status reports the runtime-verified FSR version and actual input/output sizes.
 
 NVIDIA App/driver overrides can replace the runtime or preset. A driver-controlled result is reported as a failure instead of silently accepting a different model. This mod **does not modify any driver profile**. If an override interferes, review the game's applicable NVIDIA settings yourself; the developer-only profile tool is exclusively for `ngx-probe.exe`, not the game. After correcting the cause, applying settings again retries the camera.
 
@@ -89,6 +89,7 @@ Use a disposable/test save or a session with autosaving disabled, not an unprote
 - DLAA/FSR Native AA and all four SR modes report the actual expected input/output dimensions; the world source is low-resolution for SR, without shrinking the HUD or later postprocessing.
 - Floating navigation text remains readable, correctly oriented and at its original world position/size in DLAA and SR; entering/leaving flight, hiding the indicator, and switching to TAA do not leave missing or duplicate glyphs. Check Bloom/color response as well as the raw-input exclusion.
 - All three rows and later options fit at the actual UI scale; original resolution/Bloom dropdowns and new dropdowns are clickable and not occluded. Apply, Cancel, Defaults, reopening and restarting preserve the intended selections.
+- Test the first graphics-menu opening after an English cold start, then a Chinese cold start and live language switching. A successful language switch after the controls were already created does not cover first-time initialization.
 - CNN/K/L/M each match the runtime's actual preset, and switching creates/resets the appropriate temporal feature.
 - Camera pans, rapid turns, zoom/FOV changes, scene/menu transitions, floating-origin changes and resizing do not keep obsolete history.
 - Inspect belts, ships, moving machines, particles, transparency and distant thin structures for missing-object motion, ghosting or smearing. Unity's camera-motion buffer alone does not prove object-motion coverage.
