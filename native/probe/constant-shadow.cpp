@@ -151,7 +151,7 @@ ComPtr<ID3D11Buffer> byteBuffer(ID3D11Device* device, unsigned bytes, unsigned b
 std::vector<unsigned char> byteValues(unsigned count, unsigned char salt) {
     std::vector<unsigned char> result(count);
     for (unsigned i = 0; i < count; ++i)
-        result[i] = static_cast<unsigned char>(i ^ salt);
+        result[i] = static_cast<unsigned char>(i ^ (i >> 8) ^ (i >> 16) ^ salt);
     return result;
 }
 void writeBytes(Gpu& gpu, ID3D11Buffer* target, const std::vector<unsigned char>& data) {
@@ -227,7 +227,8 @@ void released(Session& session) {
         std::cerr << "release: bytes=" << stats.bytes << " live=" << stats.liveBuffers
                   << " pending=" << stats.pending << " queued=" << stats.queued
                   << " published=" << stats.published << " stale=" << stats.stale << '\n';
-    require(stats.bytes == 0 && stats.liveBuffers == 0, "Resource retirement leaked a shadow or COM cycle");
+    require(stats.bytes == 0 && stats.liveBuffers == 0 && stats.iaResidentPages == 0,
+            "Resource retirement leaked a shadow, IA page or COM cycle");
 }
 } // namespace
 int main() {
@@ -707,7 +708,8 @@ int main() {
             ++scenarios;
             std::cout << "scenario " << scenarios << " passed\n";
         }
-        // The same demanded cells are refreshed by a real dynamic WC upload.
+        // A real dynamic WC upload refreshes the two demanded physical pages,
+        // including the short tail. Cold GPU copies still cover only 39 bytes.
         // The obsolete partial staging lease remains owned until its fence retires.
         {
             constexpr unsigned bytes = 256 * 1024 + 7, offset = bytes - 25;
@@ -723,7 +725,10 @@ int main() {
             require(s.shadow->readBytes(target.Get(), offset, sizeof(output), output.data(), info) &&
                         std::memcmp(output.data(), replacement.data() + offset, sizeof(output)) == 0,
                     "Sparse IA WC update failed to refresh its nonaligned tail");
-            require(s.shadow->stats().wcBytes == 39 && s.shadow->stats().wcCopies == 1 &&
+            require(s.shadow->stats().wcBytes == ConstantShadow::iaPageBytes + 7 &&
+                        s.shadow->stats().wcCopies == 1 &&
+                        s.shadow->stats().iaWcBytes == ConstantShadow::iaPageBytes + 7 &&
+                        s.shadow->stats().iaWcCopies == 1 && s.shadow->stats().iaResidentPages == 2 &&
                         s.shadow->stats().pending == 1 && s.shadow->stats().peakBytes < bytes,
                     "IA WC observation scanned the whole pool or freed a pending range");
             s.collect();
@@ -793,6 +798,261 @@ int main() {
                     "Stopped IA retirement published discarded bytes or bypassed its ticket");
             released(s);
             s.close();
+            ++scenarios;
+            std::cout << "scenario " << scenarios << " passed\n";
+        }
+        // New offsets can be certified by bytes actually copied at Unmap, even
+        // when that individual offset was never requested. A merely registered
+        // lookahead page, however, must remain unknown until a real observation.
+        {
+            constexpr unsigned page = ConstantShadow::iaPageBytes, bytes = 3 * page + 7;
+            const auto initial = byteValues(bytes, 0x18), replacement = byteValues(bytes, 0xB4);
+            auto target = byteBuffer(gpu.device.Get(), bytes, D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DYNAMIC,
+                                     initial.data());
+            Session s(gpu);
+            ShadowReadInfo info;
+            std::array<unsigned char, 2> output{};
+            require(!s.shadow->readBytes(target.Get(), 32, sizeof(output), output.data(), info),
+                    "Forward IA fixture did not begin with genuinely cold bytes");
+            writeBytes(gpu, target.Get(), replacement);
+            require(s.shadow->readBytes(target.Get(), 96, sizeof(output), output.data(), info) &&
+                        std::memcmp(output.data(), replacement.data() + 96, sizeof(output)) == 0,
+                    "New same-page IA offset was not learned from the actual WC mapping");
+            require(s.shadow->readBytes(target.Get(), page + 16, sizeof(output), output.data(), info) &&
+                        std::memcmp(output.data(), replacement.data() + page + 16, sizeof(output)) == 0,
+                    "Observed forward page was still forced through a stale cold ticket");
+            output.fill(9);
+            require(!s.shadow->readBytes(target.Get(), 2 * page + 16, sizeof(output), output.data(), info) &&
+                        output == std::array<unsigned char, 2>{},
+                    "Newly registered lookahead was trusted without observing its bytes");
+            const auto stats = s.shadow->stats();
+            require(stats.iaReadHits == 2 && stats.iaReadMisses == 2 && stats.iaWcBytes == 2 * page &&
+                        stats.iaWcCopies == 1 && stats.queued == 1,
+                    "IA accounting did not distinguish full reads from bounded WC page copies");
+            s.collect();
+            require(s.shadow->stats().stale == 1 && s.shadow->stats().published == 0,
+                    "Old page ticket survived a later resource revision");
+            target.Reset();
+            released(s);
+            s.close();
+            ++scenarios;
+            std::cout << "scenario " << scenarios << " passed\n";
+        }
+        // A streaming cursor advances by a page every write. The next page is
+        // captured before that new offset is read; demand older than the bounded
+        // working set must be evicted rather than accumulating forever.
+        {
+            constexpr unsigned page = ConstantShadow::iaPageBytes;
+            constexpr unsigned steps = 3 * ConstantShadow::maximumIaPages, bytes = (steps + 2) * page + 7;
+            auto data = byteValues(bytes, 0x11);
+            auto target = byteBuffer(gpu.device.Get(), bytes, D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DYNAMIC,
+                                     data.data());
+            Session s(gpu);
+            ShadowReadInfo info;
+            std::array<unsigned char, 2> output{};
+            require(!s.shadow->readBytes(target.Get(), 16, sizeof(output), output.data(), info),
+                    "Sliding IA fixture did not register its initial demand");
+            for (unsigned i = 1; i <= steps; ++i) {
+                data = byteValues(bytes, static_cast<unsigned char>(i));
+                writeBytes(gpu, target.Get(), data);
+                const auto offset = i * page + 16;
+                require(s.shadow->readBytes(target.Get(), offset, sizeof(output), output.data(), info) &&
+                            std::memcmp(output.data(), data.data() + offset, sizeof(output)) == 0,
+                        "Sliding IA offset did not use this revision's already observed forward page");
+                require(s.shadow->stats().iaResidentPages <= ConstantShadow::maximumIaPages,
+                        "Sliding IA reads accumulated unbounded resident pages");
+            }
+            require(s.shadow->stats().iaReadHits == steps && s.shadow->stats().iaReadMisses == 1 &&
+                        s.shadow->stats().iaEvictedPages > 0 && s.shadow->stats().peakBytes < bytes &&
+                        s.shadow->stats().iaWcBytes <=
+                            uint64_t(steps) * ConstantShadow::maximumIaPages * page,
+                    "Streaming IA working set escaped its page or copied-byte policy");
+            s.collect();
+            output.fill(9);
+            require(!s.shadow->readBytes(target.Get(), 16, sizeof(output), output.data(), info) &&
+                        output == std::array<unsigned char, 2>{},
+                    "Evicted IA data remained readable merely because its address was once seen");
+            data = byteValues(bytes, 0xC9);
+            writeBytes(gpu, target.Get(), data);
+            require(s.shadow->readBytes(target.Get(), 16, sizeof(output), output.data(), info) &&
+                        std::memcmp(output.data(), data.data() + 16, sizeof(output)) == 0,
+                    "A demanded evicted page could not recover from a later real write");
+            target.Reset();
+            released(s);
+            s.close();
+            ++scenarios;
+            std::cout << "scenario " << scenarios << " passed\n";
+        }
+        // Partial UpdateSubresource establishes only its actual bytes, including
+        // sub-cell, cross-cell and physical-tail updates. Known neighbors can be
+        // merged, but a two-byte write must never certify a whole cell or page.
+        {
+            constexpr unsigned page = ConstantShadow::iaPageBytes, bytes = 3 * page + 7;
+            const auto initial = byteValues(bytes, 0x31);
+            auto target = byteBuffer(gpu.device.Get(), bytes, D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT,
+                                     initial.data());
+            Session s(gpu);
+            ShadowReadInfo info;
+            std::array<unsigned char, 4> wide{};
+            require(!s.shadow->readBytes(target.Get(), page + 4, sizeof(wide), wide.data(), info),
+                    "Partial IA fixture did not start unknown");
+            const std::array<unsigned char, 2> patch{0xEF, 0x7F};
+            const D3D11_BOX tiny{page + 5, 0, 0, page + 7, 1, 1};
+            gpu.context->UpdateSubresource(target.Get(), 0, &tiny, patch.data(), 0, 0);
+            std::array<unsigned char, 2> pair{};
+            require(s.shadow->readBytes(target.Get(), page + 5, sizeof(pair), pair.data(), info) &&
+                        pair == patch,
+                    "A real two-byte IA update was lost because its cell was not fully observed");
+            wide.fill(9);
+            require(!s.shadow->readBytes(target.Get(), page + 4, sizeof(wide), wide.data(), info) &&
+                        wide == std::array<unsigned char, 4>{},
+                    "Two-byte IA update promoted unobserved bytes from the same cell");
+            const std::array<unsigned char, 4> crossing{0x01, 0x7F, 0xFF, 0x80};
+            const D3D11_BOX middle{page + 15, 0, 0, page + 19, 1, 1};
+            gpu.context->UpdateSubresource(target.Get(), 0, &middle, crossing.data(), 0, 0);
+            require(s.shadow->readBytes(target.Get(), page + 15, sizeof(wide), wide.data(), info) &&
+                        wide == crossing,
+                    "Cross-cell IA update changed exact raw bits");
+            std::array<unsigned char, 8> unknown;
+            unknown.fill(9);
+            require(!s.shadow->readBytes(target.Get(), page + 13, sizeof(unknown), unknown.data(), info) &&
+                        unknown == std::array<unsigned char, 8>{},
+                    "Cross-cell update certified untouched neighboring bytes");
+            require(!s.shadow->readBytes(target.Get(), bytes - 2, sizeof(pair), pair.data(), info),
+                    "Unobserved physical IA tail was inferred from another page");
+            const D3D11_BOX tail{bytes - 2, 0, 0, bytes, 1, 1};
+            gpu.context->UpdateSubresource(target.Get(), 0, &tail, patch.data(), 0, 0);
+            require(s.shadow->readBytes(target.Get(), bytes - 2, sizeof(pair), pair.data(), info) &&
+                        pair == patch,
+                    "Actual two-byte physical tail could not be read");
+            std::array<unsigned char, 3> tailUnknown{9, 9, 9};
+            require(!s.shadow->readBytes(target.Get(), bytes - 3, sizeof(tailUnknown), tailUnknown.data(),
+                                         info) &&
+                        tailUnknown == std::array<unsigned char, 3>{},
+                    "Physical tail update promoted its untouched leading byte");
+            const D3D11_BOX wholePage{page, 0, 0, 2 * page, 1, 1};
+            gpu.context->UpdateSubresource(target.Get(), 0, &wholePage, initial.data() + page, 0, 0);
+            gpu.context->UpdateSubresource(target.Get(), 0, &tiny, patch.data(), 0, 0);
+            std::array<unsigned char, 8> expected{};
+            std::memcpy(expected.data(), initial.data() + page + 3, expected.size());
+            expected[2] = patch[0];
+            expected[3] = patch[1];
+            require(s.shadow->readBytes(target.Get(), page + 3, sizeof(unknown), unknown.data(), info) &&
+                        unknown == expected,
+                    "Partial IA update failed to preserve previously proved neighboring bytes");
+            wide.fill(9);
+            require(!s.shadow->readBytes(target.Get(), 2 * page - 2, sizeof(wide), wide.data(), info) &&
+                        wide == std::array<unsigned char, 4>{},
+                    "Cross-page miss exposed a partial prefix from the already proved page");
+            const D3D11_BOX pageBoundary{2 * page - 2, 0, 0, 2 * page + 2, 1, 1};
+            gpu.context->UpdateSubresource(target.Get(), 0, &pageBoundary, crossing.data(), 0, 0);
+            require(s.shadow->readBytes(target.Get(), 2 * page - 2, sizeof(wide), wide.data(), info) &&
+                        wide == crossing,
+                    "Cross-page IA update used the wrong source offset or promoted the wrong bytes");
+            s.collect();
+            require(s.shadow->stats().queued == 1 && s.shadow->stats().stale == 1 &&
+                        s.shadow->stats().published == 0 && s.shadow->stats().iaWcCopies == 0,
+                    "Superseded cold data changed partial byte validity or WC accounting");
+            target.Reset();
+            released(s);
+            s.close();
+            ++scenarios;
+            std::cout << "scenario " << scenarios << " passed\n";
+        }
+        // A completed ticket cannot recreate a page evicted while its GPU lease
+        // was pending. The following copy may publish only its own 16 real bytes,
+        // not the rest of the allocated page or the registered lookahead page.
+        {
+            constexpr unsigned page = ConstantShadow::iaPageBytes;
+            constexpr unsigned lastPage = ConstantShadow::maximumIaPages + 2,
+                               bytes = (lastPage + 2) * page + 7;
+            const auto initial = byteValues(bytes, 0x79);
+            auto target = byteBuffer(gpu.device.Get(), bytes, D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DEFAULT,
+                                     initial.data());
+            Session s(gpu);
+            ShadowReadInfo info;
+            std::array<unsigned char, 2> output{};
+            require(!s.shadow->readBytes(target.Get(), 16, sizeof(output), output.data(), info),
+                    "Eviction fixture did not queue its first actual GPU range");
+            for (unsigned i = 2; i <= lastPage; ++i)
+                require(
+                    !s.shadow->readBytes(target.Get(), i * page + 16, sizeof(output), output.data(), info),
+                    "Pending unrelated copy certified a new IA page");
+            const auto before = s.shadow->stats();
+            require(before.queued == 1 && before.pending == 1 && before.iaEvictedPages > 0 &&
+                        before.iaResidentPages == ConstantShadow::maximumIaPages,
+                    "IA eviction recycled a pending copy or escaped its resident limit");
+            s.collect();
+            require(s.shadow->stats().published == 0 && s.shadow->stats().stale == 1 &&
+                        s.shadow->stats().iaResidentPages == before.iaResidentPages,
+                    "Cold publication resurrected an already evicted IA demand page");
+            const auto offset = lastPage * page + 16;
+            require(!s.shadow->readBytes(target.Get(), offset, sizeof(output), output.data(), info),
+                    "Uncopied resident page became valid after another page's retirement");
+            s.collect();
+            require(s.shadow->readBytes(target.Get(), offset, sizeof(output), output.data(), info) &&
+                        std::memcmp(output.data(), initial.data() + offset, sizeof(output)) == 0,
+                    "Exact cold interval did not populate the resident IA page");
+            output.fill(9);
+            require(!s.shadow->readBytes(target.Get(), offset + 16, sizeof(output), output.data(), info) &&
+                        output == std::array<unsigned char, 2>{},
+                    "Cold ticket promoted uncopied bytes elsewhere in the same page");
+            target.Reset();
+            released(s);
+            s.close();
+            ++scenarios;
+            std::cout << "scenario " << scenarios << " passed\n";
+        }
+        // Two data pages plus validity/node accounting fit this reduced shared
+        // quota; another resource's demanded page does not. Denial clears output
+        // and does not steal a live source/ticket or exceed the global budget.
+        {
+            constexpr unsigned page = ConstantShadow::iaPageBytes, bytes = 4 * page;
+            constexpr uint64_t limit = 3 * page;
+            const auto initial = byteValues(bytes, 0x41);
+            auto first = byteBuffer(gpu.device.Get(), bytes, D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT,
+                                    initial.data());
+            auto second = byteBuffer(gpu.device.Get(), bytes, D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DEFAULT,
+                                     initial.data());
+            Session s(gpu, limit);
+            ShadowReadInfo info;
+            std::array<unsigned char, 2> output{};
+            require(!s.shadow->readBytes(first.Get(), 16, sizeof(output), output.data(), info),
+                    "Budget fixture did not queue its bounded IA demand");
+            output.fill(9);
+            require(!s.shadow->readBytes(second.Get(), 16, sizeof(output), output.data(), info) &&
+                        output == std::array<unsigned char, 2>{} && info.failure &&
+                        std::strcmp(info.failure, "byte-budget") == 0,
+                    "Exhausted IA page budget returned partial or uncharged bytes");
+            const auto stats = s.shadow->stats();
+            require(stats.bytes <= limit && stats.peakBytes <= limit && stats.iaResidentPages == 2 &&
+                        stats.queued == 1 && stats.pending == 1,
+                    "Page data/validity/node charge escaped the shared quota or recycled a ticket");
+            s.collect();
+            require(s.shadow->readBytes(first.Get(), 16, sizeof(output), output.data(), info) &&
+                        std::memcmp(output.data(), initial.data() + 16, sizeof(output)) == 0,
+                    "Another resource's budget denial invalidated already owned IA data");
+            first.Reset();
+            second.Reset();
+            released(s);
+            s.close();
+            // Optional forward selection is also charged, but inability to
+            // allocate it must not turn a proved read into a cache miss.
+            auto narrowTarget = byteBuffer(gpu.device.Get(), bytes, D3D11_BIND_VERTEX_BUFFER,
+                                           D3D11_USAGE_DEFAULT, initial.data());
+            Session narrow(gpu, 2 * page);
+            require(!narrow.shadow->readBytes(narrowTarget.Get(), 16, sizeof(output), output.data(), info) &&
+                        narrow.shadow->stats().iaResidentPages == 1 && narrow.shadow->stats().queued == 1,
+                    "Optional lookahead consumed a charge that only the demanded IA page could afford");
+            narrow.collect();
+            require(narrow.shadow->readBytes(narrowTarget.Get(), 16, sizeof(output), output.data(), info) &&
+                        std::memcmp(output.data(), initial.data() + 16, sizeof(output)) == 0 &&
+                        narrow.shadow->stats().iaResidentPages == 1 &&
+                        narrow.shadow->stats().peakBytes <= 2 * page,
+                    "Optional lookahead budget denial rejected already proved IA bytes");
+            narrowTarget.Reset();
+            released(narrow);
+            narrow.close();
             ++scenarios;
             std::cout << "scenario " << scenarios << " passed\n";
         }

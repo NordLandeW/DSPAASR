@@ -695,18 +695,25 @@ bool UiShaderProof::stop() noexcept {
         }
         const auto s = impl_->shadow->stats();
         if (impl_->log) {
-            char message[512];
+            char message[1024];
             std::snprintf(
                 message, sizeof(message),
                 "capture.constant-shadow bytes=%llu peak=%llu WCbytes=%llu WCcopies=%llu WCns=%llu "
                 "queued=%llu published=%llu stale=%llu pending=%llu failed=%llu attachFailures=%llu "
+                "IAhits=%llu IAmisses=%llu IApages=%llu IAevicted=%llu IAWCbytes=%llu IAWCcopies=%llu "
                 "retired=%u",
                 static_cast<unsigned long long>(s.bytes), static_cast<unsigned long long>(s.peakBytes),
                 static_cast<unsigned long long>(s.wcBytes), static_cast<unsigned long long>(s.wcCopies),
                 static_cast<unsigned long long>(s.wcNanoseconds), static_cast<unsigned long long>(s.queued),
                 static_cast<unsigned long long>(s.published), static_cast<unsigned long long>(s.stale),
                 static_cast<unsigned long long>(s.pending), static_cast<unsigned long long>(s.failed),
-                static_cast<unsigned long long>(s.attachmentFailures), impl_->retired ? 1u : 0u);
+                static_cast<unsigned long long>(s.attachmentFailures),
+                static_cast<unsigned long long>(s.iaReadHits),
+                static_cast<unsigned long long>(s.iaReadMisses),
+                static_cast<unsigned long long>(s.iaResidentPages),
+                static_cast<unsigned long long>(s.iaEvictedPages),
+                static_cast<unsigned long long>(s.iaWcBytes), static_cast<unsigned long long>(s.iaWcCopies),
+                impl_->retired ? 1u : 0u);
             try {
                 impl_->log(message);
             } catch (...) {

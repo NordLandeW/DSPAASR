@@ -2,6 +2,7 @@
 #include "constants.h"
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -30,6 +31,8 @@ struct Budget {
     std::atomic<uint64_t> wcBytes{0}, wcCopies{0}, wcNanoseconds{0};
     std::atomic<uint64_t> queued{0}, published{0}, stale{0}, failed{0}, pending{0};
     std::atomic<uint64_t> adopted{0}, attachmentFailures{0}, liveBuffers{0};
+    std::atomic<uint64_t> iaReadHits{0}, iaReadMisses{0}, iaResidentPages{0}, iaEvictedPages{0};
+    std::atomic<uint64_t> iaWcBytes{0}, iaWcCopies{0};
     std::atomic<bool> active{true}, quarantined{false};
     explicit Budget(uint64_t maximum) : limit(maximum) {}
     bool reserve(uint64_t count) {
@@ -50,6 +53,18 @@ struct Cell {
     uint64_t epoch = 0;
     bool valid = false;
 };
+struct IaPage {
+    std::unique_ptr<unsigned char[]> data;
+    std::bitset<ConstantShadow::iaPageBytes> valid;
+    unsigned offset, bytes;
+    uint64_t epoch = 0, use = 0;
+    IaPage(unsigned address, unsigned length)
+        : data(std::make_unique<unsigned char[]>(length)), offset(address), bytes(length) {}
+    // Include the page object, validity bits and allocation bookkeeping.
+    uint64_t charge() const {
+        return sizeof(IaPage) + 64 + bytes;
+    }
+};
 // No reference back to the resource or manager: attaching this object cannot
 // create a COM cycle. Pending tickets live separately in the bounded manager.
 struct __declspec(uuid("FB267A8C-C3C1-4822-ACBD-F47FA124219A")) Facts final : IUnknown {
@@ -59,6 +74,10 @@ struct __declspec(uuid("FB267A8C-C3C1-4822-ACBD-F47FA124219A")) Facts final : IU
     std::mutex mutex;
     std::unique_ptr<unsigned char[]> snapshot;
     std::map<unsigned, Cell> cells;
+    // Fixed slots need no empty-map sentinel allocation. Their storage is part
+    // of sizeof(Facts); each occupied page has its own explicit charged lease.
+    std::array<std::unique_ptr<IaPage>, ConstantShadow::maximumIaPages> pages;
+    uint64_t pageUse = 0;
     const unsigned char* mapping = nullptr;
     uint64_t charged = sizeof(Facts), revision = 1, snapshotEpoch = 0, mappingEpoch = 0;
     bool snapshotValid = false;
@@ -67,6 +86,13 @@ struct __declspec(uuid("FB267A8C-C3C1-4822-ACBD-F47FA124219A")) Facts final : IU
         ++budget->liveBuffers;
     }
     ~Facts() {
+        unsigned pageCount = 0;
+        for (auto& page : pages)
+            if (page) {
+                page.reset();
+                ++pageCount;
+            }
+        budget->iaResidentPages.fetch_sub(pageCount);
         budget->bytes.fetch_sub(charged);
         --budget->liveBuffers;
     }
@@ -94,6 +120,9 @@ struct __declspec(uuid("FB267A8C-C3C1-4822-ACBD-F47FA124219A")) Facts final : IU
         snapshotValid = false;
         for (auto& entry : cells)
             entry.second.valid = false;
+        for (auto& page : pages)
+            if (page)
+                page->valid.reset();
         ++budget->invalidations;
     }
     bool ensureSnapshot() {
@@ -111,14 +140,170 @@ struct __declspec(uuid("FB267A8C-C3C1-4822-ACBD-F47FA124219A")) Facts final : IU
         }
         return true;
     }
+    bool pagedInput() const {
+        return description.ByteWidth > ConstantShadow::smallBytes && inputBuffer(description);
+    }
+    // Cache eviction is CPU-only. Tickets retain the independent source/staging
+    // leases and their charges until the exact GPU copy retires.
+    auto findPage(unsigned offset) {
+        return std::find_if(pages.begin(), pages.end(),
+                            [offset](const auto& page) { return page && page->offset == offset; });
+    }
+    bool evictPage(unsigned protectedFirst, unsigned protectedLast) {
+        auto oldest = pages.end();
+        for (auto it = pages.begin(); it != pages.end(); ++it) {
+            if (!*it || ((*it)->offset >= protectedFirst && (*it)->offset <= protectedLast))
+                continue;
+            if (oldest == pages.end() || (*it)->use < (*oldest)->use)
+                oldest = it;
+        }
+        if (oldest == pages.end())
+            return false;
+        const auto cost = (*oldest)->charge();
+        oldest->reset();
+        charged -= cost;
+        budget->bytes.fetch_sub(cost);
+        --budget->iaResidentPages;
+        ++budget->iaEvictedPages;
+        return true;
+    }
+    bool ensurePage(unsigned offset, unsigned protectedFirst, unsigned protectedLast, bool demand,
+                    const char*& failure) {
+        auto found = findPage(offset);
+        if (found != pages.end()) {
+            if (demand)
+                (*found)->use = ++pageUse;
+            return true;
+        }
+        const auto emptySlot = [&] {
+            return std::find_if(pages.begin(), pages.end(), [](const auto& page) { return !page; });
+        };
+        auto empty = emptySlot();
+        if (empty == pages.end()) {
+            if (!evictPage(protectedFirst, protectedLast)) {
+                failure = "ia-page-limit";
+                return false;
+            }
+            empty = emptySlot();
+        }
+        const auto bytes = std::min(ConstantShadow::iaPageBytes, description.ByteWidth - offset);
+        const uint64_t cost = sizeof(IaPage) + 64 + bytes;
+        while (!budget->reserve(cost)) {
+            // Optional lookahead never evicts additional useful data just to
+            // fight another resource for the shared byte budget.
+            if (!demand || !evictPage(protectedFirst, protectedLast)) {
+                failure = "byte-budget";
+                return false;
+            }
+        }
+        try {
+            *empty = std::make_unique<IaPage>(offset, bytes);
+            charged += cost;
+            ++budget->iaResidentPages;
+            if (demand)
+                (*empty)->use = ++pageUse;
+            return true;
+        } catch (...) {
+            budget->bytes.fetch_sub(cost);
+            throw;
+        }
+    }
+    bool demandPages(unsigned first, unsigned last, const char*& failure) {
+        if (mapping) {
+            failure = "buffer-mapped";
+            return false;
+        }
+        constexpr auto width = ConstantShadow::iaPageBytes;
+        const auto begin = first - first % width, end = (last - 1) - (last - 1) % width;
+        if ((static_cast<uint64_t>(end) - begin) / width + 1 > ConstantShadow::maximumIaPages) {
+            failure = "ia-page-limit";
+            return false;
+        }
+        for (uint64_t offset = begin; offset <= end; offset += width)
+            if (!ensurePage(static_cast<unsigned>(offset), begin, end, true, failure))
+                return false;
+        // This is only a bounded locality hint. The adjacent page starts EMPTY;
+        // only a later actual write/copy can establish any of its byte values.
+        const uint64_t next = static_cast<uint64_t>(end) + width;
+        if (next < description.ByteWidth) {
+            const char* ignored = nullptr;
+            try {
+                ensurePage(static_cast<unsigned>(next), begin, end, false, ignored);
+            } catch (...) {
+            }
+        }
+        return true;
+    }
+    uint64_t updatePages(unsigned first, unsigned last, const void* source, uint64_t epoch) {
+        uint64_t copied = 0;
+        // Never create pages here, especially from a completed cold ticket:
+        // a retired request cannot resurrect demand that was already evicted.
+        for (auto& entry : pages) {
+            if (!entry)
+                continue;
+            auto& page = *entry;
+            const auto offset = page.offset;
+            const auto begin = std::max<uint64_t>(offset, first);
+            const auto end = std::min<uint64_t>(static_cast<uint64_t>(offset) + page.bytes, last);
+            if (begin >= end)
+                continue;
+            if (page.epoch != epoch && description.Usage != D3D11_USAGE_IMMUTABLE)
+                page.valid.reset();
+            const auto local = static_cast<unsigned>(begin - offset);
+            const auto bytes = static_cast<unsigned>(end - begin);
+            std::memcpy(page.data.get() + local, static_cast<const unsigned char*>(source) + (begin - first),
+                        bytes);
+            if (local == 0 && bytes == ConstantShadow::iaPageBytes)
+                page.valid.set();
+            else
+                for (unsigned i = local; i < local + bytes; ++i)
+                    page.valid.set(i);
+            page.epoch = epoch;
+            copied += bytes;
+        }
+        budget->copied += copied;
+        return copied;
+    }
+    bool readPages(unsigned first, unsigned last, void* output, const char*& failure) {
+        const auto epoch = budget->epoch.load();
+        uint64_t position = first;
+        while (position < last) {
+            const auto offset = static_cast<unsigned>(position - position % ConstantShadow::iaPageBytes);
+            auto found = findPage(offset);
+            if (found == pages.end()) {
+                failure = "page-unobserved";
+                return false;
+            }
+            const auto& page = **found;
+            if (description.Usage != D3D11_USAGE_IMMUTABLE && page.epoch != epoch) {
+                failure = "page-epoch";
+                return false;
+            }
+            const auto end = std::min<uint64_t>(static_cast<uint64_t>(offset) + page.bytes, last);
+            const auto local = static_cast<unsigned>(position - offset);
+            const auto bytes = static_cast<unsigned>(end - position);
+            for (unsigned i = local; i < local + bytes; ++i)
+                if (!page.valid.test(i)) {
+                    failure = "page-unobserved";
+                    return false;
+                }
+            std::memcpy(static_cast<unsigned char*>(output) + (position - first), page.data.get() + local,
+                        bytes);
+            position = end;
+        }
+        return true;
+    }
     // The caller owns mutex and validates the source lifetime. Complete small
-    // snapshots are bounded; large WC pools copy ONLY previously requested cells.
+    // snapshots are bounded; large CBs copy sparse cells, large IA copies only
+    // resident demand/lookahead pages. Neither path scans a whole large pool.
     // Return bytes actually read from source, not subsequent cached-cell copies.
     uint64_t update(unsigned first, unsigned last, const void* source, bool rememberSmall, uint64_t epoch) {
         if (!source || first > last || last > description.ByteWidth) {
             invalidate();
             return 0;
         }
+        if (pagedInput())
+            return updatePages(first, last, source, epoch);
         uint64_t sourceBytes = 0;
         if (rememberSmall && first == 0 && last == description.ByteWidth && ensureSnapshot()) {
             std::memcpy(snapshot.get(), source, last);
@@ -460,10 +645,14 @@ struct ConstantShadow::Impl {
                     const auto epoch = ticket.epoch;
                     const bool smallSnapshot = value.description.ByteWidth <= smallBytes;
                     if (!smallSnapshot || value.ensureSnapshot()) {
-                        value.update(ticket.first, ticket.last, mapped.pData, smallSnapshot, epoch);
-                        if (epoch == budget->epoch.load() && budget->active)
-                            ++budget->published;
-                        else {
+                        const auto copied =
+                            value.update(ticket.first, ticket.last, mapped.pData, smallSnapshot, epoch);
+                        if (epoch == budget->epoch.load() && budget->active) {
+                            if (copied)
+                                ++budget->published;
+                            else
+                                ++budget->stale; // The requested IA pages were already evicted.
+                        } else {
                             value.invalidate();
                             ++budget->stale;
                         }
@@ -555,6 +744,7 @@ bool ConstantShadow::readBytes(ID3D11Buffer* buffer, unsigned byteOffset, unsign
                                ShadowReadInfo& info) noexcept {
     info = {};
     const auto fail = [&](const char* reason) {
+        ++impl_->budget->iaReadMisses;
         if (output && byteCount)
             std::memset(output, 0, byteCount);
         info.failure = reason;
@@ -579,34 +769,40 @@ bool ConstantShadow::readBytes(ID3D11Buffer* buffer, unsigned byteOffset, unsign
         const uint64_t last =
             std::min<uint64_t>((end + cellBytes - 1) / cellBytes * cellBytes, info.description.ByteWidth);
         if ((end - 1) / cellBytes - first / cellBytes + 1 > maximumCells)
-            return fail("cell-limit");
+            return fail("cell-limit"); // Per-call size bound, never accumulated IA demand.
         auto value = s.adopt(buffer, nullptr, info.failure);
         if (!value)
-            return false;
+            return fail(info.failure);
         info.owned = true;
         std::lock_guard lock(value->mutex);
         const auto epoch = s.budget->epoch.load();
         bool cold = false;
-        for (uint64_t position = first; position < end; position += cellBytes) {
-            CellBytes cell{};
-            if (!value->readCell(static_cast<unsigned>(position), cell, info.failure)) {
-                if (info.failure && (std::strcmp(info.failure, "cell-unobserved") == 0 ||
-                                     std::strcmp(info.failure, "cell-epoch") == 0))
-                    cold = true; // Register every requested cell before queuing one bounded copy.
-                else
-                    return fail(info.failure);
-            } else {
-                const auto begin = std::max<uint64_t>(position, byteOffset);
-                const auto finish = std::min<uint64_t>(position + cellBytes, end);
-                std::memcpy(static_cast<unsigned char*>(output) + (begin - byteOffset),
-                            cell.data() + (begin - position), static_cast<size_t>(finish - begin));
+        if (value->pagedInput()) {
+            if (!value->demandPages(byteOffset, static_cast<unsigned>(end), info.failure))
+                return fail(info.failure);
+            cold = !value->readPages(byteOffset, static_cast<unsigned>(end), output, info.failure);
+        } else
+            for (uint64_t position = first; position < end; position += cellBytes) {
+                CellBytes cell{};
+                if (!value->readCell(static_cast<unsigned>(position), cell, info.failure)) {
+                    if (info.failure && (std::strcmp(info.failure, "cell-unobserved") == 0 ||
+                                         std::strcmp(info.failure, "cell-epoch") == 0))
+                        cold = true; // Register every requested cell before queuing one bounded copy.
+                    else
+                        return fail(info.failure);
+                } else {
+                    const auto begin = std::max<uint64_t>(position, byteOffset);
+                    const auto finish = std::min<uint64_t>(position + cellBytes, end);
+                    std::memcpy(static_cast<unsigned char*>(output) + (begin - byteOffset),
+                                cell.data() + (begin - position), static_cast<size_t>(finish - begin));
+                }
             }
-        }
         if (cold)
             return fail(s.request(buffer, value, static_cast<unsigned>(first), static_cast<unsigned>(last)));
         if (!s.budget->active ||
             (value->description.Usage != D3D11_USAGE_IMMUTABLE && epoch != s.budget->epoch.load()))
             return fail("read-epoch-changed");
+        ++s.budget->iaReadHits;
         info.failure = nullptr;
         return true;
     } catch (...) {
@@ -678,6 +874,10 @@ void ConstantShadow::beforeUnmap(ID3D11DeviceContext* context, ID3D11Resource* r
             s.budget->wcBytes += copied;
             ++s.budget->wcCopies;
             s.budget->wcNanoseconds += static_cast<uint64_t>(elapsed);
+            if (inputBuffer(value->description)) {
+                s.budget->iaWcBytes += copied;
+                ++s.budget->iaWcCopies;
+            }
         }
         if (epoch != s.budget->epoch.load())
             value->invalidate();
@@ -758,6 +958,12 @@ ShadowStats ConstantShadow::stats() const noexcept {
     result.adopted = b.adopted;
     result.attachmentFailures = b.attachmentFailures;
     result.liveBuffers = b.liveBuffers;
+    result.iaReadHits = b.iaReadHits;
+    result.iaReadMisses = b.iaReadMisses;
+    result.iaResidentPages = b.iaResidentPages;
+    result.iaEvictedPages = b.iaEvictedPages;
+    result.iaWcBytes = b.iaWcBytes;
+    result.iaWcCopies = b.iaWcCopies;
     result.stopped = !b.active;
     result.quarantined = b.quarantined;
     return result;
