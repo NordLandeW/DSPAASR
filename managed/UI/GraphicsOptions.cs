@@ -10,13 +10,10 @@ namespace DSPAAMod.UI
     // hidden and intact so native option refreshes never reinterpret our indices.
     internal sealed class GraphicsOptions : IDisposable
     {
-        // Publicized compile references do not change the game's private runtime fields.
-        private static readonly System.Reflection.FieldInfo ItemButtonsField =
-            HarmonyLib.AccessTools.Field(typeof(UIComboBox), "ItemButtons") ??
-            throw new MissingFieldException(typeof(UIComboBox).FullName, "ItemButtons");
         private readonly Plugin plugin;
         private UIOptionWindow window;
         private UIComboBox technique, resolution, configuration;
+        private AaChoice[] techniqueChoices = Array.Empty<AaChoice>();
         private FrameGenerationOptions frameGeneration;
         private RectTransform layoutRoot;
         private Vector2 originalContentSize;
@@ -195,7 +192,7 @@ namespace DSPAAMod.UI
                 if (text.text.Trim() == translated || AaLabels.Matches(text.text, key)) return text;
             return null;
         }
-        internal static void SetItems(UIComboBox control, string[] items, int index)
+        internal static void SetItems(UIComboBox control, string[] items, int index, string missingCaption = "")
         {
             control.isDroppedDown = false;
             control.Items = new List<string>(items);
@@ -203,13 +200,18 @@ namespace DSPAAMod.UI
             for (int i = 0; i < items.Length; ++i) control.ItemsData.Add(i);
             control.UpdateItems();
             control.itemIndex = index;
+            if (index < 0) {
+                // SetState copies the input into the visible label every frame.
+                // Keep an honest caption without adding an unselectable list item.
+                control.m_Input.text = missingCaption;
+                control.m_Text.text = missingCaption;
+            }
         }
-        internal static void SetItemEnabled(UIComboBox control, int index, bool enabled) =>
-            ((List<Button>)ItemButtonsField.GetValue(control))[index].interactable = enabled;
         private void TechniqueChanged()
         {
-            if (synchronizing || draft == null || !technique || technique.itemIndex < 0 || technique.itemIndex > (int)AaChoice.Fsr) return;
-            if (!draft.TrySelectTechnique((AaChoice)technique.itemIndex, plugin.Renderer.GetAvailability((AaChoice)technique.itemIndex))) { Refresh(); return; }
+            if (synchronizing || draft == null || !technique || technique.itemIndex < 0 || technique.itemIndex >= techniqueChoices.Length) return;
+            var selected = techniqueChoices[technique.itemIndex];
+            if (!draft.TrySelectTechnique(selected, plugin.Renderer.GetAvailability(selected))) { Refresh(); return; }
             plugin.Settings.Draft = draft.Settings;
             Refresh();
         }
@@ -302,11 +304,8 @@ namespace DSPAAMod.UI
                 configurationLabel.text = Chinese ? "配置" : "Configuration";
                 shownAvailability = plugin.Renderer.Availability;
                 shownFsrAvailability = plugin.Renderer.FsrAvailability;
-                SetItems(technique, new[] { Chinese ? "关闭" : "Off", "MSAA", "FXAA", "TAA",
-                    CapabilityLabel(shownAvailability), CapabilityLabel(shownFsrAvailability) }, (int)draft.Choice);
-                var buttons = (List<Button>)ItemButtonsField.GetValue(technique);
-                buttons[(int)AaChoice.Dlss].interactable = shownAvailability.Available;
-                buttons[(int)AaChoice.Fsr].interactable = shownFsrAvailability.Available;
+                techniqueChoices = GraphicsMenuChoices.Antialiasing(shownAvailability.Available, shownFsrAvailability.Available);
+                SetItems(technique, Array.ConvertAll(techniqueChoices, TechniqueLabel), Array.IndexOf(techniqueChoices, draft.Choice), TechniqueLabel(draft.Choice));
                 string dlssReason = AvailabilityReason(shownAvailability), fsrReason = AvailabilityReason(shownFsrAvailability);
                 availabilityLabel.text = dlssReason + (dlssReason.Length > 0 && fsrReason.Length > 0 ? "\n" : "") + fsrReason;
                 bool unavailable = (!shownAvailability.Available && !shownAvailability.Pending) ||
@@ -324,6 +323,9 @@ namespace DSPAAMod.UI
             }
             finally { synchronizing = false; }
         }
+        private string TechniqueLabel(AaChoice choice) => choice == AaChoice.None ? (Chinese ? "关闭" : "Off") :
+            choice == AaChoice.Msaa ? "MSAA" : choice == AaChoice.Fxaa ? "FXAA" : choice == AaChoice.Taa ? "TAA" :
+            CapabilityLabel(choice == AaChoice.Fsr ? shownFsrAvailability : shownAvailability);
         private static string CapabilityLabel(UpscalerAvailability state) => state.Name + (state.Available ? "" : state.Pending ?
             (Chinese ? "（检测中）" : " (checking)") : (Chinese ? "（不可用）" : " (unavailable)"));
         private static string AvailabilityReason(UpscalerAvailability state) => state.Reason == UpscalerSupportReason.Runtime ?

@@ -98,6 +98,91 @@ internal static class Program
             "Defaults changed applied settings or failed to represent the game's default AA");
     }
 
+    private static void MenuProjectionChecks()
+    {
+        // Detect enum/index confusion after filtering, invented SDK support,
+        // lost saved selections, and the old fixed five-multiplier ceiling.
+        foreach (bool dlss in new[] { false, true })
+        foreach (bool fsr in new[] { false, true })
+        {
+            var aa = GraphicsMenuChoices.Antialiasing(dlss, fsr);
+            Require(aa.Length == 4 + (dlss ? 1 : 0) + (fsr ? 1 : 0) &&
+                aa[0] == AaChoice.None && aa[1] == AaChoice.Msaa && aa[2] == AaChoice.Fxaa && aa[3] == AaChoice.Taa,
+                "Filtering SDK entries changed original AA choices");
+            Require((Array.IndexOf(aa, AaChoice.Dlss) >= 0) == dlss && (Array.IndexOf(aa, AaChoice.Fsr) >= 0) == fsr,
+                "An unavailable AA entry remained in the selectable list");
+            var backends = GraphicsMenuChoices.Backends(fsr, dlss);
+            Require(backends.Length == 1 + (fsr ? 1 : 0) + (dlss ? 1 : 0) && backends[0] == FrameGenerationBackend.Off &&
+                (Array.IndexOf(backends, FrameGenerationBackend.Fsr) >= 0) == fsr &&
+                (Array.IndexOf(backends, FrameGenerationBackend.Dlss) >= 0) == dlss,
+                "FG filtering dropped Off or added an unrequestable backend");
+        }
+        var onlyFsr = GraphicsMenuChoices.Antialiasing(false, true);
+        var aaDraft = new AaMenuDraft(AaSettings.Default, 0, false);
+        var fsrSupport = UpscalerAvailability.ForPlatform(true, 0x1002, true, true, UpscalerBackend.Fsr).Complete(true, "");
+        Require(aaDraft.TrySelectTechnique(onlyFsr[4], fsrSupport) && aaDraft.Settings.Technique == AaTechnique.Fsr,
+            "The first filtered SDK entry was interpreted as DLSS instead of FSR");
+        var onlyDlss = GraphicsMenuChoices.Backends(false, true);
+        Require(new FrameGenerationSettings(onlyDlss[1]).Backend == FrameGenerationBackend.Dlss,
+            "The filtered FG index was interpreted as FSR instead of DLSS");
+
+        foreach (uint maximum in new[] { 0u, 1u, 3u, 5u, 7u })
+        foreach (bool dynamic in new[] { false, true })
+        {
+            var choices = GraphicsMenuChoices.Multipliers(true, true, maximum, dynamic);
+            Require(choices.Length == maximum + (dynamic ? 1 : 0), "The SDK maximum/Dynamic flag did not determine the multiplier list");
+            for (int i = 0; i < maximum; ++i)
+            {
+                var selected = choices[i];
+                Require(selected.Mode == FrameGenerationMode.Fixed && selected.GeneratedFrames == i + 1,
+                    "A displayed multiplier mapped to the wrong additional-frame request");
+                var request = new FrameGenerationSettings(FrameGenerationBackend.Dlss, selected.Mode, selected.GeneratedFrames);
+                Require(GraphicsMenuChoices.FindMultiplier(choices, request) == i, "A supported saved multiplier lost its selected index");
+            }
+            var beyond = new FrameGenerationSettings(FrameGenerationBackend.Dlss, generatedFrames: maximum + 1);
+            Require(GraphicsMenuChoices.FindMultiplier(choices, beyond) == -1, "An unsupported saved multiplier was silently clamped to a visible entry");
+            var savedDynamic = new FrameGenerationSettings(FrameGenerationBackend.Dlss, FrameGenerationMode.Dynamic, 9);
+            Require(GraphicsMenuChoices.FindMultiplier(choices, savedDynamic) == (dynamic ? (int)maximum : -1),
+                "Dynamic depended on a fixed item index or the saved frame-count hint");
+            if (dynamic)
+                Require(choices[maximum].Mode == FrameGenerationMode.Dynamic && choices[maximum].GeneratedFrames == Math.Max(maximum, 1u),
+                    "Dynamic was confused with a fixed multiplier request");
+        }
+        foreach (uint otherBackendMaximum in new[] { 0u, 1u, 7u })
+        {
+            var unknown = GraphicsMenuChoices.Multipliers(true, false, otherBackendMaximum, true);
+            Require(unknown.Length == 1 && unknown[0].Mode == FrameGenerationMode.Fixed && unknown[0].GeneratedFrames == 1,
+                "Unknown DLSS detail either lost the baseline request or reused another backend's MFG/Dynamic capability");
+        }
+        Require(GraphicsMenuChoices.Multipliers(false, true, 7, true).Length == 0, "An unrequestable DLSS backend exposed selectable multipliers");
+
+        var reflexChoices = GraphicsMenuChoices.ReflexModes();
+        var saved = new FrameGenerationSettings(FrameGenerationBackend.Dlss, FrameGenerationMode.Fixed, 4, ReflexMode.Off, 144, 8000);
+        var session = new FrameGenerationSettingsSession(saved);
+        session.Open();
+        Require(reflexChoices.Length == 2 && reflexChoices[0] == ReflexMode.On && reflexChoices[1] == ReflexMode.OnWithBoost &&
+            Array.IndexOf(reflexChoices, session.Draft.Reflex) == -1, "Reflex Off was retained as a selectable item or mapped to On");
+        var supportedOnly2x = GraphicsMenuChoices.Multipliers(true, true, 1, false);
+        Require(GraphicsMenuChoices.FindMultiplier(supportedOnly2x, session.Draft) == -1 && session.Draft.Equals(saved) && session.Applied.Equals(saved),
+            "A hidden saved value was silently replaced while projecting the menu");
+        session.Draft = new FrameGenerationSettings(saved.Backend, saved.Mode, supportedOnly2x[0].GeneratedFrames,
+            reflexChoices[0], saved.DynamicTargetFrameRate, saved.FrameLimitMicroseconds);
+        Require(session.Applied.Equals(saved), "Choosing available values applied them before confirmation");
+        session.Cancel();
+        Require(session.Draft.Equals(saved), "Cancel lost the original hidden values");
+        session.Draft = new FrameGenerationSettings(saved.Backend, saved.Mode, supportedOnly2x[0].GeneratedFrames,
+            reflexChoices[1], saved.DynamicTargetFrameRate, saved.FrameLimitMicroseconds);
+        FrameGenerationSettings persisted = default;
+        session.Apply(value => persisted = value);
+        session.Open();
+        Require(session.Draft.Equals(persisted) && persisted.GeneratedFrames == 1 && persisted.Reflex == ReflexMode.OnWithBoost &&
+            persisted.DynamicTargetFrameRate == saved.DynamicTargetFrameRate && persisted.FrameLimitMicroseconds == saved.FrameLimitMicroseconds,
+            "Explicit filtered choices did not survive Apply or overwrote unrelated settings");
+        session.Defaults(); session.Cancel();
+        Require(session.Draft.Equals(persisted), "Defaults/Cancel changed the last applied filtered selection");
+    }
+
+
     private static void AvailabilityChecks()
     {
         // Catch vendor-only approval, unusable DLSS selection, and loss of the user's
@@ -413,7 +498,7 @@ internal static class Program
         try
         {
             Require(args.Length == 1, "Pass the built native DLL path");
-            ModelPolicyChecks(); MenuChecks(); AvailabilityChecks(); FsrChecks(); ResolutionChecks(); JitterChecks(); VisibilityChecks(); FrameGenerationChecks(); InteropChecks(args[0]);
+            ModelPolicyChecks(); MenuChecks(); MenuProjectionChecks(); AvailabilityChecks(); FsrChecks(); ResolutionChecks(); JitterChecks(); VisibilityChecks(); FrameGenerationChecks(); InteropChecks(args[0]);
             Console.WriteLine("Model overrides, settings transactions, jitter coverage and real DLL interop passed.");
             return 0;
         }

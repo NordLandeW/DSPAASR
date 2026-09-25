@@ -11,6 +11,9 @@ namespace DSPAAMod.UI
     {
         private readonly Plugin plugin;
         private readonly UIComboBox backend, multiplier, reflex;
+        private FrameGenerationBackend[] backendChoices = Array.Empty<FrameGenerationBackend>();
+        private FrameMultiplierChoice[] multiplierChoices = Array.Empty<FrameMultiplierChoice>();
+        private readonly ReflexMode[] reflexChoices = GraphicsMenuChoices.ReflexModes();
         private readonly Text backendLabel, multiplierLabel, reflexLabel, status;
         private readonly RectTransform root;
         private readonly float step;
@@ -65,37 +68,42 @@ namespace DSPAAMod.UI
             shownFlags = caps.Flags & ~96u; shownMaximum = caps.MaximumGeneratedFrames;
             shownActive = caps.ActiveBackend; shownRequested = caps.RequestedBackend; shownSdkStatus = caps.SdkStatus;
             shownDraft = value; shownApplied = plugin.FrameGeneration.Applied; shownStartup = plugin.StartupState;
-            bool usable = caps.Available && !caps.Quarantined;
-            bool nextStartDlss = !caps.Available && plugin.CanRequestFrameGeneration(FrameGenerationBackend.Dlss);
+            bool canRequestDlss = plugin.CanRequestFrameGeneration(FrameGenerationBackend.Dlss);
+            bool detailsKnown = DlssDetailsKnown(caps);
             synchronizing = true;
             try {
                 backendLabel.text = Chinese ? "帧生成" : "Frame generation";
                 multiplierLabel.text = Chinese ? "帧生成倍率" : "Frame multiplier";
                 reflexLabel.text = "NVIDIA Reflex";
-                GraphicsOptions.SetItems(backend,new[] { Chinese ? "关闭" : "Off", "FSR 2×", "DLSS" },(int)value.Backend);
-                GraphicsOptions.SetItemEnabled(backend,1,plugin.CanRequestFrameGeneration(FrameGenerationBackend.Fsr));
-                GraphicsOptions.SetItemEnabled(backend,2,plugin.CanRequestFrameGeneration(FrameGenerationBackend.Dlss));
-                var choices = new System.Collections.Generic.List<string> {"2×","3×","4×","5×","6×",Chinese ? "自适应" : "Dynamic"};
-                int index = value.Mode == FrameGenerationMode.Dynamic ? 5 : (int)Math.Min(value.GeneratedFrames - 1,4u);
-                if (value.Mode == FrameGenerationMode.Fixed && value.GeneratedFrames > 5) {
-                    choices.Add(((ulong)value.GeneratedFrames+1) + "×"); index = choices.Count-1;
-                }
-                GraphicsOptions.SetItems(multiplier,choices.ToArray(),index);
-                uint maximum = caps.ActiveBackend == 2 ? caps.MaximumGeneratedFrames : 1u;
-                for (int i=0;i<5;++i) GraphicsOptions.SetItemEnabled(multiplier,i,
-                    (usable && caps.DlssSupported && (uint)(i+1)<=maximum) || (nextStartDlss && i==0));
-                GraphicsOptions.SetItemEnabled(multiplier,5,usable && caps.DynamicSupported && caps.ActiveBackend == 2);
-                if (choices.Count>6) GraphicsOptions.SetItemEnabled(multiplier,6,false);
-                GraphicsOptions.SetItems(reflex,new[] {Chinese ? "关闭" : "Off", Chinese ? "开启" : "On", Chinese ? "开启并增强" : "On + Boost"},(int)value.Reflex);
+                backendChoices = GraphicsMenuChoices.Backends(plugin.CanRequestFrameGeneration(FrameGenerationBackend.Fsr), canRequestDlss);
+                GraphicsOptions.SetItems(backend, Array.ConvertAll(backendChoices, BackendLabel), Array.IndexOf(backendChoices, value.Backend), BackendLabel(value.Backend));
+                multiplierChoices = GraphicsMenuChoices.Multipliers(canRequestDlss, detailsKnown, caps.MaximumGeneratedFrames, caps.DynamicSupported);
+                GraphicsOptions.SetItems(multiplier, Array.ConvertAll(multiplierChoices, choice => MultiplierLabel(choice.Mode, choice.GeneratedFrames)),
+                    GraphicsMenuChoices.FindMultiplier(multiplierChoices, value), MultiplierLabel(value.Mode, value.GeneratedFrames));
+                GraphicsOptions.SetItems(reflex, Array.ConvertAll(reflexChoices, ReflexLabel), Array.IndexOf(reflexChoices, value.Reflex), ReflexLabel(value.Reflex));
                 showDetails = value.Backend == FrameGenerationBackend.Dlss;
                 multiplier.gameObject.SetActive(showDetails); multiplierLabel.gameObject.SetActive(showDetails);
                 reflex.gameObject.SetActive(showDetails); reflexLabel.gameObject.SetActive(showDetails);
                 status.text = StatusText(caps, value, out bool warning);
+                if (value.Backend == FrameGenerationBackend.Dlss && canRequestDlss && GraphicsMenuChoices.FindMultiplier(multiplierChoices, value) < 0) {
+                    string note = detailsKnown ?
+                        (Chinese ? "所请求的帧生成倍率不可用。" : "The requested frame multiplier is unavailable.") :
+                        (Chinese ? "所请求的帧生成倍率尚未检测。" : "The requested frame multiplier has not been checked.");
+                    status.text += (status.text.Length == 0 ? "" : "\n") + note;
+                    warning |= detailsKnown;
+                }
                 status.color = warning ? warningColor : backendLabel.color;
                 status.gameObject.SetActive(status.text.Length != 0);
                 statusRows = GraphicsOptions.MeasureNoteRows(status, step);
             } finally { synchronizing = false; }
         }
+        private static bool DlssDetailsKnown(NativePresentationStatus caps) => caps.Available && !caps.Quarantined && caps.ActiveBackend == 2;
+        private static string BackendLabel(FrameGenerationBackend value) => value == FrameGenerationBackend.Off ? (Chinese ? "关闭" : "Off") :
+            value == FrameGenerationBackend.Fsr ? "FSR 2×" : "DLSS";
+        private static string MultiplierLabel(FrameGenerationMode mode, uint generatedFrames) => mode == FrameGenerationMode.Dynamic ?
+            (Chinese ? "自适应" : "Dynamic") : ((ulong)generatedFrames + 1) + "×";
+        private static string ReflexLabel(ReflexMode value) => value == ReflexMode.Off ? (Chinese ? "关闭" : "Off") :
+            value == ReflexMode.On ? (Chinese ? "开启" : "On") : (Chinese ? "开启并增强" : "On + Boost");
         private string StatusText(NativePresentationStatus caps, FrameGenerationSettings value, out bool warning)
         {
             warning = false;
@@ -158,8 +166,8 @@ namespace DSPAAMod.UI
         }
         private void BackendChanged()
         {
-            if (synchronizing || backend.itemIndex<0 || backend.itemIndex>2) return;
-            var selected=(FrameGenerationBackend)backend.itemIndex;
+            if (synchronizing || backend.itemIndex < 0 || backend.itemIndex >= backendChoices.Length) return;
+            var selected = backendChoices[backend.itemIndex];
             if (!plugin.CanRequestFrameGeneration(selected)) { Refresh(); return; }
             var prior=plugin.FrameGeneration.Draft;
             plugin.FrameGeneration.Draft=new FrameGenerationSettings(selected,
@@ -169,22 +177,22 @@ namespace DSPAAMod.UI
         }
         private void MultiplierChanged()
         {
-            if (synchronizing || !showDetails || multiplier.itemIndex<0 || multiplier.itemIndex>5 ||
-                !plugin.CanRequestFrameGeneration(FrameGenerationBackend.Dlss)) return;
-            var caps=Capabilities; var prior=plugin.FrameGeneration.Draft; int index=multiplier.itemIndex;
-            bool dynamic=index==5;
-            uint maximum=caps.ActiveBackend==2?caps.MaximumGeneratedFrames:1u;
-            if ((dynamic && (!caps.DynamicSupported || caps.ActiveBackend!=2)) || (!dynamic && (uint)(index+1)>maximum)) { Refresh(); return; }
-            plugin.FrameGeneration.Draft=new FrameGenerationSettings(prior.Backend,
-                dynamic?FrameGenerationMode.Dynamic:FrameGenerationMode.Fixed,dynamic?Math.Max(maximum,1u):(uint)(index+1),
-                prior.Reflex,prior.DynamicTargetFrameRate,prior.FrameLimitMicroseconds);
+            if (synchronizing || !showDetails || multiplier.itemIndex < 0 || multiplier.itemIndex >= multiplierChoices.Length) return;
+            var caps = Capabilities; var prior = plugin.FrameGeneration.Draft;
+            var selected = multiplierChoices[multiplier.itemIndex];
+            var next = new FrameGenerationSettings(prior.Backend, selected.Mode, selected.GeneratedFrames,
+                prior.Reflex, prior.DynamicTargetFrameRate, prior.FrameLimitMicroseconds);
+            var current = GraphicsMenuChoices.Multipliers(plugin.CanRequestFrameGeneration(FrameGenerationBackend.Dlss),
+                DlssDetailsKnown(caps), caps.MaximumGeneratedFrames, caps.DynamicSupported);
+            if (GraphicsMenuChoices.FindMultiplier(current, next) < 0) { Refresh(); return; }
+            plugin.FrameGeneration.Draft = next;
         }
         private void ReflexChanged()
         {
-            if (synchronizing || !showDetails || reflex.itemIndex<0 || reflex.itemIndex>2) return;
+            if (synchronizing || !showDetails || reflex.itemIndex < 0 || reflex.itemIndex >= reflexChoices.Length) return;
             var prior=plugin.FrameGeneration.Draft;
             plugin.FrameGeneration.Draft=new FrameGenerationSettings(prior.Backend,prior.Mode,prior.GeneratedFrames,
-                (ReflexMode)reflex.itemIndex,prior.DynamicTargetFrameRate,prior.FrameLimitMicroseconds);
+                reflexChoices[reflex.itemIndex],prior.DynamicTargetFrameRate,prior.FrameLimitMicroseconds);
         }
         private static void Remove(Component value)
         { if (value) { value.gameObject.SetActive(false); UnityEngine.Object.Destroy(value.gameObject); } }
