@@ -43,6 +43,8 @@ internal static class Program
     }
     private static void MenuChecks()
     {
+        Require(AaLabels.Matches("msaa", "MSAA") && AaLabels.Matches("fxaa", "FXAA"),
+            "Lowercase native AA component names cannot be resolved");
         var original = new AaMenuDraft(AaSettings.Default, 4, true);
         Require(AaLabels.Matches("多重采样抗锯齿 (MSAA)", "MSAA") &&
             AaLabels.Matches("快速近似抗锯齿 (FXAA)", "FXAA") &&
