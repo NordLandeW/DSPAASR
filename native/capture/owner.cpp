@@ -468,53 +468,53 @@ struct CaptureOwner::Impl final : capture::Observer, std::enable_shared_from_thi
             output.transmittance = plane(*output.clean, 1, DXGI_FORMAT_R32_FLOAT); output.constantT = true;
         } else if (!output.constantT) failure("Partial color-only write cannot silently erase existing geometric opacity", false, true, false);
     }
+    template <class Visit> void drawOutputs(Visit&& visit) {
+        if (arena->records.empty())
+            return;
+        // Original-only draws can write through both MRTs and OM UAVs. Acquire
+        // every Get-returned reference before any fallible resource lookup.
+        std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> targets{};
+        std::array<ComPtr<ID3D11RenderTargetView>, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> retained;
+        context->OMGetRenderTargets(static_cast<UINT>(targets.size()), targets.data(), nullptr);
+        for (size_t i = 0; i < targets.size(); ++i)
+            retained[i].Attach(targets[i]);
+        const UINT count = device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1
+                               ? D3D11_1_UAV_SLOT_COUNT
+                               : D3D11_PS_CS_UAV_REGISTER_COUNT;
+        std::array<ID3D11UnorderedAccessView*, D3D11_1_UAV_SLOT_COUNT> unordered{};
+        std::array<ComPtr<ID3D11UnorderedAccessView>, D3D11_1_UAV_SLOT_COUNT> retainedUnordered;
+        context->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, count, unordered.data());
+        for (size_t i = 0; i < unordered.size(); ++i)
+            retainedUnordered[i].Attach(unordered[i]);
+        for (const auto& target : retained)
+            if (auto* output = find(target.Get()))
+                visit(*output, target.Get());
+        for (const auto& view : retainedUnordered)
+            if (auto* output = find(view.Get()))
+                visit(*output, nullptr);
+    }
     void draw(const DrawArguments& arguments, NativeCall& original) {
         ++state.observedDraws;
-        if (!scope || scope->kind == CaptureScopeKind::SharedPreparation || scope->kind == CaptureScopeKind::ExternalBlurPublication) {
-            // Ordinary world/preparation draws do not need a replay snapshot.
-            // Still invalidate every tracked output they actually bind.
-            if (!arena->records.empty()) {
-                std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> targets{};
-                std::array<ComPtr<ID3D11RenderTargetView>, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> retained;
-                context->OMGetRenderTargets(static_cast<UINT>(targets.size()), targets.data(), nullptr);
-                for (size_t i = 0; i < targets.size(); ++i)
-                    retained[i].Attach(targets[i]);
-                for (const auto& target : retained)
-                    if (auto* output = find(target.Get())) {
-                        if (scope)
-                            invalidate(*output);
-                        else if (output->clean) {
-                            if (!unannotatedDrawReported && state.reason.empty() && info.unannotatedDraw) {
-                                unannotatedDrawReported = true;
-                                try {
-                                    info.unannotatedDraw(target.Get());
-                                } catch (...) {
-                                }
-                            }
-                            // Only this application value is lost. Previously consumed
-                            // values have independent private planes in their outputs.
-                            // A later consumer/seal still has to prove its own input.
-                            invalidate(*output);
+        if (!scope || scope->kind == CaptureScopeKind::SharedPreparation ||
+            scope->kind == CaptureScopeKind::ExternalBlurPublication) {
+            // Shared preparation is original-only, not permission to retain old
+            // private values for its UAV writes. Independent consumers survive.
+            drawOutputs([&](Record& output, ID3D11RenderTargetView* target) {
+                if (scope || !target)
+                    invalidate(output);
+                else if (output.clean) {
+                    if (!unannotatedDrawReported && state.reason.empty() && info.unannotatedDraw) {
+                        unannotatedDrawReported = true;
+                        try {
+                            info.unannotatedDraw(target);
+                        } catch (...) {
                         }
                     }
-                if (!scope) {
-                    // A graphics draw can also write textures through OM UAVs,
-                    // even when none of its RTVs still has a captured value.
-                    const UINT count = device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1
-                                           ? D3D11_1_UAV_SLOT_COUNT
-                                           : D3D11_PS_CS_UAV_REGISTER_COUNT;
-                    std::array<ID3D11UnorderedAccessView*, D3D11_1_UAV_SLOT_COUNT> unordered{};
-                    std::array<ComPtr<ID3D11UnorderedAccessView>, D3D11_1_UAV_SLOT_COUNT> retainedUnordered;
-                    context->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, count,
-                                                                       unordered.data());
-                    for (size_t i = 0; i < unordered.size(); ++i)
-                        retainedUnordered[i].Attach(unordered[i]);
-                    for (const auto& view : retainedUnordered)
-                        if (auto* output = find(view.Get()))
-                            invalidate(*output);
+                    invalidate(output);
                 }
-            }
-            original.run(); return;
+            });
+            original.run();
+            return;
         }
         StateGuard saved(context);
         if (!saved.pureRaster || !activeQueries.empty()) throw std::runtime_error("Capture refuses UAV/SO/query/predication or unverified programmable geometry side effects");
@@ -642,17 +642,17 @@ struct CaptureOwner::Impl final : capture::Observer, std::enable_shared_from_thi
             case OperationKind::ExecuteList:
                 failure("Opaque deferred command list cannot provide verified dual-color/UI coverage"); original.run(); return;
             case OperationKind::UnsupportedDraw: {
-                const bool shared = scope && (scope->kind == CaptureScopeKind::SharedPreparation || scope->kind == CaptureScopeKind::ExternalBlurPublication);
-                if (scope && !shared) failure("Indirect/auto draw has no bounded capture replay contract");
-                std::array<ID3D11RenderTargetView*, 8> targets{}; context->OMGetRenderTargets(8, targets.data(), nullptr);
-                for (auto* target : targets) if (target) {
-                    if (auto* output = find(target)) {
-                        if (!shared && output->clean) failure("An unsupported draw changed a captured dependency");
-                        invalidate(*output);
-                    }
-                    target->Release();
-                }
-                original.run(); return;
+                const bool shared = scope && (scope->kind == CaptureScopeKind::SharedPreparation ||
+                                              scope->kind == CaptureScopeKind::ExternalBlurPublication);
+                if (scope && !shared)
+                    failure("Indirect/auto draw has no bounded capture replay contract");
+                drawOutputs([&](Record& output, ID3D11RenderTargetView*) {
+                    if (!shared && output.clean)
+                        failure("An unsupported draw changed a captured dependency");
+                    invalidate(output);
+                });
+                original.run();
+                return;
             }
             case OperationKind::Dispatch: {
                 const UINT count = device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1 ? 64u : 8u;

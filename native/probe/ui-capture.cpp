@@ -690,43 +690,87 @@ void unscopedMissingInput(Fixture& f) {
     close(f.read(f.post.texture.Get()).at(6, 6, 2), 0.5f + 0.25f * world[2],
           "Rejected color dependency suppressed the original effect");
 }
-void unscopedUavInvalidation(Fixture& f) {
+void originalOnlyUavInvalidation(Fixture& f, const dspaa::CaptureScope* scope = nullptr,
+                                 bool indirect = false) {
     auto destination = f.make(D3D11_BIND_UNORDERED_ACCESS);
     ComPtr<ID3D11UnorderedAccessView> uav;
     dspaa::graphicsCheck(f.device->CreateUnorderedAccessView(destination.texture.Get(), nullptr, &uav),
-                         "Create unscoped write UAV");
+                         "Create original-only write UAV");
     const auto code = compile("writeUav", "ps_5_0");
     ComPtr<ID3D11PixelShader> writer;
     dspaa::graphicsCheck(
         f.device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &writer),
-        "Create unscoped UAV PS");
+        "Create original-only UAV PS");
+    ComPtr<ID3D11Buffer> arguments;
+    if (indirect) {
+        const std::array<UINT, 4> values{3, 1, 0, 0};
+        D3D11_BUFFER_DESC description{};
+        description.ByteWidth = static_cast<UINT>(sizeof(values));
+        description.Usage = D3D11_USAGE_DEFAULT;
+        description.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
+        const D3D11_SUBRESOURCE_DATA initial{values.data(), 0, 0};
+        dspaa::graphicsCheck(f.device->CreateBuffer(&description, &initial, &arguments),
+                             "Create original-only indirect draw arguments");
+    }
     consumedUiValue(f, destination);
+    require(f.capture->declareTexture(f.post.captured()), "Declare independent value C before UAV write");
+    f.context->CopyResource(f.post.texture.Get(), destination.texture.Get());
     f.draw({0, 0, 1, 0.5f});
     require(f.capture->currentColor(destination.texture.Get()).texture != nullptr,
             "UAV fixture lost B before its actual write");
     // The RTV's A value is already invalid; only the OM UAV can invalidate B.
+    // C consumed the previous B value and must survive the later original write.
     const UINT targetCount = 1, uavSlot = targetCount;
     auto* target = f.full.rtv.Get();
     auto* view = uav.Get();
     f.context->OMSetRenderTargetsAndUnorderedAccessViews(targetCount, &target, nullptr, uavSlot, 1, &view,
                                                          nullptr);
     f.context->PSSetShader(writer.Get(), nullptr, 0);
-    f.draw({0, 0, 1, 0.5f});
+    const auto before = f.capture->status();
+    if (scope)
+        require(f.capture->beginScope(*scope), "Begin original-only UAV scope");
+    f.parameters({0, 0, 1, 0.5f});
+    if (indirect)
+        f.context->DrawInstancedIndirect(arguments.Get(), 0);
+    else
+        f.context->Draw(3, 0);
+    if (scope)
+        f.end();
+    const auto after = f.capture->status();
+    require(after.colorReplays == before.colorReplays && after.coverageReplays == before.coverageReplays,
+            "Original-only UAV draw was replayed privately");
+    require(after.cleanComplete && after.occlusionComplete && after.influenceComplete,
+            "An original-only value overwrite poisoned independent branches globally");
     f.bindings(f.full, writer.Get());
     ComPtr<ID3D11UnorderedAccessView> retained;
     f.context->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, uavSlot, 1, &retained);
-    require(retained.Get() == uav.Get(), "Unscoped invalidation changed the application's OM UAV binding");
+    require(retained.Get() == uav.Get(),
+            "Original-only invalidation changed the application's OM UAV binding");
     view = nullptr;
     f.context->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr,
                                                          nullptr, uavSlot, 1, &view, nullptr);
     require(!f.capture->currentColor(destination.texture.Get()).texture,
-            "Unscoped OM UAV write retained a stale independent value");
+            "Original-only OM UAV write retained a stale independent value");
+    require(f.capture->currentColor(f.post.texture.Get()).texture != nullptr,
+            "UAV write invalidated an independently consumed C value");
     require(!f.capture->seal(destination.captured()) && !f.capture->status().cleanComplete,
             "UAV-modified final color reused its stale private planes");
     close(f.read(destination.texture.Get()).at(6, 6, 2), 1,
-          "Unscoped UAV write did not reach the original resource");
+          "Original-only UAV write did not reach the original resource");
+    close(f.read(f.post.texture.Get()).at(6, 6, 0), 0.6f,
+          "UAV write changed the independent consumer's original color");
     close(f.read(f.full.texture.Get()).at(1, 1, 2), 0.75f + 0.25f * world[2],
           "UAV invalidation suppressed or duplicated the original color draw");
+}
+void sharedUavInvalidation(Fixture& f) {
+    for (const auto kind :
+         {dspaa::CaptureScopeKind::SharedPreparation, dspaa::CaptureScopeKind::ExternalBlurPublication}) {
+        dspaa::CaptureScope scope;
+        scope.kind = kind;
+        scope.passId = 4;
+        originalOnlyUavInvalidation(f, &scope);
+        originalOnlyUavInvalidation(f, &scope, true);
+    }
 }
 void nativeClipTransfer(Fixture& f) {
     using Vertex = dspaa::proof::ClipBlitVertex;
@@ -1020,7 +1064,8 @@ int main() {
         filterAndPartial(fixture); mismatchedEffectProof(fixture); missingFiniteRgb(fixture); missingProof(fixture); missingSignedProof(fixture); rasterQuery(fixture); sharedInvalidation(fixture); unscopedInvalidation(fixture);
         unscopedConsumedValue(fixture);
         unscopedMissingInput(fixture);
-        unscopedUavInvalidation(fixture);
+        originalOnlyUavInvalidation(fixture);
+        sharedUavInvalidation(fixture);
         nativeClipTransfer(fixture);
         fragmentNonfiniteRgb(fixture); fragmentMixedScopes(fixture); fragmentStencilClip(fixture);
         fragmentSampleMask(fixture); fragmentWritableOverlap(fixture); fragmentOptInGates(fixture);
