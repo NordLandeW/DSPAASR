@@ -51,7 +51,12 @@ void readBytes(ConstantShadow& shadow, ID3D11Buffer* buffer, uint64_t offset, un
     ShadowReadInfo info;
     if (!shadow.readBytes(buffer, static_cast<unsigned>(offset), count, output, info))
         throw std::invalid_argument(std::string("Blit IA bytes unavailable: ") +
-                                    (info.failure ? info.failure : "unknown"));
+                                    (info.failure ? info.failure : "unknown") +
+                                    " allocationBytes=" + std::to_string(info.description.ByteWidth) +
+                                    " bind=" + std::to_string(info.description.BindFlags) +
+                                    " usage=" + std::to_string(info.description.Usage) +
+                                    " cpuAccess=" + std::to_string(info.description.CPUAccessFlags) +
+                                    " requestBytes=" + std::to_string(count));
 }
 void element(ConstantShadow& shadow, ID3D11DeviceContext* context, const Element& part, uint64_t vertex,
              float* output, unsigned components) {
