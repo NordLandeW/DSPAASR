@@ -72,7 +72,7 @@ This opt-in hardware probe opens no window and does not load NGX. It uses the ex
 
 ### Isolated in-game validation
 
-`tools/game-sandbox.ps1` is an explicit, interactive developer workflow, not part of a build, test or package command. Close DSP first and supply a new session directory, an installed BepInEx 5 core directory and an already validated, unpacked package:
+`tools/game-sandbox.ps1` is an explicit developer workflow, not part of a build, test or package command. Close DSP first and supply a new session directory, a BepInEx 5 core compatible with the installation's Doorstop and an already validated, unpacked package. Match the loader entry-point ABI, not just the BepInEx major version: Doorstop 3 uses `Main`, whereas Doorstop 4 uses `Doorstop.Entrypoint.Start`. A core built for the latter does not load through the former.
 
 ```powershell
 ./tools/game-sandbox.ps1 -Action Prepare -SessionDirectory artifacts/game-check `
@@ -83,9 +83,15 @@ This opt-in hardware probe opens no window and does not load NGX. It uses the ex
 ./tools/game-sandbox.ps1 -Action Restore -SessionDirectory artifacts/game-check
 ```
 
-Use `GameDirectory` when the game is installed elsewhere. Preparation copies the core and plugin into a new private profile and backs up the existing `Configs/path.txt` without changing the game. Run refuses an unredirected data path, an existing game process or modified plugin payload; it requests windowed 1280×720 (the game's own options may override this), records its PID and bounds the session lifetime. The child receives DSP's Steam App ID (`1366540`) without altering the parent environment or Steam configuration. Steam must already be running with access to the game.
+Use `GameDirectory` when the game is installed elsewhere. Preparation copies the core and plugin into a new private profile and backs up the existing `Configs/path.txt` without changing the game. Run refuses an unredirected data path, an existing game process or modified plugin payload; it requests windowed 1280×720 (the game's own options may override this), records its PID and bounds the session lifetime. In the ordinary mode shown above, the child receives DSP's Steam App ID (`1366540`) without altering the parent environment or Steam configuration. Steam must already be running with access to the game.
 
 The game's own path override isolates its file-based saves, blueprints, achievements and options. It does not isolate Steam account services; use a new in-game Sandbox world, not a personal save. On exit or timeout, the runner stops only its owned process and restores the original path file byte-for-byte. It refuses to overwrite a concurrent external edit. After an abrupt host termination, retain `sandbox.json` and `path.before` and use Restore rather than copying an entire installation/profile. Logs and receipts remain in the session directory. The default headless `game-sandbox-rollback` test checks this filesystem/refusal contract with disposable fixtures; it never starts the real game.
+
+For Steam-free diagnostics, supply a **separately prepared and validated private runtime copy**, not the normal installation or merely a preloader plugin. Its game assembly must already prevent native Steam client initialization even if Doorstop/BepInEx never starts, and the copy must contain no `steam_api*.dll`. The tool does not produce or distribute this modified runtime. Keep it and all proprietary game files private.
+
+At Prepare, pass `-GameDirectory <private-runtime>` and `-SteamFreeAssemblySha256 <validated-64-digit-SHA256>`. The runtime root must contain `steam-free-runtime.json` with `SourceGameDirectory` identifying the distinct original installation and `SteamFreeAssemblySHA256` matching the actual `DSPGAME_Data/Managed/Assembly-CSharp.dll`. This records the policy in `sandbox.json`; subsequent Run calls use that saved policy without repeating the hash. Missing/changed assemblies, a mismatching receipt, native Steam API libraries, or an offline runtime without a pinned session policy are refused before process creation. This is integrity checking for a trusted, previously validated transformation, not proof that arbitrary supplied code is Steam-free.
+
+Only this validated route removes child `SteamAppId`/`SteamGameId` and sets `DSPAASR_FG_VALIDATION_ROOT` to the session for private diagnostic tooling. Clearing environment variables alone is not Steam isolation. Keep the same private GameDirectory for Prepare/Run/Restore, and verify actual initialization state/API-call counts and process modules during menu/world validation; a successful launch is not frame-generation acceptance.
 
 ### Testing with an existing NVIDIA App override
 
