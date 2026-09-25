@@ -132,6 +132,21 @@ int wmain(int argc, wchar_t** argv) {
         if (!DspAaGetSupport(supportToken, &support) || support.result != 1)
             throw std::runtime_error(std::string("FSR capability failed: ") + support.message);
         std::cout << "analytical_provider=" << support.message << '\n';
+        // Invalid SDK render sizes must fail safely before the jitter query divides by renderWidth.
+        for (const auto& request : std::array<std::array<unsigned, 2>, 3>{{{1, 1}, {1, 4}, {2, 4}}}) {
+            execute(
+                DspAaQueueOptimalSettingsForBackend(99, anchor.Get(), request[0], request[0], request[1], 1));
+            DspAaFsrOptimalSettings invalid{};
+            invalid.settings.size = sizeof(invalid);
+            if (!DspAaGetFsrOptimalSettings(99, &invalid) || invalid.settings.result >= 0)
+                throw std::runtime_error("FSR accepted an SDK-zero-sized SR request");
+        }
+        execute(DspAaQueueRelease(99));
+        DspAaStatus edgeRetired{};
+        edgeRetired.size = sizeof(edgeRetired);
+        if (!DspAaGetStatus(99, &edgeRetired) || edgeRetired.result != 2)
+            throw std::runtime_error("FSR edge-query retirement was not acknowledged");
+        std::cout << "zero_render_size_requests=3 safely_rejected\n";
         // D3D12 devices are singleton-per-adapter; retain its debug queue across native shutdown.
         ComPtr<ID3D12Device> diagnosticDevice;
         dspaa::graphicsCheck(
