@@ -21,6 +21,12 @@ namespace DSPAAMod.Game
         private static void Postfix(PostProcessingBehaviour __instance)
         { Plugin.Instance?.Guard(() => Plugin.Instance.Presentation?.World?.AfterProjection(__instance)); }
     }
+    [HarmonyPatch(typeof(BloomComponent), nameof(BloomComponent.Prepare))]
+    internal static class NavigationBloomPatch
+    {
+        private static void Postfix(BloomComponent __instance, Texture autoExposure)
+        { Plugin.Instance?.Renderer?.ObserveNavigationBloom(__instance, autoExposure); }
+    }
     [HarmonyPatch(typeof(PostProcessingBehaviour), "OnRenderImage")]
     internal static class AfterImagePatch
     {

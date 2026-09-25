@@ -143,6 +143,17 @@ At Prepare, pass `-GameDirectory <private-runtime>` and `-SteamFreeAssemblySha25
 
 Only this validated route removes child `SteamAppId`/`SteamGameId` and sets `DSPAASR_FG_VALIDATION_ROOT` to the session for private diagnostic tooling. Clearing environment variables alone is not Steam isolation. Keep the same private GameDirectory for Prepare/Run/Restore, and verify actual initialization state/API-call counts and process modules during menu/world validation; a successful launch is not frame-generation acceptance.
 
+#### Navigation bloom acceptance
+
+The FG navigation adapter has its own image-quality checks; successful Bloom API calls or generic presentation probes do not establish them. Use the same scene, logical output size and game Bloom settings when comparing FG on/off, including the dynamically changing warp threshold.
+
+- Inspect H and Final independently: H contains neither navigation text nor its glow, while Final contains one sharp text image and the surrounding glow. Inspect generated frames as well as application frames for detached or trailing halos.
+- Use a zero-intensity composition control to detect background changes caused by the Final copy/composite. Dark gradients and bright edges must not acquire a global brightness shift, orientation change, black background or a second resampling step. Check both equal L/D dimensions and scaled/bordered output.
+- Check translucent text edges, navigation fade/visibility and the normal screen UI drawn afterward. The isolated HDR light source is a limited approximation, not a substitute for the world's depth or complete grading/distortion stack.
+- Exercise game Bloom off, FG off with SR still active, backend switches, resize and scene/camera replacement. Force an early capability rejection separately from a late glow-preparation failure: the former leaves the original world drawing intact; the latter must attempt the text draw without claiming that layer restoration alone recovered it.
+- Measure base rendering rate and resource cost with the relocated board visible. Count the extra navigation HDR draw, Bloom pyramid, Final copy and composite separately from generated-presentation counters; no hardware timing threshold belongs in default CTest.
+
+
 ### Testing with an existing NVIDIA App override
 
 Driver overrides take precedence over application hints and can even replace the requested runtime library. The Mod must not silently claim an overridden selection worked. The optional `driver-profile` utility exists only to isolate the **sibling headless probe executable**, never the game or global profile. It is not run by builds or default tests.

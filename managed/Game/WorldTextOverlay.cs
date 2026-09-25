@@ -5,7 +5,7 @@ using UnityEngine.Rendering;
 
 namespace DSPAAMod.Game
 {
-    // This unlit, ZTest-Always world HUD is not ordinary opaque scene geometry.
+    // This navigation-only world HUD is not ordinary opaque scene geometry.
     // Keep the game's TextMesh or sail Canvas, materials and transforms; only
     // move their draw to native-size temporal resolve, or after H when using FG.
     internal sealed class WorldTextOverlay : System.IDisposable
@@ -29,7 +29,7 @@ namespace DSPAAMod.Game
         private Rect viewport;
         public int PendingCount => entries.Count + canvas.PendingCount;
         public void SetProjection(Matrix4x4 value) => projection = value;
-        public string Begin(Camera current, Matrix4x4 nonJitteredProjection, bool beforeCanvas = false)
+        public string Begin(Camera current, Matrix4x4 nonJitteredProjection, bool beforeCanvas = false, NavigationBloom bloom = null)
         {
             // Canvas batches retain their layer before camera pre-cull. Continue
             // the early scope; restoring/re-borrowing here loses that isolation.
@@ -52,7 +52,8 @@ namespace DSPAAMod.Game
             UpdateCamera(current, nonJitteredProjection);
             try
             {
-                unavailable = canvas.Begin(current, group, beforeCanvas);
+                unavailable = canvas.Begin(current, group, beforeCanvas, bloom);
+                if (unavailable != null && bloom != null) return unavailable;
                 foreach (var text in texts)
                 {
                     if (!text || !text.gameObject.activeInHierarchy || string.IsNullOrEmpty(text.text)) continue;
@@ -110,6 +111,34 @@ namespace DSPAAMod.Game
             finally
             {
                 RenderTexture.active = previous;
+                entries.Clear();
+                canvas.End();
+            }
+        }
+        public int DrawWithBloom(NavigationBloom bloom)
+        {
+            if (!bloom.HasWorldBloom) return Draw(null);
+            RestoreVisibility();
+            if (PendingCount == 0 || !camera) { End(); return 0; }
+            CommandBuffer legacy = null;
+            int count = 0;
+            try
+            {
+                foreach (var entry in entries)
+                {
+                    var renderer = entry.Renderer;
+                    if (!renderer || !renderer.enabled || renderer.forceRenderingOff || !renderer.gameObject.activeInHierarchy || !entry.Material) continue;
+                    if (legacy == null) legacy = new CommandBuffer { name = "DSPAASR navigation text" };
+                    // The isolated camera supplies view/projection and CameraTarget;
+                    // its empty culling mask keeps legacy scene geometry out.
+                    legacy.DrawRenderer(renderer, entry.Material, 0, 0);
+                    ++count;
+                }
+                return count + canvas.DrawWithBloom(bloom, legacy, view, projection, viewport);
+            }
+            finally
+            {
+                legacy?.Release();
                 entries.Clear();
                 canvas.End();
             }

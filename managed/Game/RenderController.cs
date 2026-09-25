@@ -53,6 +53,7 @@ namespace DSPAAMod.Game
         private readonly List<CameraState> retired = new List<CameraState>();
         private readonly Action<string> report;
         private readonly WorldTextOverlay frameGenerationNavigation = new WorldTextOverlay();
+        private readonly NavigationBloom navigationBloom = new NavigationBloom();
         private Camera navigationCamera;
         private int navigationFrame = -1;
         private bool drawingNavigation, preparingNavigation;
@@ -68,7 +69,7 @@ namespace DSPAAMod.Game
         {
             if (!OwnsNavigation(camera)) EndFrameGenerationNavigation();
             if (!camera || camera != GameCamera.main) return;
-            string unavailable = frameGenerationNavigation.Begin(camera, projection, beforeCanvas);
+            string unavailable = frameGenerationNavigation.Begin(camera, projection, beforeCanvas, navigationBloom);
             if (unavailable != null)
             {
                 // The board remains in world color. FG must present the original
@@ -101,7 +102,7 @@ namespace DSPAAMod.Game
             {
                 if (!navigationCamera || navigationFrame != Time.frameCount) return;
                 drawingNavigation = true;
-                int count = frameGenerationNavigation.Draw(null);
+                int count = frameGenerationNavigation.DrawWithBloom(navigationBloom);
                 if (count > 0 && !reportedFrameGenerationNavigation)
                 {
                     information("World navigation text: " + count + " original renderers submitted after the FG world-color boundary.");
@@ -111,10 +112,19 @@ namespace DSPAAMod.Game
             finally { drawingNavigation = false; EndFrameGenerationNavigation(); }
         }
         private bool reportedFrameGenerationNavigation;
+        internal void ObserveNavigationBloom(BloomComponent bloom, Texture exposure)
+        {
+            if (!drawingNavigation && bloom.context != null && OwnsNavigation(bloom.context.camera))
+                navigationBloom.Observe(bloom, exposure);
+        }
         internal void EndFrameGenerationNavigation()
         {
             try { frameGenerationNavigation.End(); }
-            finally { navigationCamera = null; navigationFrame = -1; }
+            finally
+            {
+                navigationCamera = null; navigationFrame = -1;
+                navigationBloom.EndFrame();
+            }
         }
         private void PrepareCanvasNavigation()
         {
@@ -835,6 +845,7 @@ namespace DSPAAMod.Game
         public void Update()
         {
             if (navigationFrame != Time.frameCount) EndFrameGenerationNavigation();
+            navigationBloom.ReleaseIfUnused(Presentation?.TemporalRequested == true);
             for (int i = 0; i < supportQueries.Length; ++i)
                 if (supportRequested || (settings.Temporal && i == (FsrSelected ? 1 : 0))) UpdateSupport(supportQueries[i]);
             if (diagnosticThrough >= 0 && Time.frameCount > diagnosticThrough) FinishDiagnostic();
@@ -867,6 +878,7 @@ namespace DSPAAMod.Game
             Canvas.preWillRenderCanvases -= PrepareCanvasNavigation;
             EndFrameGenerationNavigation();
             frameGenerationNavigation.Dispose();
+            navigationBloom.Dispose();
             FinishDiagnostic();
             Capture?.Cancel("Renderer shutdown.");
             foreach (var state in cameras.Values) { Restore(state); Retire(state); }

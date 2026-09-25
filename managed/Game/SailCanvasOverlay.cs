@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.UI;
 
 namespace DSPAAMod.Game
@@ -27,11 +28,18 @@ namespace DSPAAMod.Game
 
         // A non-null reason rejects only this optional draw relocation. Unity
         // execution/restoration failures are exceptions, never capability results.
-        public string Begin(Camera source, GameObject group, bool beforeCanvas)
+        public string Begin(Camera source, GameObject group, bool beforeCanvas, NavigationBloom bloom = null)
         {
             End();
             var canvases = group.GetComponentsInChildren<Canvas>(true);
-            if (canvases.Length == 0) return null; // Legacy TextMesh board.
+            if (canvases.Length == 0)
+            {
+                // Legacy TextMesh draws can use this same explicit camera via a
+                // command buffer; its empty mask cannot redraw the world.
+                if (bloom == null) return null;
+                ConfigureRenderer(source, 0);
+                return bloom.Preflight(source);
+            }
             // Only the board's own canvas, never the shared world/UI canvas or
             // arbitrary WorldSpace graphics. Unknown replacements stay original.
             if (canvases.Length != 1) return "Navigation board has an unknown canvas hierarchy.";
@@ -73,25 +81,9 @@ namespace DSPAAMod.Game
             if (!string.IsNullOrEmpty(LayerMask.LayerToName(isolatedLayer)))
                 return "The navigation drawing layer is now named for another use.";
             if ((cameraLayers & bit) != 0) return "The navigation drawing layer is now used by another camera.";
-            if (!renderer)
-            {
-                var owner = new GameObject("DSPAASR navigation canvas camera") { hideFlags = HideFlags.HideAndDontSave };
-                renderer = owner.AddComponent<Camera>();
-                renderer.enabled = false;
-            }
-            renderer.CopyFrom(source);
-            renderer.enabled = false; // Always explicitly rendered, never scheduled twice.
-            renderer.RemoveAllCommandBuffers();
-            renderer.renderingPath = RenderingPath.Forward;
-            renderer.clearFlags = CameraClearFlags.Nothing;
-            renderer.cullingMask = bit;
-            renderer.depthTextureMode = DepthTextureMode.None;
-            renderer.allowMSAA = false;
-            renderer.allowHDR = false;
-            renderer.allowDynamicResolution = false;
-            renderer.forceIntoRenderTexture = false;
-            renderer.useJitteredProjectionMatrixForTransparentRendering = false;
-            renderer.useOcclusionCulling = false;
+            ConfigureRenderer(source, bit);
+            string unavailable = bloom?.Preflight(source);
+            if (unavailable != null) return unavailable; // No layer was changed yet.
             try
             {
                 Isolate(candidate.gameObject);
@@ -102,6 +94,28 @@ namespace DSPAAMod.Game
                 return null;
             }
             catch { End(); throw; }
+        }
+        private void ConfigureRenderer(Camera source, int mask)
+        {
+            if (!renderer)
+            {
+                var owner = new GameObject("DSPAASR navigation canvas camera") { hideFlags = HideFlags.HideAndDontSave };
+                renderer = owner.AddComponent<Camera>();
+                renderer.enabled = false;
+            }
+            renderer.CopyFrom(source);
+            renderer.enabled = false;
+            renderer.RemoveAllCommandBuffers();
+            renderer.renderingPath = RenderingPath.Forward;
+            renderer.clearFlags = CameraClearFlags.Nothing;
+            renderer.cullingMask = mask;
+            renderer.depthTextureMode = DepthTextureMode.None;
+            renderer.allowMSAA = false;
+            renderer.allowHDR = false;
+            renderer.allowDynamicResolution = false;
+            renderer.forceIntoRenderTexture = false;
+            renderer.useJitteredProjectionMatrixForTransparentRendering = false;
+            renderer.useOcclusionCulling = false;
         }
         private void Isolate(GameObject item)
         {
@@ -125,8 +139,44 @@ namespace DSPAAMod.Game
 
         public int Draw(RenderTexture destination, Matrix4x4 view, Matrix4x4 projection, Rect viewport)
         {
-            if (count == 0 || !renderer || !canvas || !canvas.isActiveAndEnabled) { End(); return 0; }
+            try { return DrawCamera(destination, view, projection, viewport); }
+            finally { End(); }
+        }
+        private bool VisibleCanvas => count > 0 && canvas && canvas.isActiveAndEnabled;
+        public int DrawWithBloom(NavigationBloom bloom, CommandBuffer legacy, Matrix4x4 view, Matrix4x4 projection, Rect viewport)
+        {
+            if (!VisibleCanvas && legacy == null) return 0;
+            Exception failure = null;
+            CommandBuffer composition = null;
+            try
+            {
+                try
+                {
+                    if (!bloom.Source) throw new InvalidOperationException("Navigation HDR target was not prepared before world rendering.");
+                    DrawCamera(bloom.Source, view, projection, viewport, legacy, null, true);
+                    composition = bloom.PrepareComposite(renderer);
+                }
+                catch (Exception error)
+                {
+                    bloom.Failed(error);
+                    failure = error;
+                }
+                // Even a failed HDR/glow preparation must still submit the actual
+                // text this frame. Restoring its old layer alone cannot do that.
+                // Never retry this final draw: an execution failure may be partial.
+                int drawn = DrawCamera(null, view, projection, viewport, legacy, composition);
+                if (failure != null)
+                    throw new InvalidOperationException("Navigation text was submitted without bloom after preparation failed: " + failure.Message, failure);
+                return drawn;
+            }
+            finally { bloom.EndFrame(); }
+        }
+        private int DrawCamera(RenderTexture destination, Matrix4x4 view, Matrix4x4 projection, Rect viewport,
+            CommandBuffer legacy = null, CommandBuffer composition = null, bool hdrSource = false)
+        {
+            if (!renderer || (!VisibleCanvas && legacy == null)) return 0;
             var previous = RenderTexture.active;
+            bool srgbWrite = GL.sRGBWrite;
             var depth = Shader.GetGlobalTexture(DepthTexture);
             var depthNormals = Shader.GetGlobalTexture(DepthNormalsTexture);
             var motion = Shader.GetGlobalTexture(MotionTexture);
@@ -139,20 +189,43 @@ namespace DSPAAMod.Game
                 renderer.projectionMatrix = projection;
                 renderer.nonJitteredProjectionMatrix = projection;
                 renderer.cullingMatrix = projection * view;
-                // Camera.Render handles the render-texture/backbuffer projection
-                // convention and UGUI's original material/atlas/alpha itself.
+                renderer.allowHDR = hdrSource;
+                renderer.clearFlags = hdrSource ? CameraClearFlags.SolidColor : CameraClearFlags.Nothing;
+                if (hdrSource) renderer.backgroundColor = Color.clear;
+                if (legacy != null) renderer.AddCommandBuffer(CameraEvent.AfterForwardAlpha, legacy);
+                if (composition != null) renderer.AddCommandBuffer(CameraEvent.AfterEverything, composition);
+                // Both renders consume the same early Canvas batch and layer.
+                // CameraTarget copies run INSIDE this camera, never in the caller's
+                // pre-cull context. Unity owns RT projection and sRGB view handling.
                 renderer.Render();
-                return count;
+                return VisibleCanvas ? count : 0;
             }
             finally
             {
-                // SR-only drawing is nested inside the original PP stack. Its
-                // following DoF/etc must retain the main camera's depth inputs.
-                Shader.SetGlobalTexture(DepthTexture, depth);
-                Shader.SetGlobalTexture(DepthNormalsTexture, depthNormals);
-                Shader.SetGlobalTexture(MotionTexture, motion);
-                RenderTexture.active = previous;
-                End();
+                try
+                {
+                    if (renderer)
+                    {
+                        if (legacy != null) renderer.RemoveCommandBuffer(CameraEvent.AfterForwardAlpha, legacy);
+                        if (composition != null) renderer.RemoveCommandBuffer(CameraEvent.AfterEverything, composition);
+                        renderer.targetTexture = null;
+                        renderer.allowHDR = false;
+                        renderer.clearFlags = CameraClearFlags.Nothing;
+                    }
+                }
+                finally
+                {
+                    // SR-only drawing is nested inside the original PP stack. Its
+                    // following DoF/etc must retain the main camera's depth inputs,
+                    // even if removal of a failed camera's command buffer throws.
+                    try
+                    {
+                        Shader.SetGlobalTexture(DepthTexture, depth);
+                        Shader.SetGlobalTexture(DepthNormalsTexture, depthNormals);
+                        Shader.SetGlobalTexture(MotionTexture, motion);
+                    }
+                    finally { RenderTexture.active = previous; GL.sRGBWrite = srgbWrite; }
+                }
             }
         }
 
