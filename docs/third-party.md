@@ -23,7 +23,7 @@ The frame-generation presentation adapter uses [NVIDIA-RTX/Streamline 2.14.1](ht
 
 Preserve the complete upstream `STREAMLINE-LICENSE.txt`, `nvngx_dlss.license.txt` and `reflex.license.txt`. Streamline's source license does not relicense DLSS-G or Reflex components; those retain their independent NVIDIA SDK terms, notices and applicable distribution/attribution obligations. The Nsight Perf exception listed in the Streamline license concerns `sl_nvperf`, which this package does not include. License files are preserved byte-for-byte, including the Reflex file's original encoding.
 
-Runtime loading verifies the official Streamline secondary signature on the five `sl.*` DLLs. The separate NGX FG runtime has a different signature structure: it is checked with Windows Authenticode, the NVIDIA signer and its exact pinned production SHA256. Files stay locked against replacement while the runtime owns them. No vendor DLL is modified, no security check is bypassed, and automatic plugin updates are disabled.
+The download and packaging tools verify the selected release files; these build-time pins are not enforced when the mod starts. The mod does not add runtime hash, signature or exact-file-version checks for external DLLs. Required exports, SDK initialization and feature-capability queries still determine compatibility, and checks inside vendor components are unchanged. Users may replace compatible runtime files while the game is closed; arbitrary newer versions or mixed component sets are not guaranteed to work. Files stay locked against replacement while the runtime owns them, and automatic plugin updates remain disabled. No vendor DLL is modified.
 
 ## NVIDIA NVAPI (optional developer tool)
 

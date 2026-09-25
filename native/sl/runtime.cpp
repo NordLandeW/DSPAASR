@@ -35,8 +35,22 @@ struct FrameCall {
     ~FrameCall() { state->leaveFrameCall(); }
 };
 constexpr uint32_t markerBit(SlMarker marker) { return 1u << static_cast<unsigned>(marker); }
+void lockRuntimeFiles(SlRuntimeState& state) {
+    constexpr const wchar_t* names[] = {L"sl.interposer.dll", L"sl.common.dll", L"sl.dlss_g.dll",
+                                        L"sl.reflex.dll",     L"sl.pcl.dll",    L"nvngx_dlssg.dll"};
+    for (const auto* name : names) {
+        const auto path = state.pluginPath / name;
+        auto file = std::make_unique<SlFileLock>();
+        file->value = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file->value == INVALID_HANDLE_VALUE)
+            graphicsCheck(HRESULT_FROM_WIN32(GetLastError()), "Lock Streamline runtime DLL");
+        // Prevent replacement while SDK workers may load/use these files. This
+        // is lifetime ownership, not a hash, signature or release-version gate.
+        state.files.push_back(std::move(file));
+    }
+}
 } // namespace
-void verifyRuntimeFiles(SlRuntimeState& state); // security.cpp, including locked-file ownership.
 std::string slError(sl::Result result) {
     switch (result) {
     case sl::Result::eOk: return "success";
@@ -74,13 +88,14 @@ void SlRuntimeState::initialize() {
     if (!creation.logDirectory.empty()) logPath = std::filesystem::absolute(creation.logDirectory);
     if (creation.projectId.empty() || creation.engineVersion.empty())
         throw std::invalid_argument("Streamline requires this project's own Unity engine identity");
-    verifyRuntimeFiles(*this);
+    lockRuntimeFiles(*this);
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                             reinterpret_cast<LPCWSTR>(&slError), &callbackModule.value))
         graphicsCheck(HRESULT_FROM_WIN32(GetLastError()), "Retain Streamline owner code");
     interposer.value = LoadLibraryExW((pluginPath / L"sl.interposer.dll").c_str(), nullptr,
                                      LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (!interposer.value) graphicsCheck(HRESULT_FROM_WIN32(GetLastError()), "Load verified Streamline interposer");
+    if (!interposer.value)
+        graphicsCheck(HRESULT_FROM_WIN32(GetLastError()), "Load Streamline interposer");
 #define DSPAA_SL_EXPORT(field, name) api.field = exported<PFun_##name>(interposer.value, #name)
     DSPAA_SL_EXPORT(init, slInit); DSPAA_SL_EXPORT(shutdown, slShutdown);
     DSPAA_SL_EXPORT(setDevice, slSetD3DDevice); DSPAA_SL_EXPORT(upgrade, slUpgradeInterface);
@@ -108,7 +123,7 @@ void SlRuntimeState::initialize() {
         const auto cleanup = api.shutdown();
         if (cleanup != sl::Result::eOk && cleanup != sl::Result::eErrorNotInitialized)
             quarantine("Streamline initialization and cleanup both failed");
-        slCheck(result, "Initialize Streamline 2.14.1");
+        slCheck(result, "Initialize Streamline");
     }
     initialized = true;
 }
