@@ -6,7 +6,7 @@
     <PlatformTarget>x64</PlatformTarget>
     <AssemblyName>DSPAASR.Preloader</AssemblyName>
     <RootNamespace>DSPAASR.Preloader</RootNamespace>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Product>DSPAASR</Product>
     <Description>Early presentation entry for DSPAASR.</Description>
     <Authors>NordLandeW</Authors>

@@ -6,9 +6,9 @@
     <PlatformTarget>x64</PlatformTarget>
     <AssemblyName>DSPAAMod</AssemblyName>
     <RootNamespace>DSPAAMod</RootNamespace>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Product>DSPAASR</Product>
-    <Description>Anti-aliasing and super resolution for Dyson Sphere Program.</Description>
+    <Description>Adds anti-aliasing, DLSS/AMD FSR super resolution and frame generation to Dyson Sphere Program.</Description>
     <Authors>NordLandeW</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>

@@ -6,6 +6,8 @@ After installation, open the game's **Graphics** settings to choose your anti-al
 
 Super resolution supports **DLSS and FSR 3.1**.
 
+Frame generation supports **NVIDIA DLSS Frame Generation and AMD FSR 3.1 Frame Generation**, independently of the AA/SR choice. Available modes depend on GPU and driver support. It is off by default; restart the game when prompted after enabling it for the first time. Frame generation has a rendering cost and can reduce the base frame rate, so its net benefit depends on the hardware and scene.
+
 ![Six-way anti-aliasing and super-resolution comparison](https://raw.githubusercontent.com/NordLandeW/DSPAASR/v1.0.0/docs/images/DSPAASR-comparison.png)
 
 ![The same six configurations in reverse order](https://raw.githubusercontent.com/NordLandeW/DSPAASR/v1.0.0/docs/images/DSPAASR-comparison-reversed.png)
@@ -28,6 +30,8 @@ DSPAASR 扩展了游戏的画质设置，提供更多抗锯齿与超分辨率选
 安装后，进入游戏原生的**画质设置**界面，即可调整抗锯齿／超分辨率选项及其配置。分辨率档位与模型配置可以独立选择。
 
 超分辨率支持 **DLSS 与 FSR 3.1**。
+
+帧生成支持 **NVIDIA DLSS 帧生成与 AMD FSR 3.1 帧生成**，可独立于抗锯齿／超分辨率选项配置。可用模式取决于 GPU 与驱动支持，默认关闭；首次启用后，请按提示重启游戏。帧生成本身有渲染开销，可能降低基础帧率，实际收益取决于硬件与场景。
 
 ![Six-way anti-aliasing and super-resolution comparison](https://raw.githubusercontent.com/NordLandeW/DSPAASR/v1.0.0/docs/images/DSPAASR-comparison.png)
 
@@ -56,8 +60,10 @@ This mod uses NVIDIA DLSS / NGX. The bundled `nvngx_dlss.dll` is proprietary sof
 
 NVIDIA, NVIDIA GeForce RTX, and DLSS are trademarks and/or registered trademarks of NVIDIA Corporation in the U.S. and other countries. Dyson Sphere Program's name, logo, and game imagery belong to their respective rights holders. The mod icon is a modified version of the game's logo.
 
+Frame generation also includes production NVIDIA Streamline, DLSS-G and Reflex components. Preserve the separate `STREAMLINE-LICENSE.txt`, `nvngx_dlss.license.txt` and `reflex.license.txt` supplied with the package; Streamline's source license does not relicense the NVIDIA runtime components. See the [third-party notices](https://github.com/NordLandeW/DSPAASR/blob/v1.2.0/docs/third-party.md) for the bundled components and their respective terms.
+
 **AMD FSR**
 
-The bundled, unmodified AMD-signed FSR loader and upscaler are governed by the [FSR SDK 2.3.0 license](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/60f4ea81909200d8542eca14dccb2628b763a9a3/docs/license.md). Preserve the complete `AMD-FSR-SDK-LICENSE.md` and `third-party.md` supplied with the package. The SDK has component-specific terms; the bundled runtime is not relicensed under this project's MIT license. AMD and FSR are trademarks of Advanced Micro Devices, Inc.
+The bundled, unmodified AMD-signed FSR loader, upscaler and frame-generation runtime are governed by the [FSR SDK 2.3.0 license](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/60f4ea81909200d8542eca14dccb2628b763a9a3/docs/license.md). Preserve the complete `AMD-FSR-SDK-LICENSE.md` and `third-party.md` supplied with the package. The SDK has component-specific terms; the bundled runtime is not relicensed under this project's MIT license. AMD and FSR are trademarks of Advanced Micro Devices, Inc.
 
 DSPAASR is an independent community mod and is not affiliated with or endorsed by Youthcat Studio, NVIDIA or AMD.

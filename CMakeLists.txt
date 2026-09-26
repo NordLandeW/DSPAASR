@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(DSPAASR VERSION 1.1.0 LANGUAGES CXX)
+project(DSPAASR VERSION 1.2.0 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "DSPAAMod currently requires Windows x64 and MSVC.")
