@@ -1,4 +1,5 @@
 #include "backend.h"
+#include "core/performance.h"
 #include "graphics/dx11-dx12.h"
 #include <array>
 #include <stdexcept>
@@ -114,7 +115,12 @@ class NativePresenter final : public PresentBackend {
             slot.completion = ++s.next;
             graphicsCheck(s.queue->Signal(s.fence.Get(), slot.completion), "Native input consumption signal");
             if (args.boundary && args.boundary->before) args.boundary->before(args.boundary->context, slot.frame->applicationFrameId);
-            const auto result = args.parameters ? s.chain->Present1(args.syncInterval, args.flags, args.parameters) : s.chain->Present(args.syncInterval, args.flags);
+            HRESULT result;
+            {
+                DSPAA_PERF_SCOPE(NativePresent);
+                result = args.parameters ? s.chain->Present1(args.syncInterval, args.flags, args.parameters)
+                                         : s.chain->Present(args.syncInterval, args.flags);
+            }
             if (args.boundary && args.boundary->after) args.boundary->after(args.boundary->context, slot.frame->applicationFrameId);
             s.current = (s.current + 1) % static_cast<unsigned>(s.slots.size());
             return result;

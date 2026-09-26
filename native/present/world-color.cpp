@@ -1,6 +1,8 @@
 #include "world-color.h"
 #include "channel.h"
+#include "core/performance.h"
 #include "graphics/predication.h"
+#include <stdexcept>
 
 namespace dspaa {
 namespace {
@@ -36,6 +38,7 @@ void WorldColor::releaseSurfaceReference() {
     source_.Reset();
 }
 void WorldColor::capture(uint64_t frame) {
+    DSPAA_PERF_SCOPE(WorldCapture);
     auto access = bridge_->lock();
     if (!source_ || !frame || frame <= frame_)
         return;
@@ -69,35 +72,30 @@ void WorldColor::capture(uint64_t frame) {
     // Copy-compatible typed/typeless/sRGB views preserve storage bytes, without
     // a shader decode/encode round trip. SDK inputs use the presentation format.
     desc.Format = expected.Format;
-    std::shared_ptr<Image>* free = nullptr;
+    std::shared_ptr<WorldColorImage>* free = nullptr;
     for (auto& slot : slots_)
-        if (!slot || slot.use_count() == 1) {
+        if (!slot || (slot.use_count() == 1 && slot->ready.complete())) {
             free = &slot;
             break;
         }
     if (!free)
         return; // An unavailable input pauses FG, never original rendering.
     if (!*free)
-        *free = std::make_shared<Image>();
+        *free = std::make_shared<WorldColorImage>();
     auto& image = **free;
     image.srgbView = viewDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
                      viewDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-    if (image.texture) {
+    if (image.texture.dx11) {
         D3D11_TEXTURE2D_DESC prior{};
-        image.texture->GetDesc(&prior);
+        image.texture.dx11->GetDesc(&prior);
         if (prior.Width != desc.Width || prior.Height != desc.Height || prior.Format != desc.Format)
-            image.texture.Reset();
+            image.texture = {};
     }
-    if (!image.texture) {
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.CPUAccessFlags = 0;
-        desc.MiscFlags = 0;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        graphicsCheck(bridge_->device11()->CreateTexture2D(&desc, nullptr, &image.texture),
-                      "Create world-color snapshot");
-    }
+    if (!image.texture.dx11)
+        image.texture = bridge_->texture(desc.Width, desc.Height, desc.Format, false);
+    image.ready = {};
     UnpredicatedCopy unconditional(context);
-    context->CopyResource(image.texture.Get(), current.Get());
+    context->CopyResource(image.texture.dx11.Get(), current.Get());
     // Exact world-target bytes: no guessed gamma/PQ conversion or second PP chain.
     pending_ = *free;
 }
@@ -111,7 +109,7 @@ void WorldColor::attach(PresentationSubmission& submission) {
         return;
     }
     D3D11_TEXTURE2D_DESC captured{}, display{};
-    pending_->texture->GetDesc(&captured);
+    pending_->texture.dx11->GetDesc(&captured);
     if (!source_) {
         submission.metadata.flags &= ~1u;
         return;
@@ -126,10 +124,10 @@ void WorldColor::attach(PresentationSubmission& submission) {
         return;
     }
     submission.hudlessSrgbView = pending_->srgbView;
-    submission.resources[0] = pending_->texture;
-    submission.metadata.hudless = pending_->texture.Get();
+    submission.resources[0] = pending_->texture.dx11;
+    submission.metadata.hudless = pending_->texture.dx11.Get();
     submission.worldLifetime = std::move(pending_);
-    // This slot remains leased through transport's copy and the existing SDK
-    // input-consumption fences. A CPU frame number never certifies GPU completion.
+    // The lease covers backend consumption; the image's independent fence/value
+    // additionally protects pending producer work if the frame is released early.
 }
 } // namespace dspaa

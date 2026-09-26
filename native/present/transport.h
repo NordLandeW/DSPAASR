@@ -9,7 +9,9 @@ class PresentationTransport {
         std::array<SharedTexture, 6> textures;
         std::shared_ptr<FrameImages> images;
         DisplayColor color;
-        uint64_t readyValue = 0;
+        FencePoint ready;
+        // A later pure-D3D11 publication must not replace this allocator's proof.
+        FencePoint normalized;
     };
     std::shared_ptr<Dx11Dx12> bridge_;
     std::array<Slot, 4> slots_;

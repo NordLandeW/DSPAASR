@@ -1,4 +1,5 @@
 #include "presenter.h"
+#include "core/performance.h"
 #include "graphics/dx11-dx12.h"
 #include "present/display-layout.h"
 #include <algorithm>
@@ -26,6 +27,18 @@ constexpr DWORD gpuTimeout = 30000;
 constexpr size_t slotCount = 3;
 constexpr D3D12_RESOURCE_STATES pixelRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 constexpr D3D12_RESOURCE_STATES computeRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+#if defined(DSPAA_ENABLE_PERFORMANCE_METRICS)
+bool diagnosticAsyncWorkloads() noexcept {
+    // Latch once per process, before creating any frame-generation context.
+    // All other values leave the diagnostic build on the normal queue path.
+    static const bool enabled = [] {
+        wchar_t value[2]{};
+        return GetEnvironmentVariableW(L"DSPAA_DIAGNOSTIC_FSR_ASYNC", value, 2) == 1 && value[0] == L'1';
+    }();
+    return enabled;
+}
+#endif
 
 void checkFfx(ffxReturnCode_t result, const char* operation) {
     if (result != FFX_API_RETURN_OK)
@@ -178,6 +191,11 @@ struct FsrPresenter::Impl {
     bool stopped = false, contextVerified = false;
     std::atomic<bool> quarantined{false};
     bool lastEnabled = false, fgFaulted = false, historyReset = true;
+#if defined(DSPAA_ENABLE_PERFORMANCE_METRICS)
+    const bool asyncWorkloads = diagnosticAsyncWorkloads();
+#else
+    static constexpr bool asyncWorkloads = false;
+#endif
     DXGI_COLOR_SPACE_TYPE colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     std::atomic<bool> dispatchError{false};
     void dispatchFailed() noexcept {
@@ -206,7 +224,7 @@ struct FsrPresenter::Impl {
         PresentationFrame metadata;
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> commands;
-        Image finalColor, hudlessRaw, hudless, depth, motion, distortion;
+        Image hudlessRaw, hudless, depth, motion, distortion;
         ComPtr<ID3D12DescriptorHeap> views, targets;
     };
     std::array<Slot, slotCount> slots;
@@ -592,6 +610,8 @@ void FsrPresenter::Impl::validateTemporal(const PresentationFrame& frame) const 
 }
 uint32_t FsrPresenter::Impl::flags(const PresentationFrame& frame) const {
     uint32_t result = 0;
+    if (asyncWorkloads)
+        result |= FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT;
     if (frame.depthInverted)
         result |= FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED;
     if (frame.depthInfinite)
@@ -622,7 +642,7 @@ void FsrPresenter::Impl::configure(ffxContext context, uint64_t id, bool enabled
     configuration.frameGenerationCallback = dispatchCallback;
     configuration.frameGenerationCallbackUserContext = this;
     configuration.frameGenerationEnabled = enabled;
-    configuration.allowAsyncWorkloads = false;
+    configuration.allowAsyncWorkloads = asyncWorkloads;
     configuration.frameID = id;
     configuration.generationRect =
         enabled ? generationRect(frame.generationRect, creation.swapChain.Width, creation.swapChain.Height)
@@ -667,6 +687,7 @@ void FsrPresenter::Impl::ensureContext(const PresentationFrame& frame) {
     // userdata. Keep old contexts alive until the replacement is installed.
     PresentationFrame metadata = frame;
     metadata.images.reset();
+    metadata.producerLifetime.reset();
     metadata.readyFence.Reset();
     try {
         sdkControl([this, next, metadata] {
@@ -712,7 +733,10 @@ FsrPresenter::Impl::Slot& FsrPresenter::Impl::acquire() {
             first = std::min(first, slot.retired);
     if (first == UINT64_MAX)
         throw std::runtime_error("FSR private slot retirement has no queue proof");
-    wait(first);
+    {
+        DSPAA_PERF_SCOPE(FsrSlotWait);
+        wait(first);
+    }
     collect();
     for (auto& slot : slots)
         if (!slot.occupied)
@@ -770,20 +794,34 @@ void FsrPresenter::Impl::allocate(Slot& slot, const PresentationFrame& frame, bo
         image.resource = texture(w, h, format, flags);
         image.state = D3D12_RESOURCE_STATE_COMMON;
     };
-    ensure(slot.finalColor, width, height, creation.swapChain.Format);
     if (!generating)
         return;
     const auto& images = *frame.images;
-    ensure(slot.hudlessRaw, width, height, readableFormat(images.hudless.resource->GetDesc().Format));
     ensure(slot.hudless, width, height, creation.swapChain.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-    ensure(slot.depth, frame.renderWidth, frame.renderHeight,
-           readableFormat(images.depth.resource->GetDesc().Format));
-    const auto mv = images.motion.resource->GetDesc();
-    ensure(slot.motion, static_cast<unsigned>(mv.Width), mv.Height, readableFormat(mv.Format));
+    // Copy-only producers remain supported. Normal shared inputs can be read
+    // directly during Prepare; no private D/M allocation is then required.
+    auto readableInput = [&](Image& fallback, const PresentImage& input) {
+        const auto desc = input.resource->GetDesc();
+        // A typed sRGB resource also needs a storage copy when sampled for format
+        // conversion: the contract preserves encoded values, not an sRGB decode.
+        if ((desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
+            desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+            ensure(fallback, static_cast<unsigned>(desc.Width), desc.Height, readableFormat(desc.Format));
+        else
+            fallback = {};
+    };
+    readableInput(slot.depth, images.depth);
+    readableInput(slot.motion, images.motion);
     if (images.fsrDistortion.resource)
         ensure(slot.distortion, width, height,
                readableFormat(images.fsrDistortion.resource->GetDesc().Format));
-    view(slot.views.Get(), 0, slot.hudlessRaw.resource.Get());
+    if (readableFormat(images.hudless.resource->GetDesc().Format) !=
+        readableFormat(creation.swapChain.Format)) {
+        readableInput(slot.hudlessRaw, images.hudless);
+        view(slot.views.Get(), 0,
+             slot.hudlessRaw.resource ? slot.hudlessRaw.resource.Get() : images.hudless.resource.Get());
+    } else
+        slot.hudlessRaw = {};
 }
 void FsrPresenter::Impl::view(ID3D12DescriptorHeap* heap, unsigned index, ID3D12Resource* resource) {
     D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
@@ -836,6 +874,14 @@ void FsrPresenter::Impl::copyInput(ID3D12GraphicsCommandList* commands, const Pr
 
 void FsrPresenter::Impl::prepare(Slot& slot) {
     const auto& frame = slot.metadata;
+    const auto& inputs = *slot.lease->images;
+    const PresentImage depth =
+        slot.depth.resource ? PresentImage{slot.depth.resource, slot.depth.state} : inputs.depth;
+    const PresentImage motion =
+        slot.motion.resource ? PresentImage{slot.motion.resource, slot.motion.state} : inputs.motion;
+    auto* commands = slot.commands.Get();
+    barrier(commands, depth.resource.Get(), depth.state, computeRead);
+    barrier(commands, motion.resource.Get(), motion.state, computeRead);
     ffxDispatchDescFrameGenerationPrepareV2 desc{};
     desc.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
     desc.frameID = slot.id;
@@ -849,41 +895,74 @@ void FsrPresenter::Impl::prepare(Slot& slot) {
     desc.cameraFar = frame.depthInverted ? frame.cameraNear : frame.cameraFar;
     desc.cameraFovAngleVertical = frame.verticalFov;
     desc.viewSpaceToMetersFactor = frame.viewSpaceToMeters;
-    desc.depth = ffxApiGetResourceDX12(slot.depth.resource.Get());
-    desc.motionVectors = ffxApiGetResourceDX12(slot.motion.resource.Get());
+    desc.depth = ffxApiGetResourceDX12(depth.resource.Get());
+    desc.motionVectors = ffxApiGetResourceDX12(motion.resource.Get());
+    desc.depth.description.format =
+        ffxApiGetSurfaceFormatDX12(readableFormat(depth.resource->GetDesc().Format));
+    desc.motionVectors.description.format =
+        ffxApiGetSurfaceFormatDX12(readableFormat(motion.resource->GetDesc().Format));
     std::copy(frame.cameraPosition.begin(), frame.cameraPosition.end(), desc.cameraPosition);
     std::copy(frame.cameraUp.begin(), frame.cameraUp.end(), desc.cameraUp);
     std::copy(frame.cameraRight.begin(), frame.cameraRight.end(), desc.cameraRight);
     std::copy(frame.cameraForward.begin(), frame.cameraForward.end(), desc.cameraForward);
     checkFfx(api.Dispatch(&fgContext, &desc.header), "Prepare analytical FSR FG");
+    // Prepare records reconstruction into SDK-owned double-buffered resources.
+    // Later interpolation reads those, not the original D/M. Unregistering the
+    // inputs only ends recording: the lease still waits for the upload fence.
+    barrier(commands, depth.resource.Get(), computeRead, depth.state);
+    barrier(commands, motion.resource.Get(), computeRead, motion.state);
 }
 void FsrPresenter::Impl::upload(Slot& slot, bool generating, ID3D12Resource* backbuffer) {
+    DSPAA_PERF_SCOPE(FsrUpload);
     graphicsCheck(slot.allocator->Reset(), "Reset retired FSR presentation allocator");
     graphicsCheck(slot.commands->Reset(slot.allocator.Get(), nullptr),
                   "Reset retired FSR presentation commands");
     auto* commands = slot.commands.Get();
     const auto& inputs = *slot.lease->images;
-    copyInput(commands, inputs.finalColor, slot.finalColor, D3D12_RESOURCE_STATE_COPY_SOURCE);
     if (generating) {
-        copyInput(commands, inputs.hudless, slot.hudlessRaw, pixelRead);
-        copyInput(commands, inputs.depth, slot.depth, computeRead);
-        copyInput(commands, inputs.motion, slot.motion, computeRead);
+        if (readableFormat(inputs.hudless.resource->GetDesc().Format) ==
+            readableFormat(creation.swapChain.Format)) {
+            // The game transport normally supplies the presentation format. Keep
+            // its encoded bytes without a redundant fullscreen conversion pass.
+            copyInput(commands, inputs.hudless, slot.hudless, computeRead);
+        } else {
+            // Standalone producers may use another storage format with the same
+            // encoding. The producer lease protects this direct shader read until
+            // copied completes; the private result survives SDK interpolation.
+            if (slot.hudlessRaw.resource)
+                copyInput(commands, inputs.hudless, slot.hudlessRaw, pixelRead);
+            else
+                barrier(commands, inputs.hudless.resource.Get(), inputs.hudless.state, pixelRead);
+            change(commands, slot.hudless, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            draw(commands, copyPipeline.Get(), slot.views.Get(), 0,
+                 target(slot.targets.Get(), 0, slot.hudless.resource.Get()));
+            if (!slot.hudlessRaw.resource)
+                barrier(commands, inputs.hudless.resource.Get(), pixelRead, inputs.hudless.state);
+            change(commands, slot.hudless, computeRead);
+        }
+        if (slot.depth.resource)
+            copyInput(commands, inputs.depth, slot.depth, computeRead);
+        if (slot.motion.resource)
+            copyInput(commands, inputs.motion, slot.motion, computeRead);
         if (inputs.fsrDistortion.resource)
             copyInput(commands, inputs.fsrDistortion, slot.distortion, computeRead);
-        change(commands, slot.hudless, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        draw(commands, copyPipeline.Get(), slot.views.Get(), 0,
-             target(slot.targets.Get(), 0, slot.hudless.resource.Get()));
-        change(commands, slot.hudless, computeRead);
         prepare(slot);
     }
+    // Final has no later private consumer. Copy straight into the SDK-owned
+    // backbuffer; its own swapchain retirement protects subsequent SDK reads.
+    barrier(commands, inputs.finalColor.resource.Get(), inputs.finalColor.state,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
     barrier(commands, backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
-    commands->CopyResource(backbuffer, slot.finalColor.resource.Get());
+    commands->CopyResource(backbuffer, inputs.finalColor.resource.Get());
     barrier(commands, backbuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+    barrier(commands, inputs.finalColor.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+            inputs.finalColor.state);
     graphicsCheck(commands->Close(), "Close FSR presentation inputs");
     ID3D12CommandList* lists[] = {commands};
     queue->ExecuteCommandLists(1, lists);
-    // Only this proof releases the producer lease; SDK consumption is tracked
-    // separately by Slot::retired and can outlive this copy completion.
+    // Only this proof releases the producer lease, after every copy, conversion
+    // and Prepare read. SDK interpolation consumption is tracked separately by
+    // Slot::retired and can outlive the producer-input completion.
     slot.copied = signal();
 }
 bool FsrPresenter::Impl::snapshot(uint64_t id, Snapshot& output) {
@@ -913,7 +992,11 @@ ffxReturnCode_t FsrPresenter::Impl::dispatchCallback(ffxDispatchDescFrameGenerat
         desc->minMaxLuminance[1] = slot.metadata.maxLuminance;
         desc->generationRect = generationRect(slot.metadata.generationRect, self->creation.swapChain.Width,
                                               self->creation.swapChain.Height);
-        const auto result = self->api.Dispatch(&self->fgContext, &desc->header);
+        ffxReturnCode_t result;
+        {
+            DSPAA_PERF_SCOPE(FsrDispatch);
+            result = self->api.Dispatch(&self->fgContext, &desc->header);
+        }
         if (result != FFX_API_RETURN_OK) {
             // The pinned swapchain still examines this count even when the
             // callback failed and it dropped the interpolation command list.
@@ -992,6 +1075,7 @@ HRESULT FsrPresenter::Impl::present(FrameLease frame, const PresentArguments& ar
                   displayRect(creation.swapChain.Width, creation.swapChain.Height, frame->generationRect)) ||
               previousRenderWidth != frame->renderWidth || previousRenderHeight != frame->renderHeight));
         slot.metadata.images.reset();
+        slot.metadata.producerLifetime.reset();
         slot.metadata.readyFence.Reset();
         slot.metadata.readyValue = 0;
     }
@@ -1026,8 +1110,12 @@ HRESULT FsrPresenter::Impl::present(FrameLease frame, const PresentArguments& ar
     // frames. Do not promise partial-update semantics or retain this borrowed ptr.
     if (args.boundary && args.boundary->before)
         args.boundary->before(args.boundary->context, frame->applicationFrameId);
-    const auto result = args.parameters ? chain->Present1(args.syncInterval, args.flags, args.parameters)
-                                        : chain->Present(args.syncInterval, args.flags);
+    HRESULT result;
+    {
+        DSPAA_PERF_SCOPE(FsrPresent);
+        result = args.parameters ? chain->Present1(args.syncInterval, args.flags, args.parameters)
+                                 : chain->Present(args.syncInterval, args.flags);
+    }
     if (args.boundary && args.boundary->after)
         args.boundary->after(args.boundary->context, frame->applicationFrameId);
     const auto retirement = signal();

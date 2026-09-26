@@ -64,7 +64,7 @@ struct Images {
     unsigned renderWidth, renderHeight;
     float cameraAspect;
     Images(dspaa::Dx11Dx12& bridge, unsigned width, unsigned height, RECT area = {}, unsigned rasterWidth = 0,
-           unsigned rasterHeight = 0)
+           unsigned rasterHeight = 0, bool sameHudlessFormat = false)
         : content(area) {
         if (!content.left && !content.top && !content.right && !content.bottom)
             content = {0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
@@ -83,14 +83,15 @@ struct Images {
         };
         const size_t pixels = static_cast<size_t>(width) * height;
         std::vector<uint32_t> final(pixels);
+        std::vector<uint32_t> packedHudless(pixels, 0xff000000u);
         std::vector<HALF> color(pixels * 4);
         const size_t rasterPixels = static_cast<size_t>(renderWidth) * renderHeight;
         std::vector<float> depth(rasterPixels, .5f);
         std::vector<HALF> motion(rasterPixels * 2, 0), distortion(rasterPixels * 4, 0);
         size_t uiPixels = 0;
         // Final has a 60%-opaque screen panel over the same SDR-encoded scene
-        // as HUDless. Their backgrounds agree after FP16-to-UNORM conversion;
-        // no UI alpha/color surface or global encoding mismatch stands in for UI.
+        // as HUDless. Exercise both an exact UNORM copy and the FP16-to-UNORM
+        // conversion fallback; neither route supplies a separate UI alpha/color.
         constexpr std::array<unsigned, 3> panel{230, 210, 40};
         for (unsigned y = 0; y < height; ++y)
             for (unsigned x = 0; x < width; ++x) {
@@ -115,6 +116,7 @@ struct Images {
                         ui ? (3 * panel[channel] + 2 * scene[channel] + 2) / 5 : scene[channel];
                     final[pixel] |= value << (channel * 8);
                 }
+                packedHudless[pixel] = background;
                 if (final[pixel] != background)
                     ++uiPixels;
             }
@@ -122,8 +124,12 @@ struct Images {
                 "SL probe must contain both nonzero screen UI and matching background");
         make(frame->finalColor, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, final.data(),
              width * sizeof(uint32_t));
-        make(frame->hudless, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, color.data(),
-             width * 4 * sizeof(HALF));
+        if (sameHudlessFormat)
+            make(frame->hudless, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, packedHudless.data(),
+                 width * sizeof(uint32_t));
+        else
+            make(frame->hudless, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, color.data(),
+                 width * 4 * sizeof(HALF));
         make(frame->depth, renderWidth, renderHeight, DXGI_FORMAT_R32_FLOAT, depth.data(),
              renderWidth * sizeof(float));
         make(frame->motion, renderWidth, renderHeight, DXGI_FORMAT_R16G16_FLOAT, motion.data(),
@@ -256,7 +262,9 @@ int wmain(int argc, wchar_t** argv) {
             desc.Height = sizes[stage][1];
             if (stage)
                 dspaa::graphicsCheck(presenter.resize(desc, stage + 1), "Resize SL presentation generation");
-            Images inputs(bridge, desc.Width, desc.Height);
+            const bool sameHudlessFormat = stage != 1;
+            Images inputs(bridge, desc.Width, desc.Height, {}, 0, 0, sameHudlessFormat);
+            Images otherFormatInputs(bridge, desc.Width, desc.Height, {}, 0, 0, !sameHudlessFormat);
             const unsigned contentWidth = desc.Height * 4 / 3;
             const auto inset = static_cast<LONG>((desc.Width - contentWidth) / 2);
             const RECT cropped{inset, 0, inset + static_cast<LONG>(contentWidth),
@@ -306,6 +314,7 @@ int wmain(int argc, wchar_t** argv) {
                 const auto capability = presenter.status();
                 const Images& selected = index >= cropBegin && index < shiftBegin   ? cropInputs
                                          : index >= shiftBegin && index < fullBegin ? shiftInputs
+                                         : index >= recoverBegin                    ? otherFormatInputs
                                                                                     : inputs;
                 const bool invalidArea = index >= invalidBegin && index < minimumCase;
                 const bool belowMinimum = index == minimumCase && capability.minimumDimension > 1;
@@ -453,7 +462,8 @@ int wmain(int argc, wchar_t** argv) {
         std::cout << "stages=3 gpu_retirement=complete producer_lease=released d3d12_errors=" << errors
                   << " screen_ui=nonzero ui_alpha=absent visible_windows=0 physical_display_fps=not_measured "
                      "content_rect=accepted_shifted_restored invalid_rect=original_only "
-                     "invalid_projection=original_only "
+                     "invalid_projection=original_only hudless_formats=same_and_converted "
+                     "same_stage_format_switch=accepted "
                      "pixel_fidelity=not_measured reset_constants=not_independently_observed\n";
         return 0;
     } catch (const dspaa::SlPresenterCreationError& error) {

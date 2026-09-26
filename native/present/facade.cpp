@@ -1,5 +1,6 @@
 #include "facade.h"
 #include "backend.h"
+#include "core/performance.h"
 #include "fsr/presenter.h"
 #include "graphics/dx11-dx12.h"
 #include "latency.h"
@@ -50,6 +51,12 @@ class Facade final : public IDXGISwapChain4 {
         bool resumeWhenEnvelope = false;
         std::string selectionFailure;
         std::optional<UINT> maximumLatency;
+#if defined(DSPAA_ENABLE_PERFORMANCE_METRICS)
+        // Observe the host's swapchain setter, not device-level latency controls.
+        uint64_t hostLatencyCalls = 0;
+        UINT hostLatencyRequested = 0;
+        HRESULT hostLatencyResult = S_FALSE;
+#endif
         std::optional<std::pair<UINT, UINT>> sourceSize;
         std::optional<DXGI_MODE_ROTATION> rotation;
         std::optional<DXGI_MATRIX_3X2_F> matrix;
@@ -258,7 +265,12 @@ class Facade final : public IDXGISwapChain4 {
             s.bridge->context11()->OMSetRenderTargets(static_cast<UINT>(raw.size()), raw.data(), depth.Get());
     }
     HRESULT present(const PresentArguments& args) noexcept {
-        std::lock_guard guard(mutex_);
+        DSPAA_PERF_SCOPE(FacadePresent);
+        std::unique_lock guard(mutex_, std::defer_lock);
+        {
+            DSPAA_PERF_SCOPE(FacadeLockWait);
+            guard.lock();
+        }
         if (!s_ || s_->faulted || (s_->waitable() && !s_->latency.active()))
             return DXGI_ERROR_DEVICE_REMOVED;
         try {
@@ -307,6 +319,27 @@ class Facade final : public IDXGISwapChain4 {
                               s_->description.Height, s_->generation, id, s_->activeBackend,
                               frame->inputsComplete ? 1u : 0u);
                 s_->log(message);
+#if defined(DSPAA_ENABLE_PERFORMANCE_METRICS)
+                // Only successful low-frequency samples query the active backend.
+                if (SUCCEEDED(result)) {
+                    UINT maximumLatency = 0;
+                    auto* chain = s_->backend->queries();
+                    const auto latencyResult =
+                        chain ? chain->GetMaximumFrameLatency(&maximumLatency) : E_NOINTERFACE;
+                    char parameters[384]{};
+                    std::snprintf(parameters, sizeof(parameters),
+                                  "native.present.parameters count=%llu generation=%llu backend=%u "
+                                  "sync_interval=%u present_flags=%08X chain_flags=%08X buffers=%u "
+                                  "host_latency_calls=%llu host_latency_requested=%u host_latency_hr=%08X "
+                                  "backend_max_latency=%u backend_latency_hr=%08X",
+                                  s_->presents, s_->generation, s_->activeBackend, args.syncInterval,
+                                  args.flags, s_->description.Flags, s_->description.BufferCount,
+                                  s_->hostLatencyCalls, s_->hostLatencyRequested,
+                                  static_cast<unsigned>(s_->hostLatencyResult), maximumLatency,
+                                  static_cast<unsigned>(latencyResult));
+                    s_->log(parameters);
+                }
+#endif
             }
             return result;
         } catch (const std::exception& e) {
@@ -383,6 +416,14 @@ class Facade final : public IDXGISwapChain4 {
             throw std::runtime_error("Cannot bind stable presentation latency handle");
         if (s.log)
             s.log("Native D3D11-facing/D3D12 presentation bridge created");
+#if defined(DSPAA_ENABLE_PERFORMANCE_METRICS)
+        if (s.log) {
+            char message[96]{};
+            std::snprintf(message, sizeof(message), "native.swapchain.create flags=%08X buffers=%u",
+                          description.Flags, description.BufferCount);
+            s.log(message);
+        }
+#endif
     }
     PresentRetirement stop() noexcept {
         return s_ ? s_->stop() : PresentRetirement::Drained;
@@ -632,6 +673,13 @@ class Facade final : public IDXGISwapChain4 {
     HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT v) override {
         std::lock_guard guard(mutex_);
         const auto hr = control([&](auto& b) { return b.setMaximumFrameLatency(v); });
+#if defined(DSPAA_ENABLE_PERFORMANCE_METRICS)
+        if (s_) {
+            ++s_->hostLatencyCalls;
+            s_->hostLatencyRequested = v;
+            s_->hostLatencyResult = hr;
+        }
+#endif
         if (SUCCEEDED(hr))
             s_->maximumLatency = v;
         return hr;

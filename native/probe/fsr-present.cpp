@@ -107,7 +107,7 @@ struct Inputs {
     std::shared_ptr<dspaa::FrameImages> images = std::make_shared<dspaa::FrameImages>();
     std::vector<dspaa::SharedTexture> resources;
     Inputs(dspaa::Dx11Dx12& bridge, unsigned width, unsigned height, unsigned renderWidth,
-           unsigned renderHeight) {
+           unsigned renderHeight, unsigned sequence, bool sameFormat) {
         auto access = bridge.lock();
         auto create = [&](dspaa::PresentImage& destination, DXGI_FORMAT format, const void* data, UINT pitch,
                           unsigned w, unsigned h) {
@@ -117,11 +117,21 @@ struct Inputs {
             resources.push_back(std::move(texture));
         };
         const size_t pixels = static_cast<size_t>(width) * height;
-        std::vector<uint32_t> final(pixels);
+        std::vector<uint32_t> final(pixels), hudlessBytes(pixels);
         std::vector<HALF> hudless(pixels * 4);
         const size_t rasterPixels = static_cast<size_t>(renderWidth) * renderHeight;
-        std::vector<float> depth(rasterPixels, .5f);
-        std::vector<HALF> motion(rasterPixels * 2, 0), distortion(pixels * 2, 0);
+        std::vector<float> depth(rasterPixels);
+        std::vector<HALF> motion(rasterPixels * 2), distortion(pixels * 2, 0);
+        // Exercise changing bindings and Prepare's direct reads with distinct,
+        // nonzero data, rather than a perpetually zero MV map. Image fidelity is
+        // validated separately; successful dispatch is only submission evidence.
+        for (unsigned y = 0; y < renderHeight; ++y)
+            for (unsigned x = 0; x < renderWidth; ++x) {
+                const size_t pixel = static_cast<size_t>(y) * renderWidth + x;
+                depth[pixel] = .35f + .002f * sequence + .1f * y / renderHeight;
+                motion[pixel * 2] = XMConvertFloatToHalf(.001f * (1 + sequence % 3));
+                motion[pixel * 2 + 1] = XMConvertFloatToHalf(-.0005f * (1 + sequence % 2));
+            }
         size_t uiPixels = 0;
         // A spatially varying postprocessed scene, with a 60%-opaque screen
         // panel only in Final. Both inputs use the same SDR-encoded values;
@@ -131,7 +141,8 @@ struct Inputs {
         for (unsigned y = 0; y < height; ++y)
             for (unsigned x = 0; x < width; ++x) {
                 const size_t pixel = static_cast<size_t>(y) * width + x;
-                const std::array<unsigned, 3> scene{32 + x * 96 / width, 48 + y * 80 / height, 96};
+                const std::array<unsigned, 3> scene{32 + ((x + sequence) % width) * 96 / width,
+                                                    48 + y * 80 / height, 96};
                 const bool ui = x >= width / 8 && x < width / 2 && y >= height / 4 && y < height / 2;
                 uint32_t background = 0xff000000u;
                 final[pixel] = background;
@@ -144,6 +155,7 @@ struct Inputs {
                     final[pixel] |= value << (channel * 8);
                 }
                 hudless[pixel * 4 + 3] = XMConvertFloatToHalf(1.f);
+                hudlessBytes[pixel] = background;
                 if (final[pixel] != background)
                     ++uiPixels;
             }
@@ -152,8 +164,12 @@ struct Inputs {
         // This exercises SDK HUDless UI extraction, not a pixel-fidelity check.
         create(images->finalColor, DXGI_FORMAT_R8G8B8A8_UNORM, final.data(), width * sizeof(uint32_t), width,
                height);
-        create(images->hudless, DXGI_FORMAT_R16G16B16A16_FLOAT, hudless.data(), width * 4 * sizeof(HALF),
-               width, height);
+        if (sameFormat)
+            create(images->hudless, DXGI_FORMAT_R8G8B8A8_UNORM, hudlessBytes.data(), width * sizeof(uint32_t),
+                   width, height);
+        else
+            create(images->hudless, DXGI_FORMAT_R16G16B16A16_FLOAT, hudless.data(), width * 4 * sizeof(HALF),
+                   width, height);
         create(images->depth, DXGI_FORMAT_R32_FLOAT, depth.data(), renderWidth * sizeof(float), renderWidth,
                renderHeight);
         create(images->motion, DXGI_FORMAT_R16G16_FLOAT, motion.data(), renderWidth * 2 * sizeof(HALF),
@@ -250,8 +266,9 @@ int wmain(int argc, wchar_t** argv) {
         require(presenter.present({}, {}, true) == E_INVALIDARG, "An absent non-TEST Final was accepted");
         // The SDK may activate long after simulation began; its first token is
         // not necessarily one, and dropped captures can leave intentional gaps.
-        uint64_t frameId = 1000;
+        uint64_t frameId = 1000, readyValue = 0;
         std::weak_ptr<const dspaa::PresentationFrame> firstLease;
+        std::vector<std::weak_ptr<Inputs>> producers;
         const std::array<std::array<unsigned, 2>, 3> sizes{{{640, 360}, {800, 450}, {640, 360}}};
         for (unsigned stage = 0; stage < sizes.size(); ++stage) {
             desc.Width = sizes[stage][0];
@@ -260,15 +277,20 @@ int wmain(int argc, wchar_t** argv) {
                 dspaa::graphicsCheck(presenter.resize(desc, stage + 1), "Resize FSR probe presenter");
             const unsigned renderWidth = stage == 1 ? 400 : stage == 2 ? 1280 : desc.Width;
             const unsigned renderHeight = stage == 1 ? 300 : stage == 2 ? 960 : desc.Height;
-            Inputs inputs(bridge, desc.Width, desc.Height, renderWidth, renderHeight);
-            const uint64_t readyValue = stage + 1;
-            dspaa::graphicsCheck(bridge.queue12()->Signal(ready.Get(), readyValue),
-                                 "Publish probe producer images");
             const auto before = presenter.status();
             for (unsigned index = 0; index < 24; ++index) {
                 messages();
+                // Change H storage within each surface generation. Each frame
+                // owns fresh D/M data; after submission only the presenter lease
+                // retains the producer, including its D3D11-side shared owners.
+                auto inputs = std::make_shared<Inputs>(bridge, desc.Width, desc.Height, renderWidth,
+                                                       renderHeight, index, (index / 4 + stage) % 2 == 0);
+                producers.push_back(inputs);
+                dspaa::graphicsCheck(bridge.queue12()->Signal(ready.Get(), ++readyValue),
+                                     "Publish probe producer images");
                 auto frame = std::make_shared<dspaa::PresentationFrame>();
-                frame->images = inputs.images;
+                frame->images = inputs->images;
+                frame->producerLifetime = inputs;
                 frame->readyFence = ready;
                 frame->readyValue = readyValue;
                 if (index == 13)
@@ -303,12 +325,13 @@ int wmain(int argc, wchar_t** argv) {
                 if (index == 12)
                     frame->inputsComplete = false;
                 if (index == 11) {
-                    auto missingHudless = std::make_shared<dspaa::FrameImages>(*inputs.images);
+                    auto missingHudless = std::make_shared<dspaa::FrameImages>(*inputs->images);
                     missingHudless->hudless = {};
                     frame->images = std::move(missingHudless);
                 }
                 if (!stage && !index)
                     firstLease = frame;
+                inputs.reset();
                 dspaa::graphicsCheck(presenter.present(frame, {}, enabled), "Present FSR probe frame");
                 if (!index) {
                     require(presenter.present(frame, {}, enabled) == E_INVALIDARG,
@@ -336,6 +359,8 @@ int wmain(int argc, wchar_t** argv) {
             require(after.applicationPresents - before.applicationPresents == 24,
                     "FSR application frame accounting changed");
             require(!after.generationActive, "Drained FSR controls left generation active");
+            for (const auto& producer : producers)
+                require(producer.expired(), "A drained FSR stage retained a scalar metadata producer");
             std::cout << "stage=" << stage << " size=" << desc.Width << 'x' << desc.Height
                       << " application_presents=" << after.applicationPresents
                       << " dispatches=" << after.successfulDispatches << " reason=" << after.reason << '\n';
@@ -343,13 +368,16 @@ int wmain(int argc, wchar_t** argv) {
         require(presenter.stop() == dspaa::PresentRetirement::Drained, "FSR stop did not prove retirement");
         window.retirementProved = true;
         require(firstLease.expired(), "A retired producer frame lease remained retained");
+        for (const auto& producer : producers)
+            require(producer.expired(), "A retired FSR input producer remained retained");
         require(presenter.stop() == dspaa::PresentRetirement::Drained,
                 "Repeated FSR stop changed retirement");
         require(!presenter.swapChainForQueries(), "Retired FSR owner exposed its chain");
         const auto errors = debugErrors(diagnostics.Get());
         require(errors == 0, "D3D12 validation errors in FSR presentation probe");
         std::cout << "stages=3 gpu_retirement=complete producer_lease=released d3d12_errors=" << errors
-                  << " screen_ui=nonzero ui_alpha=absent visible_windows=0 display_fps=not_measured "
+                  << " screen_ui=nonzero hudless_formats=alternating depth_motion=time_varying_nonzero "
+                     "ui_alpha=absent visible_windows=0 display_fps=not_measured "
                      "pixel_fidelity=not_measured\n";
         return 0;
     } catch (const dspaa::FsrPresenterCreationError& error) {

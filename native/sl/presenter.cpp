@@ -1,4 +1,5 @@
 #include "presenter.h"
+#include "core/performance.h"
 #include "internal.h"
 #include <algorithm>
 #include <cmath>
@@ -39,7 +40,7 @@ struct Image {
     }
 };
 struct Slot {
-    Image finalColor, rawHudless, hudless, depth, motion, distortion;
+    Image rawHudless, hudless, depth, motion, distortion;
     ComPtr<ID3D12DescriptorHeap> srv, rtv;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
@@ -47,7 +48,7 @@ struct Slot {
     uint64_t copied = 0, consumed = 0;
     FrameLease producer;
     std::shared_ptr<detail::SlTicket> ticket;
-    bool tagged = false;
+    bool tagged = false, convertHudless = false;
 };
 bool texture(const PresentImage& image) {
     if (!image.resource)
@@ -306,9 +307,15 @@ void SlPresenter::Impl::wait(ID3D12Fence* fence, uint64_t value) {
     }
 }
 void SlPresenter::Impl::retire(Slot& slot) {
-    wait(copiedFence.Get(), slot.copied);
+    {
+        DSPAA_PERF_SCOPE(SlCopiedWait);
+        wait(copiedFence.Get(), slot.copied);
+    }
     slot.producer.reset();
-    wait(slot.consumedFence.Get(), slot.consumed);
+    {
+        DSPAA_PERF_SCOPE(SlConsumedWait);
+        wait(slot.consumedFence.Get(), slot.consumed);
+    }
     if (slot.tagged && slot.ticket)
         runtime->clearTags(*slot.ticket);
     slot.tagged = false;
@@ -322,6 +329,7 @@ void SlPresenter::Impl::drain() {
         retire(slot);
     if (queue && copiedFence) {
         graphicsCheck(queue->Signal(copiedFence.Get(), ++nextFence), "Signal Streamline queue drain");
+        DSPAA_PERF_SCOPE(SlCopiedWait);
         wait(copiedFence.Get(), nextFence);
     }
 }
@@ -354,6 +362,7 @@ void SlPresenter::Impl::pause() {
     forceReset = true;
 }
 sl::DLSSGState SlPresenter::Impl::query() {
+    DSPAA_PERF_SCOPE(SlQuery);
     sl::DLSSGState state{};
     detail::slCheck(runtime->api.dlssState(sl::ViewportHandle(0u), state, nullptr),
                     "Query DLSS FG state on presentation thread");
@@ -395,6 +404,26 @@ void SlPresenter::Impl::prepare(Slot& slot, const PresentationFrame& frame, bool
                                                          IID_PPV_ARGS(&slot.list)),
                       "Create SL input command list");
         graphicsCheck(slot.list->Close(), "Close fresh SL command list");
+    }
+    if (!generate)
+        return;
+    const auto& images = *frame.images;
+    auto color = images.hudless.resource->GetDesc();
+    slot.convertHudless = sampleFormat(color.Format) != sampleFormat(description.Format);
+    color.Format = description.Format;
+    ensure(slot.hudless, color);
+    ensure(slot.depth, images.depth.resource->GetDesc());
+    ensure(slot.motion, images.motion.resource->GetDesc());
+    if (images.slDistortion.resource)
+        ensure(slot.distortion, images.slDistortion.resource->GetDesc());
+    if (!slot.convertHudless) {
+        // Same-encoding, same-format H needs only an immutable private copy.
+        // This slot has retired, so an old conversion source can be released.
+        slot.rawHudless = {};
+        return;
+    }
+    ensure(slot.rawHudless, images.hudless.resource->GetDesc());
+    if (!slot.srv) {
         D3D12_DESCRIPTOR_HEAP_DESC heap{};
         heap.NumDescriptors = 1;
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -406,18 +435,6 @@ void SlPresenter::Impl::prepare(Slot& slot, const PresentationFrame& frame, bool
         graphicsCheck(runtime->device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&slot.rtv)),
                       "Create SL HUDless RTV heap");
     }
-    const auto& images = *frame.images;
-    ensure(slot.finalColor, images.finalColor.resource->GetDesc());
-    if (!generate)
-        return;
-    ensure(slot.rawHudless, images.hudless.resource->GetDesc());
-    auto color = images.hudless.resource->GetDesc();
-    color.Format = description.Format;
-    ensure(slot.hudless, color);
-    ensure(slot.depth, images.depth.resource->GetDesc());
-    ensure(slot.motion, images.motion.resource->GetDesc());
-    if (images.slDistortion.resource)
-        ensure(slot.distortion, images.slDistortion.resource->GetDesc());
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = sampleFormat(images.hudless.resource->GetDesc().Format);
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -437,34 +454,35 @@ void SlPresenter::Impl::copy(Slot& slot, Image& destination, const PresentImage&
                          source.state);
 }
 void SlPresenter::Impl::copyFrame(Slot& slot, const PresentationFrame& frame, bool generate) {
+    DSPAA_PERF_SCOPE(SlCopySubmit);
     graphicsCheck(slot.allocator->Reset(), "Reset retired SL allocator");
     graphicsCheck(slot.list->Reset(slot.allocator.Get(), nullptr), "Reset retired SL command list");
     const auto& images = *frame.images;
-    copy(slot, slot.finalColor, images.finalColor);
-    slot.finalColor.transition(slot.list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
     if (generate) {
-        copy(slot, slot.rawHudless, images.hudless);
+        copy(slot, slot.convertHudless ? slot.rawHudless : slot.hudless, images.hudless);
         copy(slot, slot.depth, images.depth);
         copy(slot, slot.motion, images.motion);
         if (images.slDistortion.resource)
             copy(slot, slot.distortion, images.slDistortion);
-        slot.rawHudless.transition(slot.list.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        slot.hudless.transition(slot.list.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
-        const auto rtv = slot.rtv->GetCPUDescriptorHandleForHeapStart();
-        slot.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        ID3D12DescriptorHeap* heaps[] = {slot.srv.Get()};
-        slot.list->SetDescriptorHeaps(1, heaps);
-        slot.list->SetGraphicsRootSignature(root.Get());
-        slot.list->SetPipelineState(pipeline.Get());
-        slot.list->SetGraphicsRootDescriptorTable(0, slot.srv->GetGPUDescriptorHandleForHeapStart());
-        const D3D12_VIEWPORT viewport{
-            0, 0, static_cast<float>(description.Width), static_cast<float>(description.Height), 0, 1};
-        const D3D12_RECT scissor{0, 0, static_cast<LONG>(description.Width),
-                                 static_cast<LONG>(description.Height)};
-        slot.list->RSSetViewports(1, &viewport);
-        slot.list->RSSetScissorRects(1, &scissor);
-        slot.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        slot.list->DrawInstanced(3, 1, 0, 0);
+        if (slot.convertHudless) {
+            slot.rawHudless.transition(slot.list.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            slot.hudless.transition(slot.list.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const auto rtv = slot.rtv->GetCPUDescriptorHandleForHeapStart();
+            slot.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            ID3D12DescriptorHeap* heaps[] = {slot.srv.Get()};
+            slot.list->SetDescriptorHeaps(1, heaps);
+            slot.list->SetGraphicsRootSignature(root.Get());
+            slot.list->SetPipelineState(pipeline.Get());
+            slot.list->SetGraphicsRootDescriptorTable(0, slot.srv->GetGPUDescriptorHandleForHeapStart());
+            const D3D12_VIEWPORT viewport{
+                0, 0, static_cast<float>(description.Width), static_cast<float>(description.Height), 0, 1};
+            const D3D12_RECT scissor{0, 0, static_cast<LONG>(description.Width),
+                                     static_cast<LONG>(description.Height)};
+            slot.list->RSSetViewports(1, &viewport);
+            slot.list->RSSetScissorRects(1, &scissor);
+            slot.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            slot.list->DrawInstanced(3, 1, 0, 0);
+        }
         for (auto* input : {&slot.hudless, &slot.depth, &slot.motion})
             input->transition(slot.list.Get(), D3D12_RESOURCE_STATE_COMMON);
         if (images.slDistortion.resource)
@@ -482,7 +500,13 @@ void SlPresenter::Impl::copyFrame(Slot& slot, const PresentationFrame& frame, bo
         throw std::runtime_error("Streamline proxy backbuffer does not match the presentation generation");
     Dx11Dx12::transition(slot.list.Get(), backbuffer.Get(), D3D12_RESOURCE_STATE_PRESENT,
                          D3D12_RESOURCE_STATE_COPY_DEST);
-    slot.list->CopyResource(backbuffer.Get(), slot.finalColor.resource.Get());
+    // Final is already immutable and is never tagged as an SDK input. Copy it
+    // straight to the proxy backbuffer; copiedFence still retains its producer.
+    Dx11Dx12::transition(slot.list.Get(), images.finalColor.resource.Get(), images.finalColor.state,
+                         D3D12_RESOURCE_STATE_COPY_SOURCE);
+    slot.list->CopyResource(backbuffer.Get(), images.finalColor.resource.Get());
+    Dx11Dx12::transition(slot.list.Get(), images.finalColor.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                         images.finalColor.state);
     Dx11Dx12::transition(slot.list.Get(), backbuffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                          D3D12_RESOURCE_STATE_PRESENT);
     graphicsCheck(slot.list->Close(), "Close Streamline input copies");
@@ -495,6 +519,7 @@ void SlPresenter::Impl::copyFrame(Slot& slot, const PresentationFrame& frame, bo
     graphicsCheck(queue->Signal(copiedFence.Get(), slot.copied), "Publish Streamline source-copy retirement");
 }
 void SlPresenter::Impl::tag(Slot& slot, const PresentationFrame& frame, const ContentView& view) {
+    DSPAA_PERF_SCOPE(SlTag);
     sl::Constants constants{};
     constants.cameraViewToClip = matrix(frame.cameraViewToClip);
     constants.clipToCameraView = matrix(frame.clipToCameraView);
@@ -688,9 +713,13 @@ HRESULT SlPresenter::Impl::present(FrameLease frame, const PresentArguments& arg
         // FG: commit On only after the real submission boundary is established.
         options(request.mode, request);
     }
-    const auto result = arguments.parameters
-                            ? chain->Present1(arguments.syncInterval, arguments.flags, arguments.parameters)
-                            : chain->Present(arguments.syncInterval, arguments.flags);
+    HRESULT result;
+    {
+        DSPAA_PERF_SCOPE(SlPresent);
+        result = arguments.parameters
+                     ? chain->Present1(arguments.syncInterval, arguments.flags, arguments.parameters)
+                     : chain->Present(arguments.syncInterval, arguments.flags);
+    }
     runtime->presented(slot.ticket);
     if (arguments.boundary && arguments.boundary->after)
         arguments.boundary->after(arguments.boundary->context, frame->applicationFrameId);

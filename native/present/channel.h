@@ -10,6 +10,7 @@
 
 namespace dspaa {
 class WorldColor;
+struct WorldColorImage;
 struct PresentationConfiguration {
     uint32_t backend = 0, mode = 0, generatedFrames = 1, reflex = 1;
     float dynamicTargetFrameRate = 0;
@@ -19,7 +20,7 @@ struct PresentationConfiguration {
 struct PresentationSubmission {
     DspAaPresentationInputs metadata{};
     std::array<Microsoft::WRL::ComPtr<ID3D11Resource>, 5> resources;
-    std::shared_ptr<const void> worldLifetime;
+    std::shared_ptr<WorldColorImage> worldLifetime;
     // Evidence from the captured world RTV, not inferred from swapchain color space.
     bool hudlessSrgbView = false;
 };

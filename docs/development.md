@@ -115,6 +115,25 @@ This opt-in hardware probe opens no window and does not load NGX. It uses the ex
 
 `fsr-present-probe <AMD-runtime-directory>` and `sl-present-probe <Streamline-runtime-directory> [diagnostic-directory]` exercise the SDK backends independently. Their inputs contain a spatially varying scene and a nonzero, localized translucent screen panel in Final, with no application UI-alpha plane. They cover three size stages, missing HUDless, Off/re-enable and resource retirement; graphics debug errors fail the run. Run these hardware probes explicitly, serially and with an outer process timeout. They are not default CTest dependencies and do not measure physical display FPS or interpolation pixel fidelity.
 
+### Opt-in CPU timing diagnostics
+
+Normal builds compile presentation timing scopes away. To investigate CPU submission and waiting costs, use a separate build directory with the existing toolchain preset:
+
+```powershell
+cmake --preset windows -B build/native-performance -DDSPAA_ENABLE_PERFORMANCE_METRICS=ON
+cmake --build build/native-performance --config Release
+ctest --test-dir build/native-performance -C Release --output-on-failure
+```
+
+Only that diagnostic DLL exports `DspAaReadPerformanceCounter`. Its metric IDs and scope definitions are in `native/core/performance.h`; each counter exposes cumulative completed-call count, QPC ticks, lifetime maximum ticks and QPC frequency. Take snapshots at both ends of a stable measurement interval and use count/tick differences. Counters do not reset during rendering, concurrent reads are not an atomic frame boundary, and the lifetime maximum is not a per-interval maximum. Pair snapshots with the same backend and surface generation, excluding startup and transitions.
+
+These are CPU wall-clock intervals, including blocking and scheduling. They are not GPU shader durations; nested scopes overlap and cannot be added as independent costs. The diagnostic path does not perform per-frame file output, GPU readback or SDK counter queries. Keep instrumented packages separate and compare final performance with the normal, uninstrumented Release build. The ordinary `build/native` cache, build preset and packaging workflow remain unchanged.
+
+At the existing throttled presentation trace points, diagnostic builds also record the Present interval/flags passed to the backend, the facade's swapchain flags/buffer count, observed host swapchain-latency requests, and the backend interface's maximum-frame-latency query result. These describe the client-facing contract: SDK proxies may translate parameters internally or report application-facing latency values rather than the physical swapchain's configuration. A failed query is not a valid latency value; absence of a swapchain setter call does not rule out device-level latency controls. No additional waitable handle is acquired.
+
+For a controlled FSR GPU scheduling comparison, a diagnostic process may set `DSPAA_DIAGNOSTIC_FSR_ASYNC=1`. The value is latched once per process and enables both the SDK context support flag and asynchronous optical-flow/frame-generation workloads. Unset or other values leave GPU asynchronous workloads disabled, as do normal builds, which do not read this variable. Both conditions retain the SDK's independent presentation/pacing thread: asynchronous presentation is distinct from asynchronous GPU computation. Compare both conditions using the same diagnostic binary, and validate resource retirement and image quality before considering a production scheduling change.
+
+
 
 ### Isolated in-game validation
 

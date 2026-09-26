@@ -56,6 +56,97 @@ unsigned errors(ID3D12InfoQueue* queue) {
     }
     return count;
 }
+dspaa::FencePoint readyPoint(const dspaa::FrameLease& frame) {
+    return {frame->readyFence, frame->readyValue};
+}
+uint32_t readPixel12(const std::shared_ptr<dspaa::Dx11Dx12>& bridge, ID3D12CommandQueue* queue,
+                     const dspaa::PresentImage& image, const dspaa::FencePoint& ready, unsigned x = 0,
+                     unsigned y = 0) {
+    require(!ready.unpublished(), "readback received an unpublished producer ticket");
+    struct ReadbackJob {
+        ComPtr<ID3D12Device> device;
+        ComPtr<ID3D12CommandQueue> consumerQueue;
+        dspaa::PresentImage sourceImage;
+        dspaa::FencePoint producerReady;
+        ComPtr<ID3D12Resource> readback;
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        ComPtr<ID3D12Fence> consumed;
+    };
+    auto job = std::make_unique<ReadbackJob>();
+    job->device = bridge->device12();
+    job->consumerQueue = queue;
+    job->sourceImage = image;
+    job->producerReady = ready;
+    const auto desc = image.resource->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 bytes = 0;
+    bridge->device12()->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    heap.CreationNodeMask = heap.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = bytes;
+    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    auto& readback = job->readback;
+    check(bridge->device12()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                      IID_PPV_ARGS(&readback)),
+          "producer readback");
+    auto& allocator = job->allocator;
+    auto& list = job->list;
+    check(
+        bridge->device12()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
+        "producer readback allocator");
+    check(bridge->device12()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                                IID_PPV_ARGS(&list)),
+          "producer readback list");
+    dspaa::Dx11Dx12::transition(list.Get(), image.resource.Get(), image.state,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = image.resource.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = readback.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint = footprint;
+    list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    dspaa::Dx11Dx12::transition(list.Get(), image.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                image.state);
+    check(list->Close(), "close producer readback");
+    auto& consumed = job->consumed;
+    check(bridge->device12()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&consumed)),
+          "readback consumer fence");
+    bool submitted = false;
+    try {
+        if (ready.value)
+            check(queue->Wait(ready.fence.Get(), ready.value), "readback waits for the actual producer");
+        ID3D12CommandList* lists[]{list.Get()};
+        submitted = true;
+        queue->ExecuteCommandLists(1, lists);
+        check(queue->Signal(consumed.Get(), 1), "publish independent readback completion");
+        bridge->wait({consumed, 1});
+    } catch (...) {
+        // The independent queue is not covered by a later bridge drain. A failed
+        // proof retains the entire submitted job until this failing probe exits.
+        if (submitted)
+            (void)job.release();
+        throw;
+    }
+    void* data = nullptr;
+    const SIZE_T offset =
+        static_cast<SIZE_T>(footprint.Offset) + static_cast<SIZE_T>(y) * footprint.Footprint.RowPitch + x * 4;
+    D3D12_RANGE read{offset, offset + 4};
+    check(readback->Map(0, &read, &data), "map producer readback");
+    uint32_t value;
+    std::memcpy(&value, static_cast<const unsigned char*>(data) + offset, 4);
+    D3D12_RANGE written{0, 0};
+    readback->Unmap(0, &written);
+    return value;
+}
 void worldSnapshots(const std::shared_ptr<dspaa::Dx11Dx12>& bridge) {
     auto logical = bridge->texture(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, false);
     auto source = bridge->texture(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, false);
@@ -178,6 +269,149 @@ void worldSnapshots(const std::shared_ptr<dspaa::Dx11Dx12>& bridge) {
               "rejection, held-slot backpressure and reuse passed");
 }
 
+void unidirectionalTransport(const std::shared_ptr<dspaa::Dx11Dx12>& bridge) {
+    bridge->drain();
+    auto* context = bridge->context11();
+    auto final = bridge->texture(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, false);
+    auto depth = bridge->texture(8, 8, DXGI_FORMAT_R32_FLOAT, false);
+    auto motion = bridge->texture(8, 8, DXGI_FORMAT_R16G16_FLOAT, false);
+    ComPtr<ID3D11RenderTargetView> target;
+    check(bridge->device11()->CreateRenderTargetView(final.dx11.Get(), nullptr, &target),
+          "direct producer target");
+    const float red[]{1, 0, 0, 1}, green[]{0, 1, 0, 1};
+    context->ClearRenderTargetView(target.Get(), red);
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ComPtr<ID3D12CommandQueue> consumer;
+    check(bridge->device12()->CreateCommandQueue(&desc, IID_PPV_ARGS(&consumer)),
+          "independent producer consumer queue");
+    ComPtr<ID3D12Fence> gate12, gate11;
+    check(bridge->device12()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate12)),
+          "independent D3D12 queue gate");
+    check(bridge->device12()->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&gate11)),
+          "shared D3D11 producer gate");
+    ComPtr<ID3D11Device5> fenceDevice;
+    check(bridge->device11()->QueryInterface(IID_PPV_ARGS(&fenceDevice)), "D3D11 fence interface");
+    HANDLE shared = nullptr;
+    check(bridge->device12()->CreateSharedHandle(gate11.Get(), nullptr, GENERIC_ALL, nullptr, &shared),
+          "share D3D11 producer gate");
+    ComPtr<ID3D11Fence> gateOn11;
+    const auto opened = fenceDevice->OpenSharedFence(shared, IID_PPV_ARGS(&gateOn11));
+    CloseHandle(shared);
+    check(opened, "open D3D11 producer gate");
+    dspaa::PresentationTransport transport(bridge), pendingTransport(bridge);
+    dspaa::WorldColor world(bridge);
+    world.surface(final.dx11.Get(), 7);
+    std::array<dspaa::FrameLease, 4> held;
+    std::array<dspaa::FrameLease, 3> later;
+    std::array<std::unique_ptr<dspaa::PresentationSubmission>, 3> heldWorld;
+    std::string reason;
+    check(bridge->queue12()->Wait(gate12.Get(), 1), "block unrelated D3D12 work");
+    try {
+        for (auto& frame : held)
+            frame =
+                transport.capture(final.dx11.Get(), 7, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, {}, reason);
+        bool rejected = false;
+        try {
+            (void)transport.capture(final.dx11.Get(), 7, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, {}, reason);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        require(rejected, "producer overwrote a leased transport slot behind the queue gate");
+        // A separate real consumer waits on the published ticket and reads pixels
+        // while the bridge queue is still gated. This detects a hidden middle hop.
+        require(readPixel12(bridge, consumer.Get(), held.front()->images->finalColor,
+                            readyPoint(held.front())) == 0xff0000ffu,
+                "pure D3D11 publication depended on the blocked bridge queue or lost pixels");
+        for (const auto& frame : held)
+            bridge->wait(readyPoint(frame));
+        held = {};
+        auto resumed =
+            transport.capture(final.dx11.Get(), 7, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, {}, reason);
+        bridge->wait(readyPoint(resumed));
+        resumed.reset();
+        check(gate12->Signal(1), "release unrelated D3D12 queue gate");
+        bridge->drain();
+
+        check(context->Wait(gateOn11.Get(), 1), "block real D3D11 producer work");
+        context->ClearRenderTargetView(target.Get(), green);
+        auto* bound = target.Get();
+        context->OMSetRenderTargets(1, &bound, nullptr);
+        auto captureWorld = [&](uint64_t id) {
+            auto input = std::make_unique<dspaa::PresentationSubmission>();
+            input->metadata.applicationFrameId = id;
+            input->metadata.generation = 7;
+            input->metadata.flags = 1;
+            input->metadata.renderWidth = input->metadata.renderHeight = 8;
+            input->resources[1] = depth.dx11;
+            input->resources[2] = motion.dx11;
+            world.capture(id);
+            world.attach(*input);
+            return input;
+        };
+        auto first = pendingTransport.capture(final.dx11.Get(), 7, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                                              captureWorld(1), reason);
+        require(first->inputsComplete, "gated producer world inputs missing");
+        const auto ready = readyPoint(first);
+        const auto firstFinal = first->images->finalColor, firstWorld = first->images->hudless;
+        require(!ready.complete(), "D3D11 producer ticket became ready before its writes");
+        first.reset(); // Only the retirement tickets now protect this slot/world source.
+        for (auto& frame : later) {
+            frame = pendingTransport.capture(final.dx11.Get(), 7, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, {},
+                                             reason);
+            require(frame->images->finalColor.resource.Get() != firstFinal.resource.Get() &&
+                        !readyPoint(frame).complete(),
+                    "CPU early-release reused an unfinished D3D11 producer slot");
+        }
+        for (size_t i = 0; i < heldWorld.size(); ++i) {
+            heldWorld[i] = captureWorld(i + 2);
+            require(heldWorld[i]->worldLifetime != nullptr, "gated world consumed extra pool slots");
+        }
+        auto blocked = captureWorld(5);
+        require(!(blocked->metadata.flags & 1u), "unfinished producer world source was recycled");
+        check(gate11->Signal(1), "release D3D11 producer gate");
+        bridge->wait(ready);
+        require(readPixel12(bridge, consumer.Get(), firstFinal, ready) == 0xff00ff00u &&
+                    readPixel12(bridge, consumer.Get(), firstWorld, ready) == 0xff00ff00u,
+                "D3D11 ready publication did not cover exact Final/world writes");
+        auto recycled = pendingTransport.capture(final.dx11.Get(), 7, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                                                 {}, reason);
+        require(recycled->images->finalColor.resource.Get() == firstFinal.resource.Get(),
+                "completed producer slot could not be reused");
+        auto reclaimed = captureWorld(6);
+        require(reclaimed->worldLifetime &&
+                    reclaimed->worldLifetime->texture.dx12.Get() == firstWorld.resource.Get(),
+                "completed producer world source could not be reused");
+        bridge->wait(readyPoint(recycled));
+        later = {};
+        heldWorld = {};
+        recycled.reset();
+        reclaimed.reset();
+        context->OMSetRenderTargets(0, nullptr, nullptr);
+        bridge->drain();
+        pendingTransport.reset();
+        world.surface(nullptr, 8);
+        dspaa::FencePoint unpublished;
+        unpublished.arm();
+        require(!unpublished.complete(), "armed ticket was treated as complete");
+        rejected = false;
+        try {
+            bridge->wait(unpublished);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        require(rejected, "unpublished ticket was registered as a normal fence wait");
+    } catch (...) {
+        (void)gate12->Signal(1);
+        (void)gate11->Signal(1);
+        context->OMSetRenderTargets(0, nullptr, nullptr);
+        bridge->drain();
+        throw;
+    }
+    std::puts("producer_queue_direction: independent consumer pixels behind D3D12 gate, pending D3D11 "
+              "ready/early-release protection, four-slot reuse and unpublished-ticket rejection passed");
+}
+
 void unpredicatedTransport(const std::shared_ptr<dspaa::Dx11Dx12>& bridge) {
     auto* device = bridge->device11();
     auto* context = bridge->context11();
@@ -207,59 +441,9 @@ void unpredicatedTransport(const std::shared_ptr<dspaa::Dx11Dx12>& bridge) {
         context->Unmap(staging.Get(), 0);
         return value;
     };
-    auto pixel12 = [&](const dspaa::PresentImage& image, unsigned x = 0, unsigned y = 0) {
-        auto desc = image.resource->GetDesc();
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-        UINT64 bytes = 0;
-        bridge->device12()->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_READBACK;
-        heap.CreationNodeMask = heap.VisibleNodeMask = 1;
-        D3D12_RESOURCE_DESC buffer{};
-        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        buffer.Width = bytes;
-        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
-        buffer.SampleDesc.Count = 1;
-        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        ComPtr<ID3D12Resource> readback;
-        check(bridge->device12()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
-                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                          IID_PPV_ARGS(&readback)),
-              "producer readback");
-        ComPtr<ID3D12CommandAllocator> allocator;
-        ComPtr<ID3D12GraphicsCommandList> list;
-        check(bridge->device12()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                         IID_PPV_ARGS(&allocator)),
-              "producer readback allocator");
-        check(bridge->device12()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(),
-                                                    nullptr, IID_PPV_ARGS(&list)),
-              "producer readback list");
-        dspaa::Dx11Dx12::transition(list.Get(), image.resource.Get(), image.state,
-                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
-        D3D12_TEXTURE_COPY_LOCATION source{};
-        source.pResource = image.resource.Get();
-        source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        D3D12_TEXTURE_COPY_LOCATION destination{};
-        destination.pResource = readback.Get();
-        destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        destination.PlacedFootprint = footprint;
-        list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
-        dspaa::Dx11Dx12::transition(list.Get(), image.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
-                                    image.state);
-        check(list->Close(), "close producer readback");
-        ID3D12CommandList* lists[]{list.Get()};
-        bridge->queue12()->ExecuteCommandLists(1, lists);
-        bridge->wait12(bridge->handoffTo11());
-        void* data = nullptr;
-        const SIZE_T offset = static_cast<SIZE_T>(footprint.Offset) +
-                              static_cast<SIZE_T>(y) * footprint.Footprint.RowPitch + x * 4;
-        D3D12_RANGE read{offset, offset + 4};
-        check(readback->Map(0, &read, &data), "map producer readback");
-        uint32_t value;
-        std::memcpy(&value, static_cast<const unsigned char*>(data) + offset, 4);
-        D3D12_RANGE written{0, 0};
-        readback->Unmap(0, &written);
-        return value;
+    auto pixel12 = [&](const dspaa::FrameLease& frame, const dspaa::PresentImage& image, unsigned x = 0,
+                       unsigned y = 0) {
+        return readPixel12(bridge, bridge->queue12(), image, readyPoint(frame), x, y);
     };
     auto packet = [&](uint64_t id) {
         auto result = std::make_unique<dspaa::PresentationSubmission>();
@@ -280,7 +464,7 @@ void unpredicatedTransport(const std::shared_ptr<dspaa::Dx11Dx12>& bridge) {
     fill(motion, {0, 0, 0, 1});
     auto seed =
         transport.capture(final.dx11.Get(), 7, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, packet(1), reason);
-    require(seed->inputsComplete && pixel12(seed->images->finalColor) == 0xff0000ffu,
+    require(seed->inputsComplete && pixel12(seed, seed->images->finalColor) == 0xff0000ffu,
             "producer slot seed failed");
     seed.reset();
     fill(final, {0, 1, 0, 1});
@@ -313,10 +497,11 @@ void unpredicatedTransport(const std::shared_ptr<dspaa::Dx11Dx12>& bridge) {
     require(retained.Get() == predicate.Get() && retainedValue == blocked,
             "producer did not restore the engine predicate");
     context->SetPredication(nullptr, FALSE);
-    require(frame->inputsComplete && pixel12(frame->images->finalColor) == 0xff00ff00u,
+    require(frame->inputsComplete && pixel12(frame, frame->images->finalColor) == 0xff00ff00u,
             "producer fence advanced but the engine predicate suppressed the real Final copy");
-    require(pixel12(frame->images->hudless) == 0xffff0000u && pixel12(frame->images->depth) == 0x3e800000u &&
-                pixel12(frame->images->motion) == 0x34003000u,
+    require(pixel12(frame, frame->images->hudless) == 0xffff0000u &&
+                pixel12(frame, frame->images->depth) == 0x3e800000u &&
+                pixel12(frame, frame->images->motion) == 0x34003000u,
             "conditional predicate suppressed a temporal producer copy");
     context->SetPredication(predicate.Get(), blocked);
     bool rejected = false;
@@ -346,10 +531,10 @@ void unpredicatedTransport(const std::shared_ptr<dspaa::Dx11Dx12>& bridge) {
                                    std::move(scaled), reason);
     require(gamma->inputsComplete && gamma->reset && gamma->images->hudless.resource->GetDesc().Width == 8,
             "logical output was not normalized into the display or did not reset history");
-    const auto filtered = pixel12(gamma->images->hudless, 3, 3) & 255u;
+    const auto filtered = pixel12(gamma, gamma->images->hudless, 3, 3) & 255u;
     require(filtered >= 164 && filtered <= 166,
             "sRGB display resampling interpolated encoded values instead of linear light");
-    require(pixel12(gamma->images->finalColor) == 0xff00ff00u &&
+    require(pixel12(gamma, gamma->images->finalColor) == 0xff00ff00u &&
                 gamma->images->depth.resource->GetDesc().Width == 8 && gamma->renderWidth == 8,
             "display normalization rewrote Final or repacked local temporal inputs");
     gamma.reset();
@@ -364,8 +549,9 @@ void unpredicatedTransport(const std::shared_ptr<dspaa::Dx11Dx12>& bridge) {
     auto boxed = transport.capture(final.dx11.Get(), 7, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
                                    std::move(letterbox), reason);
     require(boxed->inputsComplete && boxed->reset && boxed->generationRect.top == 2 &&
-                boxed->generationRect.bottom == 6 && pixel12(boxed->images->hudless, 0, 0) == 0xff000000u &&
-                pixel12(boxed->images->hudless, 3, 3) == 0xff0000ffu,
+                boxed->generationRect.bottom == 6 &&
+                pixel12(boxed, boxed->images->hudless, 0, 0) == 0xff000000u &&
+                pixel12(boxed, boxed->images->hudless, 3, 3) == 0xff0000ffu,
             "content extent did not produce exact black bars and local world color");
     boxed.reset();
     auto explicitCanonical = packet(5);
@@ -376,7 +562,7 @@ void unpredicatedTransport(const std::shared_ptr<dspaa::Dx11Dx12>& bridge) {
     auto canonical = transport.capture(final.dx11.Get(), 7, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
                                        std::move(explicitCanonical), reason);
     require(canonical->inputsComplete && canonical->reset && canonical->generationRect.left == 1 &&
-                pixel12(canonical->images->hudless, 0, 0) == 0xffff0000u,
+                pixel12(canonical, canonical->images->hudless, 0, 0) == 0xffff0000u,
             "explicit canonical H was guessed, resized or cleared outside its SDK rectangle");
     canonical.reset();
     auto invalidDomain = packet(6);
@@ -384,9 +570,160 @@ void unpredicatedTransport(const std::shared_ptr<dspaa::Dx11Dx12>& bridge) {
     invalidDomain->metadata.logicalOutputHeight = 2;
     auto invalid = transport.capture(final.dx11.Get(), 7, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
                                      std::move(invalidDomain), reason);
-    require(!invalid->inputsComplete && invalid->reset && pixel12(invalid->images->finalColor) == 0xff00ff00u,
+    require(!invalid->inputsComplete && invalid->reset &&
+                pixel12(invalid, invalid->images->finalColor) == 0xff00ff00u,
             "mismatched logical input generated a frame or suppressed genuine Final");
     bridge->drain();
+    {
+        dspaa::WorldColor world(bridge);
+        world.surface(final.dx11.Get(), 7);
+        dspaa::PresentationTransport sharedTransport(bridge);
+        ComPtr<ID3D11RenderTargetView> worldTarget;
+        check(device->CreateRenderTargetView(hudless.dx11.Get(), nullptr, &worldTarget),
+              "shared world target");
+        auto* bound = worldTarget.Get();
+        context->OMSetRenderTargets(1, &bound, nullptr);
+        auto fromWorld = [&](uint64_t id) {
+            auto value = packet(id);
+            value->resources[0].Reset();
+            world.capture(id);
+            world.attach(*value);
+            return value;
+        };
+        auto input = fromWorld(1);
+        require(input->worldLifetime != nullptr, "missing shared world lease");
+        auto* snapshot = input->worldLifetime->texture.dx12.Get();
+        auto direct = sharedTransport.capture(final.dx11.Get(), 7, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                                              std::move(input), reason);
+        require(direct->inputsComplete && direct->images->hudless.resource.Get() == snapshot &&
+                    pixel12(direct, direct->images->hudless) == 0xffff0000u,
+                "shared world H was recopied or changed its captured bytes");
+        direct.reset();
+        auto explicitInput = fromWorld(2);
+        snapshot = explicitInput->worldLifetime->texture.dx12.Get();
+        explicitInput->resources[0] = final.dx11;
+        auto fallback = sharedTransport.capture(final.dx11.Get(), 7, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                                                std::move(explicitInput), reason);
+        require(fallback->inputsComplete && fallback->images->hudless.resource.Get() != snapshot &&
+                    pixel12(fallback, fallback->images->hudless) == 0xff00ff00u,
+                "explicit H borrowed an unrelated world snapshot instead of its copy fallback");
+        fallback.reset();
+        bridge->drain();
+        world.surface(final.dx11.Get(), 8);
+        worldTarget.Reset();
+        check(device->CreateRenderTargetView(wide.dx11.Get(), nullptr, &worldTarget),
+              "pending logical world target");
+        bound = worldTarget.Get();
+        context->OMSetRenderTargets(1, &bound, nullptr);
+        auto logicalPacket = [&](uint64_t id) {
+            auto value = packet(id);
+            value->metadata.generation = 8;
+            value->metadata.logicalOutputWidth = 4;
+            value->metadata.logicalOutputHeight = 2;
+            value->metadata.generationRect[1] = 2;
+            value->metadata.generationRect[2] = 8;
+            value->metadata.generationRect[3] = 6;
+            value->resources[0].Reset();
+            world.capture(id);
+            world.attach(*value);
+            return value;
+        };
+        auto pendingInput = logicalPacket(3);
+        require(pendingInput->worldLifetime != nullptr, "missing pending world lease");
+        snapshot = pendingInput->worldLifetime->texture.dx12.Get();
+        ComPtr<ID3D12Fence> gate;
+        check(bridge->device12()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)),
+              "world resample queue gate");
+        std::array<std::unique_ptr<dspaa::PresentationSubmission>, 3> heldWorld;
+        check(bridge->queue12()->Wait(gate.Get(), 1), "hold world resample in flight");
+        try {
+            auto queued =
+                sharedTransport.capture(final.dx11.Get(), 8, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                                        std::move(pendingInput), reason);
+            require(queued->inputsComplete && queued->images->hudless.resource.Get() != snapshot,
+                    "logical world did not enter the shared display-domain resample");
+            const auto ready = readyPoint(queued);
+            const auto normalized = queued->images->hudless;
+            const auto normalizedFinal = queued->images->finalColor;
+            require(!ready.complete(), "normalized ready ignored its gated D3D12 conversion");
+            queued.reset(); // No backend or CPU frame keeps the source lease alive.
+            std::array<dspaa::FrameLease, 3> pure;
+            for (size_t i = 0; i < pure.size(); ++i) {
+                auto purePacket = packet(20 + i);
+                purePacket->metadata.generation = 8;
+                pure[i] =
+                    sharedTransport.capture(final.dx11.Get(), 8, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                                            std::move(purePacket), reason);
+                require(pure[i]->inputsComplete &&
+                            pure[i]->images->finalColor.resource.Get() != normalizedFinal.resource.Get(),
+                        "pure producer overwrote a still-pending normalized slot");
+                bridge->wait(readyPoint(pure[i]));
+            }
+            require(!ready.complete(), "pure publication replaced normalized completion proof");
+            for (size_t index = 0; index < heldWorld.size(); ++index) {
+                heldWorld[index] = logicalPacket(4 + index);
+                require(heldWorld[index]->worldLifetime != nullptr,
+                        "pending world lease consumed more than one pool slot");
+            }
+            fill(wide, {0, 1, 0, 1});
+            auto blockedWorld = logicalPacket(7);
+            require(!(blockedWorld->metadata.flags & 1u),
+                    "CPU early-release recycled a world source still read by the gated resample");
+            check(gate->Signal(1), "release pending world resample");
+            bridge->wait(ready);
+            require(readPixel12(bridge, bridge->queue12(), normalized, ready, 3, 3) == 0xff0000ffu,
+                    "pending world resample lost its original snapshot after CPU early-release");
+            auto resumedWorld = logicalPacket(8);
+            require(resumedWorld->worldLifetime &&
+                        resumedWorld->worldLifetime->texture.dx12.Get() == snapshot &&
+                        pixel11(resumedWorld->worldLifetime->texture.dx11.Get()) == 0xff00ff00u,
+                    "world source was not reusable after proven resample completion");
+            auto pureInput = packet(30);
+            pureInput->metadata.generation = 8;
+            auto pureReuse = sharedTransport.capture(
+                final.dx11.Get(), 8, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, std::move(pureInput), reason);
+            require(pureReuse->images->finalColor.resource.Get() == normalizedFinal.resource.Get(),
+                    "retired normalized slot was not reused by pure publication");
+            bridge->wait(readyPoint(pureReuse));
+            pureReuse.reset();
+            auto resumedImage = resumedWorld->worldLifetime;
+            auto normalizedAgain =
+                sharedTransport.capture(final.dx11.Get(), 8, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                                        std::move(resumedWorld), reason);
+            require(normalizedAgain->inputsComplete &&
+                        normalizedAgain->images->finalColor.resource.Get() ==
+                            normalizedFinal.resource.Get() &&
+                        pixel12(normalizedAgain, normalizedAgain->images->hudless, 3, 3) == 0xff00ff00u,
+                    "same-generation normalize/pure/normalize reuse lost allocator or pixel safety");
+            normalizedAgain.reset();
+            // A failed submission may have armed a source without successfully
+            // publishing its completion ticket. Only a drained surface reset may
+            // release that quarantine, never CPU-reference retirement alone.
+            resumedImage->ready.arm();
+            resumedImage.reset();
+            auto failedWorld = logicalPacket(9);
+            require(!(failedWorld->metadata.flags & 1u), "failed world-use ticket was silently recycled");
+            bridge->drain();
+            world.surface(final.dx11.Get(), 9);
+            auto afterDrain = packet(10);
+            afterDrain->metadata.generation = 9;
+            afterDrain->metadata.logicalOutputWidth = 4;
+            afterDrain->metadata.logicalOutputHeight = 2;
+            afterDrain->resources[0].Reset();
+            world.capture(10);
+            world.attach(*afterDrain);
+            require(afterDrain->worldLifetime != nullptr, "drained surface did not reclaim failed world use");
+            bridge->drain();
+        } catch (...) {
+            (void)gate->Signal(1);
+            bridge->drain();
+            throw;
+        }
+        context->OMSetRenderTargets(0, nullptr, nullptr);
+        bridge->drain();
+    }
+    std::puts("shared_world: exact direct H, explicit-input fallback, pending-resample early-release "
+              "protection, normalize/pure/normalize reuse and failed-ticket quarantine passed");
     std::puts("display_domain: logical resize, sRGB filtering, letterbox, local D/M, canonical bypass and "
               "layout reset passed");
     std::puts("producer_predication: negative control, exact Final/H/depth/motion bytes and normal/exception "
@@ -530,6 +867,7 @@ int wmain(int argc, wchar_t** argv) {
         bridge->device12()->QueryInterface(IID_PPV_ARGS(&diagnostics));
         std::printf("d3d12_info_queue_available=%u\n", diagnostics ? 1u : 0u);
         worldSnapshots(bridge);
+        unidirectionalTransport(bridge);
         unpredicatedTransport(bridge);
         Window window;
         DXGI_SWAP_CHAIN_DESC1 description{};

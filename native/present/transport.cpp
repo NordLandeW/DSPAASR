@@ -1,6 +1,8 @@
 #include "transport.h"
+#include "core/performance.h"
 #include "display-layout.h"
 #include "graphics/predication.h"
+#include "world-color.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -109,32 +111,33 @@ FrameLease PresentationTransport::capture(ID3D11Texture2D* finalColor, uint64_t 
                                           DXGI_COLOR_SPACE_TYPE colorSpace,
                                           std::unique_ptr<PresentationSubmission> submission,
                                           std::string& reason) {
+    DSPAA_PERF_SCOPE(TransportCapture);
     auto access = bridge_->lock();
     UnpredicatedCopy unconditional(bridge_->context11());
-    const auto completed = bridge_->completionFence12()->GetCompletedValue();
-    if (completed == UINT64_MAX)
-        throw std::runtime_error("Presentation transport fence reports device removal");
     Slot* free = nullptr;
     Slot* pending = nullptr;
     for (auto& candidate : slots_) {
         if (candidate.images && candidate.images.use_count() != 1)
             continue;
-        if (!candidate.readyValue || completed >= candidate.readyValue) {
+        if (candidate.ready.complete() && candidate.normalized.complete()) {
             free = &candidate;
             break;
         }
-        if (!pending || candidate.readyValue < pending->readyValue)
+        // Timeline values cannot order submissions from different fences.
+        if (!pending && !candidate.ready.unpublished() && !candidate.normalized.unpublished())
             pending = &candidate;
     }
     if (!free && pending) {
         // No consumer remains, but the slot's command allocator may still be in
         // flight. Prefer another retired slot; backpressure only when all four
         // producer submissions are pending, never reset an executing allocator.
-        bridge_->wait12(pending->readyValue);
+        DSPAA_PERF_SCOPE(TransportSlotWait);
+        bridge_->wait(pending->ready);
+        bridge_->wait(pending->normalized);
         free = pending;
     }
     if (!free)
-        throw std::runtime_error("All presentation producer slots remain leased");
+        throw std::runtime_error("All presentation producer slots remain leased or unpublished");
     auto& slot = *free;
     if (!slot.images)
         slot.images = std::make_shared<FrameImages>();
@@ -146,8 +149,11 @@ FrameLease PresentationTransport::capture(ID3D11Texture2D* finalColor, uint64_t 
     frame->colorSpace = colorSpace;
     frame->images = slot.images;
     const auto final = describe(finalColor, bridge_->device11());
+    // Any failure after recording work leaves this slot unavailable until drain/reset.
+    slot.ready.arm();
     copy(slot, 0, finalColor, final.Format, slot.images->finalColor);
     bool normalize = false, srgbFilter = false;
+    std::shared_ptr<WorldColorImage> borrowedWorld;
     if (submission) {
         metadata(*frame, submission->metadata);
         const auto& source = submission->metadata;
@@ -213,9 +219,21 @@ FrameLease PresentationTransport::capture(ID3D11Texture2D* finalColor, uint64_t 
                 }
                 PresentImage* images[] = {&slot.images->hudless, &slot.images->depth, &slot.images->motion,
                                           &slot.images->fsrDistortion, &slot.images->slDistortion};
-                for (size_t i = 0; i < std::size(images); ++i)
-                    if (submission->resources[i])
+                for (size_t i = 0; i < std::size(images); ++i) {
+                    if (!submission->resources[i])
+                        continue;
+                    const auto& world = submission->worldLifetime;
+                    if (i == 0 && world && world->texture.dx12 &&
+                        world->texture.dx11.Get() == submission->resources[i].Get()) {
+                        // Arm before any possible D3D12 read. Failure keeps the
+                        // source unavailable until a drained surface transition;
+                        // dropping a CPU frame must not recycle pending resamples.
+                        borrowedWorld = world;
+                        world->ready.arm();
+                        *images[i] = {world->texture.dx12, D3D12_RESOURCE_STATE_COMMON};
+                    } else
                         copy(slot, i + 1, submission->resources[i].Get(), formats[i], *images[i]);
+                }
                 frame->inputsComplete = true;
             } catch (const std::invalid_argument& error) {
                 reason = error.what();
@@ -226,13 +244,24 @@ FrameLease PresentationTransport::capture(ID3D11Texture2D* finalColor, uint64_t 
         reason = "No end-of-frame envelope; preserving the real Final without inventing a simulation token";
     if (!frame->inputsComplete)
         frame->reset = true;
-    bridge_->handoffTo12();
-    if (frame->inputsComplete && normalize)
+    if (frame->inputsComplete && normalize) {
+        slot.normalized.arm();
+        bridge_->handoffTo12();
         slot.images->hudless =
             slot.color.convert(bridge_->device12(), bridge_->queue12(), slot.images->hudless, final.Width,
                                final.Height, typed(final.Format), frame->generationRect, srgbFilter);
-    frame->readyValue = bridge_->handoffTo11();
-    slot.readyValue = frame->readyValue;
+        slot.normalized = {bridge_->completionFence12(), bridge_->signal12()};
+        slot.ready = slot.normalized;
+    } else {
+        // These inputs contain only ordered D3D11 writes. Publish that timeline
+        // directly; each backend still waits before reading and retains its lease.
+        // There is no bridge-queue hop and no reverse D3D12-to-D3D11 wait.
+        slot.ready = {bridge_->producerFence12(), bridge_->signal11()};
+    }
+    frame->readyFence = slot.ready.fence;
+    frame->readyValue = slot.ready.value;
+    if (borrowedWorld)
+        borrowedWorld->ready = slot.ready;
     previousComplete_ = frame->inputsComplete;
     if (frame->inputsComplete) {
         const auto& source =
@@ -245,7 +274,6 @@ FrameLease PresentationTransport::capture(ID3D11Texture2D* finalColor, uint64_t 
         previousRenderHeight_ = frame->renderHeight;
         previousSrgb_ = srgbFilter;
     }
-    frame->readyFence = bridge_->completionFence12();
     return frame;
 }
 } // namespace dspaa

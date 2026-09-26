@@ -1,3 +1,4 @@
+#include "core/performance.h"
 #include "internal.h"
 #include <algorithm>
 #include <chrono>
@@ -280,7 +281,10 @@ bool SlRuntimeState::begin(uint64_t applicationFrameId) {
     FrameCall call{this};
     // No frame/SDK mutex across sleep: rendering the preceding frame must remain
     // free to submit work and Present while the simulation thread is sleeping.
-    slCheck(api.sleep(*ticket->token), "Reflex before-input sleep");
+    {
+        DSPAA_PERF_SCOPE(ReflexSleep);
+        slCheck(api.sleep(*ticket->token), "Reflex before-input sleep");
+    }
     std::lock_guard lock(frameMutex);
     ticket->begun = true;
     return true;

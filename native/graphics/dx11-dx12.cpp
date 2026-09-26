@@ -1,4 +1,5 @@
 #include "dx11-dx12.h"
+#include "core/performance.h"
 #include <dxgi1_4.h>
 #include <iomanip>
 #include <sstream>
@@ -13,6 +14,16 @@ void graphicsCheck(HRESULT result, const char* operation) {
         message << operation << " failed (0x" << std::hex << static_cast<uint32_t>(result) << ")";
         throw std::runtime_error(message.str());
     }
+}
+bool FencePoint::complete() const {
+    if (unpublished())
+        return false;
+    if (!value)
+        return true;
+    const auto observed = fence->GetCompletedValue();
+    if (observed == UINT64_MAX)
+        throw std::runtime_error("GPU retirement fence reports device removal");
+    return observed >= value;
 }
 namespace {
 struct Handle {
@@ -109,39 +120,54 @@ SharedTexture Dx11Dx12::texture(unsigned width, unsigned height, DXGI_FORMAT for
                   "Open bridge texture in D3D11");
     return result;
 }
-void Dx11Dx12::handoffTo12() {
+uint64_t Dx11Dx12::signal11() {
     auto access = lock();
     const auto value = ++next11_;
     graphicsCheck(context11_->Signal(produced11_.Get(), value), "Signal D3D11 producer");
-    context11_->Flush(); // Submit the signal before the other API waits for it.
+    {
+        DSPAA_PERF_SCOPE(ProducerFlush);
+        context11_->Flush(); // Submit the signal before the other API waits for it.
+    }
+    return value;
+}
+void Dx11Dx12::handoffTo12() {
+    auto access = lock();
+    const auto value = signal11();
     graphicsCheck(queue12_->Wait(produced12_.Get(), value), "D3D12 waits for D3D11 producer");
 }
-uint64_t Dx11Dx12::handoffTo11() {
+uint64_t Dx11Dx12::signal12() {
     auto access = lock();
     const auto value = ++next12_;
     graphicsCheck(queue12_->Signal(completed12_.Get(), value), "Signal D3D12 completion");
+    return value;
+}
+uint64_t Dx11Dx12::handoffTo11() {
+    auto access = lock();
+    const auto value = signal12();
     graphicsCheck(context11_->Wait(completed11_.Get(), value), "D3D11 waits for D3D12 completion");
     return value;
 }
 void Dx11Dx12::wait12(uint64_t completion) {
+    wait({completed12_, completion});
+}
+void Dx11Dx12::wait(const FencePoint& completion) {
     auto access = lock();
-    if (!completion)
+    if (completion.unpublished())
+        throw std::runtime_error("Cannot wait for an unpublished GPU retirement ticket");
+    if (!completion.value)
         return;
     graphicsCheck(device12_->GetDeviceRemovedReason(), "D3D12 device health");
-    const auto completed = completed12_->GetCompletedValue();
-    if (completed == UINT64_MAX)
-        throw std::runtime_error("D3D12 completion fence reports device removal");
-    if (completed >= completion)
+    if (completion.complete())
         return;
-    graphicsCheck(completed12_->SetEventOnCompletion(completion, event_), "Wait for bridge completion");
+    graphicsCheck(completion.fence->SetEventOnCompletion(completion.value, event_),
+                  "Wait for bridge completion");
     const auto result = WaitForSingleObject(event_, 30000); // Fault isolation, never a frame-rate assertion.
     if (result != WAIT_OBJECT_0)
         throw std::runtime_error("GPU bridge failed to drain; resources must remain retained");
     graphicsCheck(device12_->GetDeviceRemovedReason(), "D3D12 completion health");
     // An earlier timed-out registration can signal this reusable event late.
     // Notification is not proof that THIS fence value has retired; fail closed.
-    const auto observed = completed12_->GetCompletedValue();
-    if (observed == UINT64_MAX || observed < completion)
+    if (!completion.complete())
         throw std::runtime_error(
             "GPU fence notification did not prove requested retirement; resources remain retained");
 }
