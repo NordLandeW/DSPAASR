@@ -84,8 +84,8 @@ struct SlRuntimeState {
     std::atomic<bool> dlssSupported{false}, reflexSupported{false}, pclSupported{false};
     std::atomic<bool> lowLatencyAvailable{false}, flashIndicatorDriverControlled{false};
     std::atomic<uint32_t> statsWindowMessage{0};
-    std::atomic<bool> active{false}, quarantined{false};
-    std::atomic<SlReflexMode> reflexMode{SlReflexMode::On};
+    std::atomic<bool> active{false}, quarantined{false}, reflexConfigured{false};
+    std::atomic<SlReflexMode> reflexMode{SlReflexMode::Off};
     void* presenterOwner = nullptr;
     mutable std::mutex frameMutex, sdkMutex, errorMutex;
     std::condition_variable callsFinished;
@@ -104,6 +104,7 @@ struct SlRuntimeState {
     void activate(void* owner);
     void deactivate(void* owner); // Only after chain/proxy queues have been retired and released.
     void stopFrameCalls();
+    void applyReflex(SlReflexMode mode, uint32_t frameLimitMicroseconds); // Caller holds sdkMutex.
     void leaveFrameCall() noexcept;
     bool begin(uint64_t applicationFrameId);
     bool mark(uint64_t applicationFrameId, SlMarker marker);

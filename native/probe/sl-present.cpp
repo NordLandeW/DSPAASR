@@ -213,6 +213,8 @@ int wmain(int argc, wchar_t** argv) {
                     "Unsupported runtime failed clean shutdown");
             return 77;
         }
+        require(!runtime->setReflex(dspaa::SlReflexMode::OnWithBoost, 1000),
+                "An inactive runtime applied an unowned Reflex policy");
         ComPtr<ID3D12Fence> ready;
         dspaa::graphicsCheck(bridge.device12()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ready)),
                              "Create SL producer fence");
@@ -235,6 +237,8 @@ int wmain(int argc, wchar_t** argv) {
             DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
         window.drained = false;
         dspaa::SlPresenter presenter(create);
+        require(!runtime->beginFrame(1000), "An unconfigured SL owner admitted its first frame");
+        require(runtime->setReflex(dspaa::SlReflexMode::On, 0), "Initial SL-owned Reflex policy rejected");
         dspaa::graphicsCheck(presenter.setMaximumFrameLatency(1), "Set application-owned SL latency");
         dspaa::PresentArguments test;
         test.flags = DXGI_PRESENT_TEST;
@@ -431,6 +435,8 @@ int wmain(int argc, wchar_t** argv) {
                       << " max_generated=" << observed.maximumGeneratedFrames
                       << " dynamic=" << observed.dynamicSupported << " status=" << observed.sdkStatus << '\n';
         }
+        require(runtime->setReflex(dspaa::SlReflexMode::OnWithBoost, 1000),
+                "SL-owned Boost/limiter retirement setup failed");
         require(presenter.stop() == dspaa::PresentRetirement::Drained, "SL presenter retirement failed");
         window.drained = true;
         require(firstLease.expired(), "Retired SL producer lease remained held");
@@ -439,6 +445,8 @@ int wmain(int argc, wchar_t** argv) {
         const auto tickets = runtime->status().acceptedFrameTickets;
         require(!runtime->beginFrame(++id) && runtime->status().acceptedFrameTickets == tickets,
                 "Inactive SL backend kept advancing frames");
+        require(!runtime->setReflex(dspaa::SlReflexMode::On, 5000),
+                "Retired SL owner restored a stale Reflex limiter");
         require(runtime->shutdown() == dspaa::PresentRetirement::Drained, "SL runtime shutdown failed");
         const auto errors = validationErrors(diagnostics.Get());
         require(!errors, "D3D12 SL validation errors");

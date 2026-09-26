@@ -181,9 +181,8 @@ void SlRuntimeState::attach(ID3D12Device* nativeDevice, IDXGIFactory* nativeFact
     dlssLoaded = false;
     featureFunctions();
     if (reflexSupported) {
-        sl::ReflexOptions options{};
-        options.mode = sl::ReflexMode::eLowLatency;
-        slCheck(api.reflexOptions(options), "Set initial Reflex options");
+        // Attaching capability services is not ownership of active Reflex pacing.
+        applyReflex(SlReflexMode::Off, 0);
         sl::ReflexState state{};
         slCheck(api.reflexState(state), "Query Reflex capabilities");
         lowLatencyAvailable = state.lowLatencyAvailable;
@@ -208,12 +207,14 @@ void SlRuntimeState::activate(void* owner) {
     slCheck(api.load(sl::kFeatureDLSS_G, true), "Load DLSS FG at a quiescent backend boundary");
     dlssLoaded = true;
     presenterOwner = owner;
+    reflexConfigured.store(false);
     featureFunctions();
     // The presenter enables frame production only after its real chain exists.
 }
 void SlRuntimeState::stopFrameCalls() {
     active.store(false);
     std::unique_lock lock(frameMutex);
+    reflexConfigured.store(false);
     if (!callsFinished.wait_for(lock, std::chrono::milliseconds(slTimeoutMilliseconds), [this] { return frameCalls == 0; })) {
         quarantine("Streamline frame/Reflex call did not retire; DLLs and token owners remain retained");
         throw std::runtime_error("Streamline frame-call retirement timed out");
@@ -223,6 +224,9 @@ void SlRuntimeState::deactivate(void* owner) {
     stopFrameCalls();
     std::lock_guard sdkLock(sdkMutex);
     if (presenterOwner != owner) throw std::runtime_error("Streamline presenter ownership mismatch");
+    // The real SL owner has retired. Neither FSR nor Native owns its driver policy.
+    // Keep ownership intact if neutralization fails; the caller must quarantine.
+    applyReflex(SlReflexMode::Off, 0);
     slCheck(api.load(sl::kFeatureDLSS_G, false), "Unload retired DLSS FG backend");
     api.dlssOptions = nullptr; api.dlssState = nullptr; dlssLoaded = false;
     presenterOwner = nullptr;
@@ -245,7 +249,8 @@ bool SlRuntimeState::begin(uint64_t applicationFrameId) {
     std::shared_ptr<SlTicket> ticket;
     {
         std::lock_guard lock(frameMutex);
-        if (!active || quarantined || !applicationFrameId) return false;
+        if (!active || !reflexConfigured || quarantined || !applicationFrameId)
+            return false;
         if (const auto found = tickets.find(applicationFrameId); found != tickets.end()) return found->second->begun;
         pruneLocked();
         if ((haveBegun && applicationFrameId <= lastBegun) ||
@@ -286,7 +291,8 @@ bool SlRuntimeState::mark(uint64_t applicationFrameId, SlMarker markerValue) {
     const auto bit = markerBit(markerValue);
     {
         std::lock_guard lock(frameMutex);
-        if (!active || quarantined) return false;
+        if (!active || !reflexConfigured || quarantined)
+            return false;
         const auto found = tickets.find(applicationFrameId);
         if (found == tickets.end() || !found->second->begun) { report("No before-input ticket for this PCL marker"); return false; }
         ticket = found->second;
@@ -351,19 +357,37 @@ void SlRuntimeState::clearTags(const SlTicket& ticket) {
     slCheck(api.tags(*ticket.token, sl::ViewportHandle(0u), tags.data(), static_cast<uint32_t>(tags.size()), nullptr),
             "Clear frame-owned Streamline resource tags");
 }
-bool SlRuntimeState::setReflex(SlReflexMode mode, uint32_t frameLimitMicroseconds) {
-    std::lock_guard lock(sdkMutex);
-    if (!attached || quarantined || !reflexSupported) return false;
+void SlRuntimeState::applyReflex(SlReflexMode mode, uint32_t frameLimitMicroseconds) {
     sl::ReflexOptions options{};
     switch (mode) {
     case SlReflexMode::Off: options.mode = sl::ReflexMode::eOff; break;
     case SlReflexMode::On: options.mode = sl::ReflexMode::eLowLatency; break;
     case SlReflexMode::OnWithBoost: options.mode = sl::ReflexMode::eLowLatencyWithBoost; break;
-    default: return false;
+    default:
+        throw std::invalid_argument("Invalid Reflex mode");
     }
     options.frameLimitUs = frameLimitMicroseconds;
-    slCheck(api.reflexOptions(options), "Configure Reflex latency/limiter");
+    try {
+        slCheck(api.reflexOptions(options), "Configure Reflex latency/limiter");
+    } catch (const std::exception& error) {
+        // A failed driver-policy transition is not proof that the previous mode
+        // remains active or that another presentation owner can safely take over.
+        quarantine(error.what());
+        throw;
+    }
     reflexMode.store(mode);
+}
+bool SlRuntimeState::setReflex(SlReflexMode mode, uint32_t frameLimitMicroseconds) {
+    std::lock_guard lock(sdkMutex);
+    if (!attached || quarantined || !reflexSupported || !presenterOwner || !active)
+        return false;
+    if (mode != SlReflexMode::Off && mode != SlReflexMode::On && mode != SlReflexMode::OnWithBoost)
+        return false;
+    // Keep the existing serialized control path; never block rendering here
+    // waiting for a main-thread Sleep that may need this frame's Present.
+    // The new owner's first token is gated until its policy has been applied.
+    applyReflex(mode, frameLimitMicroseconds);
+    reflexConfigured.store(true);
     return true;
 }
 SlRuntimeStatus SlRuntimeState::status() const {
@@ -403,6 +427,8 @@ PresentRetirement SlRuntimeState::stop() noexcept {
         if (initialized) {
             bounded([this] {
                 std::lock_guard sdkLock(sdkMutex);
+                if (api.reflexOptions && reflexSupported)
+                    applyReflex(SlReflexMode::Off, 0);
                 // Release SL proxy objects while their plugin manager still
                 // exists. Native device/factory references remain alive across
                 // slShutdown, as required by the SDK shutdown contract.

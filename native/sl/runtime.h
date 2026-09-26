@@ -44,6 +44,8 @@ class SlRuntime {
     // these markers. The host uses PresentArguments::boundary for RenderSubmitEnd,
     // PresentStart and PresentEnd at the actual chain boundary, also on FG-Off frames.
     bool marker(uint64_t applicationFrameId, SlMarker marker) noexcept;
+    // Only a live presenter may apply its requested policy. Its first frame is
+    // gated until this succeeds; actual owner retirement restores Off/limiter 0.
     bool setReflex(SlReflexMode mode, uint32_t frameLimitMicroseconds = 0) noexcept;
     SlRuntimeStatus status() const;
     // All presenters must already have proved retirement. Quarantine retains the

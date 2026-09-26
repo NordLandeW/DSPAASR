@@ -68,6 +68,8 @@ The presentation bridge adds copies and synchronization even while generation it
 
 If the bridge already exists in the current process, FSR/DLSS/Off changes apply without restarting. Turning FG off stops generation immediately but retains the bridge until the game exits; turning it back on during that same session also needs no restart. Starting again with Off restores the native presentation path. The restart prompt depends on the actual bridge state, not an Off-to-On menu transition. Apply saves the draft, Cancel discards it, and Defaults remains a draft until applied. Installation or initialization failures are reported separately from a normal next-start request.
 
+Reflex and its frame limiter apply while the DLSS backend owns presentation. Switching to Off or FSR releases those runtime controls without changing the saved DLSS choices. Temporarily pausing generation while the DLSS backend remains active keeps its selected Reflex settings applied.
+
 | Section / key | Values | Default |
 |---|---|---|
 | FrameGeneration / Backend | Off, Fsr, Dlss; startup selects whether to create the bridge | Off |
