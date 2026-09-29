@@ -111,7 +111,12 @@ namespace DSPAAMod
             {
                 string directory = Path.GetDirectoryName(Info.Location);
                 string data = Path.Combine(Paths.CachePath, "DSPAAMod");
-                native = new NativeBridge(directory, data);
+                try { native = new NativeBridge(directory, data); }
+                catch (NativeModuleLoadException error)
+                {
+                    Logger.LogError(error);
+                    throw;
+                }
             }
             return native;
         }

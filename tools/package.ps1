@@ -42,6 +42,7 @@ $files = [ordered]@{
     'external/streamline-runtime/rel/nvngx_dlss.license.txt' = 'nvngx_dlss.license.txt'
     'external/streamline-runtime/rel/reflex.license.txt' = 'reflex.license.txt'
     'README.md' = 'README.md'
+    'docs/usage.md' = 'usage.md'
     'LICENSE' = 'LICENSE'
     'docs/third-party.md' = 'third-party.md'
     'docs/nvidia-dlss-notices.txt' = 'NVIDIA-DLSS-NOTICES.txt'

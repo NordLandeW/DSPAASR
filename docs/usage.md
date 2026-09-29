@@ -6,15 +6,56 @@ DSPAASR adds native anti-aliasing controls, NVIDIA DLAA/DLSS, AMD FSR 3.1.5 Nati
 
 Target: Dyson Sphere Program's Unity 2022.3.62f3c1 Mono build on Windows x64, D3D11 and BepInEx 5.4.x. DLSS/DLAA additionally require a supported NVIDIA RTX GPU and a compatible driver; FSR and the original AA modes do not have that NVIDIA-only requirement. FSR additionally requires D3D12/Shader Model 6.2, D3D11 shared fences and compatible shared texture formats on the same graphics adapter. Unity itself remains on D3D11; the FSR bridge has additional copies and synchronization costs. An unsupported backend/device, missing runtime or unverified preset leaves original game AA available. Other mods changing the same AA controls/render hooks may be incompatible. Hot-unloading the native plugin is not supported; restart the game to remove it.
 
+Install the current [Microsoft Visual C++ v14 Redistributable for x64](https://aka.ms/vc14/vc_redist.x64.exe) from Microsoft. The bundled AMD FSR and NVIDIA Streamline runtimes depend on it even though DSPAASR's own native bridge statically links its C/C++ runtime. A mod manager installs the BepInEx dependency; check this Windows runtime prerequisite separately.
+
 ## Installation and removal
 
 For **Gale**, select the Dyson Sphere Program profile and import the supplied ZIP with Gale's local-mod import feature. Its `manifest.json`, README, changelog, 256×256 icon and ordinary runtime files are at the archive root; the early loader is under `patchers/`. Preserve that archive structure, without an extra parent directory. Gale and compatible Thunderstore managers install the plugin and patcher into their respective profile directories. The dependency is `xiaoye97-BepInEx-5.4.17`. No `boot.config` edit, game-directory bootstrap or additional opt-in file is required.
 
-For a manual installation, close the game. Place the archive's root files together in a dedicated `BepInEx/plugins/DSPAASR/` directory, and place `patchers/DSPAASR.Preloader.dll` in `BepInEx/patchers/DSPAASR/`. Do not put the patcher underneath `plugins/`. When upgrading an existing installation, replace its previous copy rather than keeping two plugin folders. The package contains `DSPAAMod.dll`, `DSPAANative.dll`, the unmodified **release** `nvngx_dlss.dll`, the NVIDIA Streamline/DLSS-G/Reflex runtime set, AMD-signed `amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll` and `amd_fidelityfx_framegeneration_dx12.dll`, complete project and third-party licenses/notices, and a SHA256 manifest. The assembly filenames retain their original names for compatibility. Do not replace any game assemblies or install the development runtime. BepInEx itself is a prerequisite, not part of this package.
+For a **manual installation**, install BepInEx 5.4.x for Windows x64 first, then close the game:
+
+1. Create `BepInEx/plugins/DSPAASR/` in the installation or profile used to launch the game. Copy all archive-root files into that directory, keeping `DSPAAMod.dll`, `DSPAANative.dll` and every supplied vendor DLL together.
+2. Copy the archive's `patchers/DSPAASR.Preloader.dll` to `BepInEx/patchers/DSPAASR/DSPAASR.Preloader.dll`.
+3. When upgrading, replace the previous installation in that profile. Keep only one enabled copy of the plugin and its matching preloader.
+
+The relevant layout is:
+
+```text
+BepInEx/
+  plugins/
+    DSPAASR/
+      DSPAAMod.dll
+      DSPAANative.dll
+      nvngx_dlss.dll
+      amd_fidelityfx_loader_dx12.dll
+      amd_fidelityfx_upscaler_dx12.dll
+      amd_fidelityfx_framegeneration_dx12.dll
+      ...remaining package-root files, including Streamline DLLs and licenses
+  patchers/
+    DSPAASR/
+      DSPAASR.Preloader.dll
+```
+
+The native bridge is loaded from the active `DSPAAMod.dll` directory. Placing its DLLs beside `DSPGAME.exe` does not satisfy that layout; the preloader belongs under `BepInEx/patchers/`, separately from the ordinary plugin. A mod manager is recommended for routing these files and the BepInEx dependency, but a complete manual installation is supported.
+
+The package includes unmodified **release** NVIDIA and AMD runtimes, complete project and third-party licenses/notices, this `usage.md` guide, and a SHA256 manifest. The assembly filenames retain their original names for compatibility. Keep the supplied runtime and license files together. BepInEx itself is a prerequisite, not part of this package.
 
 To update a runtime, exit the game first and replace it with a compatible version. DSPAASR does not require external runtime DLLs to match the package's hashes at startup. Normal DLL loading, required exports, SDK compatibility checks and the vendor runtime's own checks still apply; compatibility with arbitrary newer versions is not guaranteed.
 
 First installation preserves the game's existing AA and leaves frame generation off. To disable or uninstall, close the game and use the manager's controls for this package; both its plugin and patcher must be disabled or removed. For manual removal, remove both dedicated DSPAASR directories under `plugins/` and `patchers/`, and optionally remove `BepInEx/config/dspaa.mod.cfg` and `BepInEx/cache/DSPAAMod/`. A retained configuration does not enable a removed or disabled plugin. No save conversion is involved. The original game graphics settings remain normal game settings; choosing a custom AA mode and applying it sets native MSAA to off and keeps the game's FXAA fallback enabled.
+
+### Native DLL loading failures
+
+`Cannot load DSPAANative.dll` means Windows could not load the native bridge, before the FSR capability check could run. It does not establish whether the GPU supports FSR. The menu reports the Windows error code and system reason; `BepInEx/LogOutput.log` records the full expected DLL path and whether the file was present at the diagnostic check. Use the log from the same installation/profile used to launch the game.
+
+- **File absent at the expected path:** check the layout above and reinstall the complete package into the active profile. A DLL in the game directory or a different profile will not repair that installation.
+- **Error 126 with the file present:** Windows could not find a required module, which can be one of its dependencies. The code alone does not identify which dependency is missing. The original 1.2.0 bridge also depends directly on the Microsoft runtime linked above. Install or repair the official x64 redistributable, and check that the complete mod package is present. Avoid downloading individual system DLLs from third-party sites.
+- **Error 193 or 216:** check for a damaged or wrong-architecture file and restore the complete Windows x64 package.
+- **Other Windows errors:** use the recorded system reason to check access permissions or security-software reports. Retain the error code when reporting the problem.
+
+A later `Load official FSR runtime failed (0x8007007e)` or `Load FSR FG runtime failed (0x8007007e)` is the corresponding module-not-found error when loading an AMD component. Check the supplied AMD DLLs and the Microsoft x64 runtime even if `DSPAANative.dll` loaded successfully.
+
+After correcting the files or dependencies, restart the game. If the problem remains, include the mod version, Windows version, installation method, `BepInEx/LogOutput.log`, and the file listing of the active plugin folder. Remove personal information from paths before posting logs publicly.
 
 ## Graphics settings
 

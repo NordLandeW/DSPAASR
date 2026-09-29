@@ -8,6 +8,7 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using DSPAAMod.Core;
+using DSPAAMod.Interop;
 using Mono.Cecil;
 
 namespace DSPAASR.Preloader
@@ -72,7 +73,8 @@ namespace DSPAASR.Preloader
                 throw new InvalidOperationException("The DSPAASR plugin and preloader versions do not match.");
             string runtime = PresentationStartup.NormalizeDirectory(Path.GetDirectoryName(managed));
             if (!File.Exists(Path.Combine(runtime, "DSPAANative.dll")))
-                throw new FileNotFoundException("DSPAANative.dll is disabled or missing beside the active DSPAASR plugin.");
+                throw new FileNotFoundException("DSPAANative.dll is disabled or missing beside the active DSPAASR plugin.",
+                    Path.Combine(runtime, "DSPAANative.dll"));
             return runtime;
         }
 
@@ -95,8 +97,6 @@ namespace DSPAASR.Preloader
             [MarshalAs(UnmanagedType.LPWStr)] string data, uint mode);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate uint GetAbi();
-        [DllImport("kernel32.dll", EntryPoint = "LoadLibraryExW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
-        private static extern IntPtr LoadLibraryEx(string path, IntPtr file, uint flags);
         [DllImport("kernel32.dll", EntryPoint = "GetModuleHandleExW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetModuleHandleEx(uint flags, string path, out IntPtr module);
@@ -113,8 +113,7 @@ namespace DSPAASR.Preloader
         private static void StartPresentation(string runtime, string data)
         {
             string path = Path.Combine(runtime, "DSPAANative.dll");
-            IntPtr module = LoadLibraryEx(path, IntPtr.Zero, 0x00000100 | 0x00001000);
-            if (module == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot load DSPAANative.dll.");
+            IntPtr module = NativeModule.Load(path);
             // Native callbacks/trampolines can outlive the patcher and any error.
             // Keep both this load reference and a process-lifetime pin; never free.
             if (!GetModuleHandleEx(0x00000001, path, out _))

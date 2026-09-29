@@ -13,7 +13,7 @@ $files = @(
     @('include/nvsdk_ngx_helpers_d3d.h', 'include/nvsdk_ngx_helpers_d3d.h', 'EC75224F36ED6580BAAF250FA83620405AD81A1D98C2C436654A0C9CF6A6B8BA'),
     @('include/nvsdk_ngx_helpers.h', 'include/nvsdk_ngx_helpers.h', '5BCBADFE7478B802CF6D3ACA4DC5DDD7D0889B99726E69C63F9E9BD555F44471'),
     @('include/nvsdk_ngx_helpers_cuda.h', 'include/nvsdk_ngx_helpers_cuda.h', 'F2851A76107BDF4FBCB7B261F3C35573C312D8ECB4BC18FB02D9E2CEC7705042'),
-    @('lib/Windows_x86_64/x64/nvsdk_ngx_d.lib', 'lib/nvsdk_ngx_d.lib', '4B6CECAD7F1906571C94010241F650E4A5457E64FAD49DDACCB82DE79F6C2999'),
+    @('lib/Windows_x86_64/x64/nvsdk_ngx_s.lib', 'lib/nvsdk_ngx_s.lib', '4E5D355086D2BC11E1A0842457D2519EA528EE1F3E112C45679A84960C07DFF3'),
     @('LICENSE.txt', 'LICENSE.txt', 'D4216E39EBEF5F9B50A6712EBB37BEEB5379862A67733A9999C651F21592AAF0'),
     @('lib/Windows_x86_64/rel/nvngx_dlss.dll', 'runtime/rel/nvngx_dlss.dll', '3975567B8943C53ACCE397F2B72380092F84F162D00B0D2C7D08A1025C563983')
 )

@@ -18,6 +18,7 @@
   <ItemGroup>
     <Compile Include="../managed/Core/PresentationStartup.cs" Link="Core/PresentationStartup.cs" />
     <Compile Include="../managed/Core/FrameGenerationSettings.cs" Link="Core/FrameGenerationSettings.cs" />
+    <Compile Include="../managed/Interop/NativeModule.cs" Link="Interop/NativeModule.cs" />
     <Reference Include="BepInEx"><HintPath>$(BepInExPath)/BepInEx.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Mono.Cecil"><HintPath>$(BepInExPath)/Mono.Cecil.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>

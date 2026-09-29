@@ -1,5 +1,4 @@
 using System;
-using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -107,8 +106,6 @@ namespace DSPAAMod.Interop
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr QueueBackendOptimal(ulong camera, IntPtr resource, uint width, uint height, uint quality, uint backend);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int ReadFsrOptimal(ulong camera, ref NativeFsrOptimalSettings result);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern IntPtr LoadLibraryEx(string name, IntPtr file, uint flags);
         [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true, SetLastError = true)]
         private static extern IntPtr GetProcAddress(IntPtr module, string name);
 
@@ -137,8 +134,7 @@ namespace DSPAAMod.Interop
         public NativeBridge(string directory, string dataDirectory)
         {
             if (!Environment.Is64BitProcess) throw new PlatformNotSupportedException("DSPAAMod requires x64.");
-            module = LoadLibraryEx(Path.Combine(directory, "DSPAANative.dll"), IntPtr.Zero, 0x00000100 | 0x00001000);
-            if (module == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot load DSPAANative.dll.");
+            module = NativeModule.Load(Path.Combine(directory, "DSPAANative.dll"));
             // Keep the DLL loaded for process lifetime: Unity may hold queued function pointers.
             if (Get<Abi>("DspAaGetAbiVersion")() != 2 || FrameSize != 112 || StatusSize != 288 || OptimalSize != 300 || SupportSize != 264 || FsrParametersSize != 40 || FsrOptimalSize != 304)
                 throw new InvalidOperationException("Native/managed DSPAAMod ABI mismatch.");

@@ -443,6 +443,46 @@ internal static class Program
         catch (ArgumentOutOfRangeException) { }
     }
 
+    private static void NativeLoadFailures(string dll)
+    {
+        string root = Path.Combine(Path.GetTempPath(), "DSPAAMod-loader-" + Guid.NewGuid().ToString("N"));
+        string plugin = Path.Combine(root, "BepInEx", "plugins", "manual install 测试");
+        string expected = Path.Combine(plugin, "DSPAANative.dll");
+        string previous = Environment.CurrentDirectory;
+        Directory.CreateDirectory(plugin);
+        try
+        {
+            // A valid DLL in the simulated game/current directory must not hide an
+            // incomplete plugin installation. No native module has been loaded yet.
+            File.Copy(dll, Path.Combine(root, "DSPAANative.dll"));
+            Environment.CurrentDirectory = root;
+            NativeModuleLoadException Failure()
+            {
+                try { _ = new NativeBridge(plugin, Path.Combine(root, "data")); }
+                catch (NativeModuleLoadException error) { return error; }
+                throw new InvalidOperationException("An incomplete or damaged native installation was accepted");
+            }
+            var missing = Failure();
+            Require(!missing.ModuleFound && missing.ModulePath == expected &&
+                (missing.NativeErrorCode == 2 || missing.NativeErrorCode == 3 || missing.NativeErrorCode == 126),
+                "Missing plugin DLL lost its expected path/system error, or loaded the game-root copy");
+            Require(missing.ToString().Contains(expected) && !missing.Message.Contains(root) &&
+                missing.Message.Contains(missing.NativeErrorCode.ToString()),
+                "Native failure did not separate actionable menu diagnostics from the full logged path");
+            File.WriteAllBytes(expected, new byte[] { 0, 1, 2, 3 });
+            var damaged = Failure();
+            Require(damaged.ModuleFound && damaged.ModulePath == expected && damaged.NativeErrorCode == 193,
+                "Invalid native image was not distinguished from an absent file");
+            Require(damaged.Message.Contains(new System.ComponentModel.Win32Exception(damaged.NativeErrorCode).Message),
+                "Windows' actual failure reason was discarded");
+        }
+        finally
+        {
+            Environment.CurrentDirectory = previous;
+            Directory.Delete(root, true);
+        }
+    }
+
     private static void InteropChecks(string dll)
     {
         string root = Path.Combine(Path.GetTempPath(), "DSPAAMod-managed-" + Guid.NewGuid().ToString("N"));
@@ -498,7 +538,7 @@ internal static class Program
         try
         {
             Require(args.Length == 1, "Pass the built native DLL path");
-            ModelPolicyChecks(); MenuChecks(); MenuProjectionChecks(); AvailabilityChecks(); FsrChecks(); ResolutionChecks(); JitterChecks(); VisibilityChecks(); FrameGenerationChecks(); InteropChecks(args[0]);
+            ModelPolicyChecks(); MenuChecks(); MenuProjectionChecks(); AvailabilityChecks(); FsrChecks(); ResolutionChecks(); JitterChecks(); VisibilityChecks(); FrameGenerationChecks(); NativeLoadFailures(args[0]); InteropChecks(args[0]);
             Console.WriteLine("Model overrides, settings transactions, jitter coverage and real DLL interop passed.");
             return 0;
         }

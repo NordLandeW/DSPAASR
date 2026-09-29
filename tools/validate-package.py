@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 import struct
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -12,7 +13,7 @@ def validate(path):
     expected = {
         "manifest.json", "README.md", "LICENSE", "CHANGELOG.md", "icon.png", "DSPAAMod.dll",
         "DSPAANative.dll", "nvngx_dlss.dll", "NVIDIA-RTX-SDK-LICENSE.txt", "NVIDIA-DLSS-NOTICES.txt",
-        "third-party.md", "SHA256SUMS.json",
+        "third-party.md", "usage.md", "SHA256SUMS.json",
         "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll", "AMD-FSR-SDK-LICENSE.md",
         "MINHOOK-LICENSE.txt",
         "amd_fidelityfx_framegeneration_dx12.dll", "STREAMLINE-LICENSE.txt",
@@ -73,8 +74,9 @@ def validate(path):
         for name, digest in sl_pins.items():
             if hashlib.sha256(archive.read(name)).hexdigest().upper() != digest:
                 raise ValueError(f"Unexpected Streamline production runtime or incomplete license: {name}")
-        for name in ("README.md", "LICENSE", "third-party.md", "NVIDIA-RTX-SDK-LICENSE.txt", "NVIDIA-DLSS-NOTICES.txt", "AMD-FSR-SDK-LICENSE.md"):
+        for name in ("README.md", "usage.md", "LICENSE", "third-party.md", "NVIDIA-RTX-SDK-LICENSE.txt", "NVIDIA-DLSS-NOTICES.txt", "AMD-FSR-SDK-LICENSE.md"):
             archive.read(name).decode("utf-8")
+    subprocess.run([sys.executable, str(Path(__file__).with_name("test-native-dependencies.py")), str(path)], check=True)
     print(f"Validated {manifest['name']} {version}: {len(expected)} files, standard preloader entry, metadata, icon, CRCs and recursive payload hashes.")
 
 
