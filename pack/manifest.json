@@ -1,6 +1,6 @@
 {
     "name": "DSPAASR",
-    "description": "Adds anti-aliasing, DLSS/AMD FSR super resolution and frame generation to Dyson Sphere Program.",
+    "description": "Adds TAA, DLSS/AMD FSR super resolution and frame generation to Dyson Sphere Program.",
     "version_number": "1.2.0",
     "dependencies": [
         "xiaoye97-BepInEx-5.4.17"
