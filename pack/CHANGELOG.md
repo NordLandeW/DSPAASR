@@ -2,6 +2,7 @@
 
 ## v1.2.0
 
+- Fixed blueprint cursor picking and world-overlay offsets with TAA, DLAA, DLSS and FSR by preserving the game camera's off-center projection through temporal rendering and cleanup.
 - Added NVIDIA DLSS Frame Generation and AMD FSR 3.1 Frame Generation, configured independently of anti-aliasing and super resolution. Available backends and DLSS multipliers follow runtime capability checks.
 - Added frame-generation controls and NVIDIA Reflex settings to the graphics menu. Frame generation is off by default; the first activation may require a restart.
 - Added a standard BepInEx preloader for the presentation bridge. Starting with frame generation off preserves native presentation for SR-only use, without game-file or boot configuration edits.

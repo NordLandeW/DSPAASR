@@ -8,5 +8,7 @@
   <ItemGroup>
     <Compile Include="../../managed/Core/*.cs" Link="Core/%(Filename)%(Extension)" />
     <Compile Include="../../managed/Interop/*.cs" Link="Interop/%(Filename)%(Extension)" />
+    <Compile Include="../../managed/Game/TemporalProjection.cs" Link="Game/TemporalProjection.cs" />
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(DspLibsPath)/UnityEngine.CoreModule.dll</HintPath></Reference>
   </ItemGroup>
 </Project>

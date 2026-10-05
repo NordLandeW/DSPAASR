@@ -27,7 +27,7 @@ namespace DSPAAMod.Game
             public int WorldTextFrame = -1;
             public int RequestedWidth, RequestedHeight;
             public bool QueryIssued, TargetOverridden, SrThisRender, InputsCopied;
-            public Matrix4x4 AppliedProjection;
+            public readonly TemporalProjection ProjectionScope = new TemporalProjection();
             public uint Phase;
             public ulong Frame;
             public uint ReportedPreset;
@@ -36,7 +36,7 @@ namespace DSPAAMod.Game
             public Quaternion Rotation;
             public Matrix4x4 Projection;
             public JitterSample Jitter;
-            public bool Reset = true, Faulted, Prepared, JitterApplied, Overridden, OriginalMsaa, OriginalTransparentJitter;
+            public bool Reset = true, Faulted, Prepared, Overridden, OriginalMsaa, OriginalTransparentJitter;
             public AntialiasingModel Model;
             public AntialiasingModel.Settings OriginalSettings;
             public bool OriginalEnabled;
@@ -262,7 +262,7 @@ namespace DSPAAMod.Game
                     " method=" + profile.antialiasing.settings.method + " debugInterrupt=" + profile.debugViews.willInterrupt : " no-profile";
                 model += " contextProfile=" + (context != null && context.profile ? context.profile.GetInstanceID().ToString() : "none");
                 string adapter = cameras.TryGetValue(camera, out var state) ? " key=" + state.Key + " prepared=" + state.Prepared +
-                    " faulted=" + state.Faulted + " reset=" + state.Reset + " jitterApplied=" + state.JitterApplied +
+                    " faulted=" + state.Faulted + " reset=" + state.Reset + " jitterApplied=" + state.ProjectionScope.Captured +
                     " submitted=" + state.Frame : " unregistered-camera";
                 information("PipelineTrace frame=" + Time.frameCount + " stage=" + stage + " camera=" + camera.GetInstanceID() + ":" + camera.name +
                     " postEnabled=" + (behaviour && behaviour.enabled) + model + " interrupted=" + (context != null && context.interrupted) + adapter +
@@ -359,6 +359,7 @@ namespace DSPAAMod.Game
             // Recover old render overrides without releasing this frame's Canvas
             // isolation, which was already consumed by Unity's batch preparation.
             Restore(state, state.WorldTextFrame == Time.frameCount);
+            state.ProjectionScope.Clear();
             state.Prepared = false;
             state.SrThisRender = false;
             state.InputsCopied = false;
@@ -555,31 +556,52 @@ namespace DSPAAMod.Game
             anchor.Release(); UnityEngine.Object.Destroy(anchor);
         }
 
-        public bool Projection(TaaComponent taa, Func<Vector2, Matrix4x4> custom)
+        public bool Projection(TaaComponent taa, ref Func<Vector2, Matrix4x4> custom)
         {
             TraceStage("taa.projection-entry", taa.context?.camera, taa.context);
-            if (!TryPrepared(taa, out var state)) return true;
+            if (taa.context == null || !taa.context.camera || !cameras.TryGetValue(taa.context.camera, out var state))
+                return true;
             Camera camera = state.Camera;
+            bool prepared = state.Prepared && !state.Faulted;
+            // GameCamera authors its projection each logic frame. Other cameras
+            // must retain Unity's automatic FOV/aspect updates after a reset.
+            bool gameProjection = camera == GameCamera.main && GameCamera.instance && GameCamera.instance.isActiveAndEnabled;
+            if (!prepared && !gameProjection) return true;
+            int width = prepared ? state.Targets.Width : taa.context.width;
+            int height = prepared ? state.Targets.Height : taa.context.height;
+            state.ProjectionScope.Begin(camera.projectionMatrix, camera.orthographic, width, height, gameProjection);
+            if (!prepared)
+            {
+                // Preserve the original TAA sample sequence, shader uniforms and
+                // explicit custom delegate; replace only its centered default.
+                if (custom == null) custom = state.ProjectionScope.JitteredMatrix;
+                return true;
+            }
             var jitter = new Vector2(state.Jitter.X, state.Jitter.Y);
-            Matrix4x4 projection = camera.projectionMatrix;
-            camera.nonJitteredProjectionMatrix = projection;
-            if (custom != null) projection = custom(jitter);
-            else if (camera.orthographic)
-            {
-                projection.m03 -= 2f * jitter.x / state.Targets.Width;
-                projection.m13 -= 2f * jitter.y / state.Targets.Height;
-            }
-            else
-            {
-                projection.m02 += 2f * jitter.x / state.Targets.Width;
-                projection.m12 += 2f * jitter.y / state.Targets.Height;
-            }
+            camera.nonJitteredProjectionMatrix = state.ProjectionScope.Original;
+            Matrix4x4 projection = (custom ?? state.ProjectionScope.JitteredMatrix)(jitter);
+            state.ProjectionScope.Observe(projection);
             camera.projectionMatrix = projection;
-            state.AppliedProjection = projection;
-            state.JitterApplied = true;
             camera.useJitteredProjectionMatrixForTransparentRendering = true;
-            setJitter(taa, new Vector2(jitter.x / state.Targets.Width, jitter.y / state.Targets.Height));
+            setJitter(taa, new Vector2(jitter.x / width, jitter.y / height));
             return false; // Do not apply the legacy eight-phase jitter a second time.
+        }
+        public void AfterProjection(TaaComponent taa)
+        {
+            if (taa.context != null && taa.context.camera && cameras.TryGetValue(taa.context.camera, out var state))
+                state.ProjectionScope.Observe(state.Camera.projectionMatrix);
+        }
+        public bool ResetProjection(Camera camera)
+        {
+            if (!camera || !cameras.TryGetValue(camera, out var state) ||
+                !state.ProjectionScope.TryReset(camera.projectionMatrix, out var projection)) return false;
+            camera.projectionMatrix = projection;
+            return true;
+        }
+        private static void RestoreProjection(CameraState state)
+        {
+            if (state.Camera && state.ProjectionScope.TryRestore(state.Camera.projectionMatrix, out var projection))
+                state.Camera.projectionMatrix = projection;
         }
         public bool Resolve(TaaComponent taa, RenderTexture source, RenderTexture destination)
         {
@@ -639,7 +661,7 @@ namespace DSPAAMod.Game
                     submitted = true;
                 }
                 TraceStage("ngx.submitted", state.Camera, taa.context, source, destination);
-                Capture?.EnqueueIfRequested(frame, targets, state.Camera, state.AppliedProjection, state.WorldText.PendingCount);
+                Capture?.EnqueueIfRequested(frame, targets, state.Camera, state.ProjectionScope.Applied, state.WorldText.PendingCount);
                 state.Reset = false;
                 return false; // NGX consumed raw color, NOT an already TAA-resolved image.
             }
@@ -794,11 +816,10 @@ namespace DSPAAMod.Game
                     {
                         state.Camera.allowMSAA = state.OriginalMsaa;
                         state.Camera.useJitteredProjectionMatrixForTransparentRendering = state.OriginalTransparentJitter;
-                        if (state.JitterApplied && state.Camera.projectionMatrix == state.AppliedProjection) state.Camera.projectionMatrix = state.Projection;
                     }
-                    state.JitterApplied = false;
                     state.Overridden = false;
                 }
+                RestoreProjection(state);
             }
         }
         public void Reset(PostProcessingBehaviour behaviour)

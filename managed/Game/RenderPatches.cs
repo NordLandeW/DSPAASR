@@ -21,6 +21,28 @@ namespace DSPAAMod.Game
         private static void Postfix(PostProcessingBehaviour __instance)
         { Plugin.Instance?.Guard(() => Plugin.Instance.Presentation?.World?.AfterProjection(__instance)); }
     }
+    [HarmonyPatch(typeof(PostProcessingBehaviour), "OnPostRender")]
+    internal static class ResetProjectionPatch
+    {
+        private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            var original = AccessTools.Method(typeof(Camera), nameof(Camera.ResetProjectionMatrix));
+            var replacement = AccessTools.Method(typeof(ResetProjectionPatch), nameof(ResetProjection));
+            int replacements = 0;
+            var result = new List<CodeInstruction>();
+            foreach (var instruction in instructions)
+            {
+                if (instruction.Calls(original)) { instruction.opcode = OpCodes.Call; instruction.operand = replacement; ++replacements; }
+                result.Add(instruction);
+            }
+            if (replacements != 1) throw new InvalidOperationException("Unsupported postprocessing projection reset flow.");
+            return result;
+        }
+        private static void ResetProjection(Camera camera)
+        {
+            if (Plugin.Instance?.Renderer?.ResetProjection(camera) != true) camera.ResetProjectionMatrix();
+        }
+    }
     [HarmonyPatch(typeof(BloomComponent), nameof(BloomComponent.Prepare))]
     internal static class NavigationBloomPatch
     {
@@ -88,13 +110,17 @@ namespace DSPAAMod.Game
     [HarmonyPatch(typeof(TaaComponent), nameof(TaaComponent.SetProjectionMatrix))]
     internal static class JitterPatch
     {
-        private static bool Prefix(TaaComponent __instance, Func<Vector2, Matrix4x4> jitteredFunc)
+        private static bool Prefix(TaaComponent __instance, ref Func<Vector2, Matrix4x4> jitteredFunc)
         {
             if (Plugin.Instance == null) return true;
             bool original = true;
-            Plugin.Instance.Guard(() => original = Plugin.Instance.Renderer.Projection(__instance, jitteredFunc));
+            var custom = jitteredFunc;
+            Plugin.Instance.Guard(() => original = Plugin.Instance.Renderer.Projection(__instance, ref custom));
+            jitteredFunc = custom;
             return original;
         }
+        private static void Postfix(TaaComponent __instance)
+        { Plugin.Instance?.Guard(() => Plugin.Instance.Renderer.AfterProjection(__instance)); }
     }
     [HarmonyPatch(typeof(TaaComponent), nameof(TaaComponent.Render))]
     internal static class ResolvePatch

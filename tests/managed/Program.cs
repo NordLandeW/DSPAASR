@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 using DSPAAMod.Core;
 using DSPAAMod.Interop;
 
-internal static class Program
+internal static partial class Program
 {
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void RenderEvent(int eventId, IntPtr token);
@@ -538,7 +538,7 @@ internal static class Program
         try
         {
             Require(args.Length == 1, "Pass the built native DLL path");
-            ModelPolicyChecks(); MenuChecks(); MenuProjectionChecks(); AvailabilityChecks(); FsrChecks(); ResolutionChecks(); JitterChecks(); VisibilityChecks(); FrameGenerationChecks(); NativeLoadFailures(args[0]); InteropChecks(args[0]);
+            ModelPolicyChecks(); MenuChecks(); MenuProjectionChecks(); AvailabilityChecks(); FsrChecks(); ResolutionChecks(); JitterChecks(); TemporalProjectionChecks(); VisibilityChecks(); FrameGenerationChecks(); NativeLoadFailures(args[0]); InteropChecks(args[0]);
             Console.WriteLine("Model overrides, settings transactions, jitter coverage and real DLL interop passed.");
             return 0;
         }
