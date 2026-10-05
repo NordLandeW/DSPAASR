@@ -147,6 +147,9 @@ struct SlPresenter::Impl {
     bool stopped = false, owned = false, forceReset = true;
     uint64_t lastApplicationFrame = 0;
     bool haveFrame = false, optionsConfigured = false;
+    bool recoveryPresentPending = false;
+    // Last successful SDK submission; runtime observations do not change this cache.
+    SlGenerationMode configuredMode = SlGenerationMode::Off;
     unsigned configuredGeneratedFrames = 1;
     float configuredDynamicTarget = 0;
     sl::Extent lastAcceptedArea{};
@@ -175,6 +178,7 @@ struct SlPresenter::Impl {
                   const SlGenerationRequest& request, const std::shared_ptr<detail::SlTicket>& ticket,
                   ContentView& view);
     HRESULT present(FrameLease frame, const PresentArguments& arguments, const SlGenerationRequest& request);
+    void finishPresent(bool generate, HRESULT result, const sl::DLSSGState& state, const ContentView& view);
     PresentRetirement stop() noexcept;
     void quarantine(const char* reason) noexcept {
         runtime->quarantine(reason);
@@ -340,7 +344,7 @@ void SlPresenter::Impl::options(SlGenerationMode mode, const SlGenerationRequest
                                                      : sl::DLSSGMode::eOff;
     value.numFramesToGenerate = mode == SlGenerationMode::Fixed ? request.generatedFrames : 1;
     value.dynamicTargetFrameRate = mode == SlGenerationMode::Dynamic ? request.dynamicTargetFrameRate : 0;
-    if (optionsConfigured && observation.active == mode &&
+    if (optionsConfigured && configuredMode == mode &&
         configuredGeneratedFrames == value.numFramesToGenerate &&
         configuredDynamicTarget == value.dynamicTargetFrameRate)
         return;
@@ -352,6 +356,7 @@ void SlPresenter::Impl::options(SlGenerationMode mode, const SlGenerationRequest
     detail::slCheck(runtime->api.dlssOptions(sl::ViewportHandle(0u), value),
                     "Configure DLSS frame generation");
     observation.active = mode;
+    configuredMode = mode;
     optionsConfigured = true;
     configuredGeneratedFrames = value.numFramesToGenerate;
     configuredDynamicTarget = value.dynamicTargetFrameRate;
@@ -595,6 +600,10 @@ bool SlPresenter::Impl::eligible(const PresentationFrame& frame, const PresentAr
         observation.reason = "DLSS frame generation is off";
         return false;
     }
+    // SetOptions takes effect at the next Present. Complete a disabled Present
+    // before retrying generation, even if its inputs are already eligible again.
+    if (recoveryPresentPending)
+        return reject("DLSS FG is completing a disabled recovery Present");
     if (!ticket || !ticket->generationReady)
         return reject("The matching before-input ticket and required PCL phases are missing");
     if (runtime->reflexMode == SlReflexMode::Off)
@@ -658,6 +667,28 @@ bool SlPresenter::Impl::eligible(const PresentationFrame& frame, const PresentAr
     observation.reason.clear();
     return true;
 }
+void SlPresenter::Impl::finishPresent(bool generate, HRESULT result, const sl::DLSSGState& state,
+                                      const ContentView& view) {
+    forceReset = !generate || FAILED(result) || state.status != sl::DLSSGStatus::eOk;
+    if (!forceReset)
+        lastAcceptedArea =
+            view.area; // Only successfully accepted temporal history; invalid frames cannot poison it.
+    // Disabled frames may still report the last generation error. Their Present
+    // result, rather than an assumed clearing of SDK status bits, completes Off.
+    if (!generate && SUCCEEDED(result))
+        recoveryPresentPending = false;
+    if (generate && state.status != sl::DLSSGStatus::eOk) {
+        recoveryPresentPending = true;
+        observation.active = SlGenerationMode::Off;
+        observation.reason =
+            "DLSS FG reports status bits " + std::to_string(static_cast<uint32_t>(state.status));
+        // Input-consumption fences have already been retained by the caller.
+        // Reporting Off alone does not disable the SDK's last On/Dynamic mode.
+        options(SlGenerationMode::Off);
+    } else if (generate) {
+        observation.active = configuredMode;
+    }
+}
 HRESULT SlPresenter::Impl::present(FrameLease frame, const PresentArguments& arguments,
                                    const SlGenerationRequest& request) {
     if (!usable())
@@ -683,7 +714,7 @@ HRESULT SlPresenter::Impl::present(FrameLease frame, const PresentArguments& arg
     if (!generate) {
         // Pause is a transition, not a full queue/SDK drain on every menu frame.
         // It also must not be followed by a second SetOptions for this Present.
-        if (!optionsConfigured || observation.active != SlGenerationMode::Off)
+        if (!optionsConfigured || configuredMode != SlGenerationMode::Off)
             pause();
         forceReset = true;
     }
@@ -740,15 +771,7 @@ HRESULT SlPresenter::Impl::present(FrameLease frame, const PresentArguments& arg
             item.producer.reset();
     haveFrame = true;
     lastApplicationFrame = frame->applicationFrameId;
-    forceReset = !generate || FAILED(result) || state.status != sl::DLSSGStatus::eOk;
-    if (!forceReset)
-        lastAcceptedArea =
-            view.area; // Only successfully accepted temporal history; invalid frames cannot poison it.
-    if (generate && state.status != sl::DLSSGStatus::eOk) {
-        observation.active = SlGenerationMode::Off;
-        observation.reason =
-            "DLSS FG reports status bits " + std::to_string(static_cast<uint32_t>(state.status));
-    }
+    finishPresent(generate, result, state, view);
     if (FAILED(asynchronousError.load()))
         throw std::runtime_error("The Streamline asynchronous presenter failed while submitting this frame");
     if (FAILED(result) && result != DXGI_ERROR_WAS_STILL_DRAWING)

@@ -65,6 +65,7 @@ class SlPresenter {
     SlPresenterStatus status() const;
 
   private:
+    friend struct SlPresenterTests;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
